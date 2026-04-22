@@ -158,10 +158,22 @@ app.get('/api/statistics/:type', (req, res) => res.json({}));
 // Health check
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+async function checkDatabaseConnection() {
+  try {
+    await prisma.$connect();
+    console.log('✅ Database connected successfully');
+  } catch (error: any) {
+    console.error('❌ Database connection failed:', error.message);
+  }
+}
+
 const PORT = process.env.PORT || 4000;
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`Backend 2.0 running on http://localhost:${PORT}`);
+  
+  // Verify database connection
+  await checkDatabaseConnection();
   
   // Initialize automation cron jobs
   cronService.init();
