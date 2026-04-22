@@ -1,0 +1,886 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  email     String?  @unique
+  phone     String?
+  whatsappId String? @unique // WhatsApp sender ID
+  instagramId String? @unique // Instagram sender ID
+  messengerId String? @unique // Messenger sender ID
+  aiEnabled Boolean  @default(true) // AI enabled for this customer
+  isAiPaused Boolean @default(false) // Pauses AI for this customer (e.g. during escalation)
+  lastInstagramMessageAt DateTime? // Last inbound Instagram message for 24hr window tracking
+  lastMessengerMessageAt DateTime? // Last inbound Messenger message for 24hr window tracking
+  dailyTokenUsage Int @default(0) // Token usage counter for rate limiting
+  tokenResetDate DateTime? // Date when token counter resets (24hr window)
+  totalTokensUsed Int @default(0) // Lifetime token usage for analytics
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages  Message[]
+  bookings  Booking[]
+  bookingDrafts BookingDraft[]
+  escalations Escalation[]
+  conversationMetrics ConversationMetrics[]
+  photoLinks PhotoLink[]
+  invoices  Invoice[]
+  customerMemory CustomerMemory?
+  conversationLearnings ConversationLearning[]
+  sessionNotes CustomerSessionNote[]
+  
+  // Advanced AI Relations
+  proactiveOutreaches ProactiveOutreach[]
+  schedulingPreference SchedulingPreference?
+  unifiedConversations UnifiedConversation[]
+  channelPreference ChannelPreference?
+  handoffSessions HandoffSession[]
+  negotiationSessions NegotiationSession[]
+  sentimentScores SentimentScore[]
+  churnAlerts ChurnAlert[]
+
+  @@map("customers")
+}
+
+// ============================================
+// SECURITY: User Management
+// ============================================
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String   // Hashed password
+  name      String
+  role      String   @default("admin") // admin, agent, viewer
+  isActive  Boolean  @default(true)
+  lastLoginAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  content   String
+  platform  String   // whatsapp, instagram, messenger, telegram
+  direction String   // inbound, outbound
+  customerId String
+  customer  Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  externalId String? @unique // External message ID to prevent duplicates
+  createdAt DateTime @default(now())
+  handledBy String? // 'agent' or 'ai'
+  isResolved Boolean?
+  isEscalated Boolean?
+
+  @@map("messages")
+}
+
+model Booking {
+  id          String   @id @default(cuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  service     String
+  dateTime    DateTime
+  status      String   // provisional, confirmed, cancelled
+  durationMinutes Int? // duration in minutes for the service
+  recipientName String?
+  recipientPhone String?
+  googleEventId String? @unique // Google Calendar event ID
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  invoice     Invoice?
+  payments    Payment[]
+  followups   PostShootFollowup[]
+  reminders   BookingReminder[]
+  sessionNotes CustomerSessionNote[]
+
+  @@map("bookings")
+}
+
+model KnowledgeBase {
+  id        String   @id @default(cuid())
+  question  String   @unique
+  answer    String
+  category  String
+  embedding Float[]  // vector for Pinecone
+  mediaUrls String[] @default([]) // Array of image URLs to include in responses
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("knowledge_base")
+}
+
+model MediaAsset {
+  id          String   @id @default(cuid())
+  url         String   // Direct image/video URL
+  title       String?  // Optional title/caption
+  description String?  // Optional description
+  category    String   // 'backdrop', 'portfolio', 'studio', 'outdoor', 'beach', 'family', etc.
+  subcategory String?  // More specific categorization
+  mediaType   String   @default("image") // 'image' or 'video'
+  source      String   @default("website") // 'website', 'manual', 'upload'
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("media_assets")
+  @@index([category])
+  @@index([subcategory])
+}
+
+model BookingDraft {
+  id          String   @id @default(cuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  service     String?
+  date        String?  // e.g., "2025-11-20"
+  time        String?  // e.g., "9:00 AM"
+  dateTimeIso String?  // ISO-8601 UTC string for scheduling
+  name        String?
+  recipientName String?
+  recipientPhone String?
+  isForSomeoneElse Boolean?
+  step        String   // current step: service, date, time, name, confirm, reschedule, reschedule_confirm
+  conflictResolution String? // Tracks user's choice when conflict: 'cancel_existing', 'modify_existing', 'different_time'
+  bookingId   String?  // ID of booking being rescheduled (for reschedule flow)
+  version     Int      @default(1) // For optimistic locking
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  payment     Payment?
+
+  @@unique([customerId]) // One draft per customer
+  @@map("booking_drafts")
+}
+
+model Package {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  type        String   // 'outdoor' or 'studio'
+  price       Int      // in KSH
+  deposit     Int      @default(2000) // deposit amount in KSH (default for migration)
+  duration    String   // e.g., '2 hrs', '1 hr 30 mins'
+  images      Int      // number of soft copy images
+  makeup      Boolean  // professional makeup included
+  outfits     Int      // number of own outfits
+  styling     Boolean  // styling included
+  photobook   Boolean  // photobook included
+  photobookSize String? // e.g., '8x8"'
+  mount       Boolean  // A3 mount included
+  balloonBackdrop Boolean // Customised balloon backdrop included
+  wig         Boolean  // Styled wig included
+  notes       String?  // extra notes
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("packages")
+}
+
+model StudioInfo {
+  id        String   @id @default(cuid())
+  location  String
+  notes     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("studio_info")
+}
+
+model Payment {
+  id             String      @id @default(cuid())
+  bookingDraftId String?     @unique
+  bookingDraft   BookingDraft? @relation(fields: [bookingDraftId], references: [id], onDelete: SetNull)
+  bookingId      String?
+  booking        Booking?      @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  amount         Int         // deposit amount
+  phone          String      // customer's phone for M-Pesa
+  status         String      // pending, success, failed
+  mpesaReceipt   String?     // M-Pesa receipt number
+  checkoutRequestId String?  // M-Pesa CheckoutRequestID
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@map("payments")
+}
+
+model AiSettings {
+  id        Int    @id @default(1)
+  aiEnabled Boolean @default(true)
+  updatedAt DateTime @updatedAt
+
+  @@map("ai_settings")
+}
+
+model AiPrediction {
+  id           Int      @id @default(autoincrement())
+  timestamp    DateTime @default(now())
+  input        String
+  prediction   String
+  actual       String?
+  confidence   Float?
+  responseTime Int      // ms
+  error        String?
+  userFeedback Int?     // 1-5 rating
+  modelVersion String?
+  tokensUsed   Int?     // Tokens consumed by this request
+  wasCached    Boolean  @default(false) // Whether response was cached
+  
+  feedback     ResponseFeedback?
+}
+
+model Escalation {
+  id        String   @id @default(uuid())
+  customerId String
+  customer  Customer @relation(fields: [customerId], references: [id])
+  reason    String?
+  description String?
+  status    String   @default("OPEN") // OPEN, RESOLVED
+  escalationType String @default("manual") // manual, frustration, quota, error
+  metadata  Json?    // Store sentiment analysis results and conversation context
+  sentimentScore Float? // Frustration score (0.0 - 1.0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("escalations")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  type      String   // 'booking', 'reschedule', 'payment'
+  title     String
+  message   String
+  metadata  Json?    // Flexible field for additional data
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("notifications")
+  @@index([read, createdAt])
+}
+
+model ConversationMetrics {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  intent        String   // booking, faq, escalation, etc.
+  duration      Int      // conversation duration in seconds
+  messagesCount Int      // number of messages exchanged
+  resolved      Boolean  // whether issue was resolved
+  timestamp     DateTime @default(now())
+
+  @@map("conversation_metrics")
+  @@index([customerId])
+  @@index([timestamp])
+  @@index([intent])
+}
+
+// AI observability: one row per AI queue job (Tier 1 + strategy + fallback + circuit breaker)
+model AiJobMetric {
+  id                  String   @id @default(cuid())
+  createdAt           DateTime @default(now())
+  customerId          String?
+  platform            String?   // whatsapp, instagram, messenger
+  latencyMs           Int?      // job start to response ready
+  success             Boolean  // false = timeout, exception, or send failure
+  failureReason       String?  // short reason if success=false
+  strategyUsed        String?  // faq, package_inquiry, booking, fallback
+  isFallback          Boolean  @default(false) // recovery / "connect you with our team"
+  circuitBreakerTrip  Boolean  @default(false)
+  circuitBreakerReason String?
+  queueWaitingCount   Int?     // waiting count when this job started
+
+  @@map("ai_job_metrics")
+  @@index([createdAt])
+  @@index([success])
+  @@index([strategyUsed])
+}
+
+model PhotoLink {
+  id         String   @id @default(cuid())
+  link       String
+  sentAt     DateTime @default(now())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@map("photo_links")
+}
+
+model Invoice {
+  id              String   @id @default(cuid())
+  invoiceNumber   String   @unique // Auto-generated: INV-2024-001
+  bookingId       String   @unique
+  booking         Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  customerId      String
+  customer        Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  // Invoice Details
+  subtotal        Float
+  tax             Float    @default(0)
+  discount        Float    @default(0)
+  total           Float
+
+  // Payment Info
+  depositPaid     Float
+  balanceDue      Float
+
+  // Status
+  status          String   @default("pending") // pending, sent, paid
+  sentAt          DateTime?
+  paidAt          DateTime?
+
+  // PDF - stored as binary data in database
+  pdfData         Bytes?   // PDF file stored as binary
+  pdfUrl          String?  // DEPRECATED - kept for backward compatibility
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("invoices")
+}
+
+model PostShootFollowup {
+  id             String   @id @default(cuid())
+  bookingId      String
+  booking        Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  type           String   // delivery, review_request, upsell
+  scheduledFor   DateTime
+  status         String   @default("pending") // pending, sent, cancelled, failed
+  messageContent String?
+  metadata       Json?    // Store response data, suggested packages, etc.
+  sentAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("post_shoot_followups")
+}
+
+model BookingReminder {
+  id             String   @id @default(cuid())
+  bookingId      String
+  booking        Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  type           String   // 48hr, 24hr
+  scheduledFor   DateTime
+  status         String   @default("pending") // pending, sent, cancelled, failed
+  messageContent String?
+  sentAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("booking_reminders")
+}
+
+// ============================================
+// LEARNING AI MODELS
+// ============================================
+
+model CustomerMemory {
+  id                String   @id @default(cuid())
+  customerId        String   @unique
+  customer          Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  // Preferences
+  preferredPackages String[] @default([])
+  budgetMin         Int?
+  budgetMax         Int?
+  preferredTimes    String[] @default([]) // e.g., ["morning", "afternoon"]
+  communicationStyle String? // 'brief' | 'detailed' | 'friendly'
+  
+  // Insights
+  relationshipStage String   @default("new") // new, interested, booked, returning, vip
+  lifetimeValue     Float    @default(0)
+  satisfactionScore Float?   // Average satisfaction from feedback
+  totalBookings     Int      @default(0)
+  
+  // Behavioral patterns
+  averageResponseTime Int?   // seconds
+  preferredChannel  String?  // whatsapp, instagram, etc.
+  lastInteractionSummary String?
+  
+  // Conversation summaries (JSON array of summaries)
+  conversationSummaries Json[] @default([])
+  
+  // Key insights learned about this customer
+  keyInsights       String[] @default([])
+  
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("customer_memory")
+}
+
+model CustomerSessionNote {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  // What the customer mentioned bringing
+  type          String   // 'external_people' | 'external_items' | 'special_request' | 'other'
+  items         String[] @default([]) // e.g., ["makeup artist", "photographer"]
+  description   String?  // Full description or original message
+  
+  // Booking context
+  bookingId     String?
+  booking       Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  
+  // Admin actions
+  status        String   @default("pending") // pending, reviewed, approved, declined
+  adminNotes    String?  // Admin's notes or actions taken
+  reviewedBy    String?  // Admin user ID who reviewed
+  reviewedAt    DateTime?
+  
+  // Metadata
+  sourceMessage String?  // Original message that triggered this note
+  platform      String?  // whatsapp, instagram, messenger
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("customer_session_notes")
+  @@index([customerId])
+  @@index([bookingId])
+  @@index([status])
+}
+
+model ConversationLearning {
+  id                String   @id @default(cuid())
+  customerId        String
+  customer          Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  conversationId    String?  // Optional grouping ID for conversation sessions
+  
+  // What was learned
+  userMessage       String
+  aiResponse        String
+  extractedIntent   String
+  detectedEmotionalTone String? // excited, anxious, frustrated, neutral
+  
+  // Success indicators
+  wasSuccessful     Boolean  @default(false)
+  userFeedbackScore Int?     // 1-5 rating if provided
+  conversationOutcome String? // booked, escalated, abandoned, resolved
+  
+  // Learning signals
+  shouldAddToKB     Boolean  @default(false)
+  newKnowledgeExtracted String?
+  category          String?
+  
+  // Context
+  conversationLength Int     @default(1) // Number of messages in conversation
+  timeToResolution  Int?    // seconds
+  
+  // Metadata for analysis
+  metadata          Json?
+  
+  createdAt         DateTime @default(now())
+
+  @@map("conversation_learning")
+  @@index([customerId])
+  @@index([wasSuccessful])
+  @@index([shouldAddToKB])
+  @@index([extractedIntent])
+}
+
+model ResponseFeedback {
+  id                String   @id @default(cuid())
+  predictionId      Int      @unique
+  prediction        AiPrediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+  
+  // Feedback types
+  thumbsUp          Boolean?
+  rating            Int?     // 1-5 stars
+  comment           String?
+  
+  // Feedback context
+  wasHelpful        Boolean?
+  wasAccurate       Boolean?
+  wasEmpathetic     Boolean?
+  
+  // What could be improved
+  improvementSuggestion String?
+  
+  createdAt         DateTime @default(now())
+
+  @@map("response_feedback")
+}
+
+model DomainKnowledge {
+  id                String   @id @default(cuid())
+  
+  // Knowledge categorization
+  category          String   // best_practices, objection_handling, recommendations, seasonal, policies
+  subcategory       String?
+  
+  // Knowledge content
+  topic             String
+  content           String   @db.Text
+  
+  // When to use this knowledge
+  triggers          String[] @default([]) // Keywords or patterns that trigger this knowledge
+  applicableIntents String[] @default([]) // Which intents this applies to
+  
+  // Metadata
+  priority          Int      @default(5) // 1-10, higher = more important
+  isActive          Boolean  @default(true)
+  usageCount        Int      @default(0)
+  successRate       Float?   // Track how often this knowledge leads to success
+  
+  // Examples
+  exampleQuestions  String[] @default([])
+  exampleResponses  String[] @default([])
+  
+  // Versioning
+  version           Int      @default(1)
+  
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("domain_knowledge")
+  @@index([category])
+  @@index([isActive])
+  @@index([priority])
+}
+
+model ConversationContext {
+  id                String   @id @default(cuid())
+  customerId        String
+  sessionId         String   // Unique session identifier
+  
+  // Session state
+  currentIntent     String?
+  conversationStage String?  // discovery, consideration, decision, booking, post_booking
+  
+  // Context tracking
+  topicsDiscussed   String[] @default([])
+  questionsAsked    String[] @default([])
+  packagesViewed    String[] @default([])
+  
+  // Session metadata
+  messageCount      Int      @default(0)
+  startedAt         DateTime @default(now())
+  lastActivityAt    DateTime @default(now())
+  
+  // Session outcome
+  wasSuccessful     Boolean?
+  outcome           String?  // booked, escalated, abandoned, needs_followup
+  
+  // Full context (for analysis)
+  fullContext       Json?
+
+  @@map("conversation_context")
+  @@index([customerId])
+  @@index([sessionId])
+  @@index([lastActivityAt])
+}
+
+// ============================================
+// ADVANCED AI CAPABILITIES
+// ============================================
+
+// Proactive Intelligence
+model ProactiveOutreach {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  type          String   // abandoned_booking, pregnancy_milestone, post_shoot, reengagement, milestone, weather_alert
+  status        String   @default("pending") // pending, sent, delivered, failed, cancelled
+  
+  scheduledFor  DateTime
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  
+  messageContent String  @db.Text
+  channel       String   // whatsapp, instagram, messenger
+  
+  campaignId    String?
+  campaign      OutreachCampaign? @relation(fields: [campaignId], references: [id])
+  
+  metadata      Json?    // Additional context
+  responseReceived Boolean @default(false)
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("proactive_outreach")
+  @@index([customerId])
+  @@index([status])
+  @@index([scheduledFor])
+  @@index([type])
+}
+
+model OutreachCampaign {
+  id            String   @id @default(cuid())
+  name          String
+  type          String   // abandoned, milestone, reengagement, seasonal
+  isActive      Boolean  @default(true)
+  
+  targetCriteria Json    // Criteria for targeting customers
+  messageTemplate String @db.Text
+  
+  triggerDelay  Int?     // Hours to wait before triggering
+  maxSends      Int      @default(1) // Max sends per customer
+  
+  outreaches    ProactiveOutreach[]
+  
+  stats         Json?    // Campaign statistics
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("outreach_campaigns")
+}
+
+// Smart Scheduling
+model SchedulingPreference {
+  id            String   @id @default(cuid())
+  customerId    String   @unique
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  preferredDays    String[] @default([]) // monday, tuesday, etc
+  preferredTimes   String[] @default([]) // morning, afternoon, evening
+  avoidWeekends    Boolean  @default(false)
+  timezone         String   @default("Africa/Nairobi")
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("scheduling_preferences")
+}
+
+model TimeSlotAvailability {
+  id            String   @id @default(cuid())
+  
+  date          DateTime
+  startTime     String
+  endTime       String
+  
+  isAvailable   Boolean  @default(true)
+  isBooked      Boolean  @default(false)
+  bookingId     String?
+  
+  photographerId String?
+  studioLocation String?
+  capacity      Int      @default(1)
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("time_slot_availability")
+  @@index([date])
+  @@index([isAvailable])
+}
+
+// Multi-Channel Orchestration
+model UnifiedConversation {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  sessionId     String   @unique
+  
+  channels      String[] @default([]) // whatsapp, instagram, messenger
+  primaryChannel String
+  
+  currentContext Json?
+  conversationState String?
+  
+  messageCount  Int      @default(0)
+  
+  startedAt     DateTime @default(now())
+  lastActivityAt DateTime @default(now())
+  endedAt       DateTime?
+
+  @@map("unified_conversations")
+  @@index([customerId])
+  @@index([sessionId])
+  @@index([lastActivityAt])
+}
+
+model ChannelPreference {
+  id            String   @id @default(cuid())
+  customerId    String   @unique
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  preferredChannel String?
+  channelResponseRates Json? // Track response rates per channel
+  channelEngagementScores Json? // Engagement metrics per channel
+  
+  lastChannelUsed String?
+  lastActivityAt  DateTime?
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("channel_preferences")
+}
+
+// Human-AI Collaboration
+model HandoffSession {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  reason        String   // complex_case, customer_request, ai_confidence_low, escalation
+  aiSummary     String   @db.Text
+  aiConfidence  Float
+  
+  conversationContext Json?
+  suggestedActions String[] @default([])
+  
+  assignedTo    String?  // Human agent ID
+  status        String   @default("pending") // pending, active, resolved, cancelled
+  
+  resolution    String?  @db.Text
+  resolutionTime Int?    // seconds
+  
+  humanCorrections Json[] @default([])
+  qualityScore  Float?
+  
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+  updatedAt     DateTime @updatedAt
+
+  suggestions   AIAssistSuggestion[]
+
+  @@map("handoff_sessions")
+  @@index([customerId])
+  @@index([status])
+  @@index([assignedTo])
+}
+
+model AIAssistSuggestion {
+  id            String   @id @default(cuid())
+  handoffId     String
+  handoff       HandoffSession @relation(fields: [handoffId], references: [id], onDelete: Cascade)
+  
+  suggestionType String  // response, action, information, package_recommendation
+  content       String   @db.Text
+  confidence    Float
+  reasoning     String?  @db.Text
+  
+  wasUsed       Boolean  @default(false)
+  wasHelpful    Boolean?
+  humanFeedback String?
+  
+  createdAt     DateTime @default(now())
+
+  @@map("ai_assist_suggestions")
+  @@index([handoffId])
+}
+
+// Advanced Objection Handling
+model NegotiationSession {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  objectionType String   // price, timing, uncertainty, competitor
+  originalPrice Float
+  
+  offeredDiscount Float?
+  offeredPaymentPlan Boolean @default(false)
+  alternativePackage String?
+  
+  outcome       String?  // accepted, declined, pending
+  finalPrice    Float?
+  
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+
+  @@map("negotiation_sessions")
+  @@index([customerId])
+  @@index([outcome])
+}
+
+// Enhanced Sentiment Tracking
+model SentimentScore {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  score         Float    // -1 to 1
+  sentiment     String   // very_negative, negative, neutral, positive, very_positive
+  confidence    Float
+  
+  messageId     String?
+  conversationContext Json?
+  
+  triggeredAlert Boolean @default(false)
+  
+  createdAt     DateTime @default(now())
+
+  @@map("sentiment_scores")
+  @@index([customerId])
+  @@index([sentiment])
+  @@index([createdAt])
+}
+
+model ChurnAlert {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  riskLevel     String   // low, medium, high, critical
+  riskScore     Float    // 0-100
+  reasons       String[] @default([])
+  
+  recoveryAction String?
+  recoveryStatus String   @default("pending") // pending, in_progress, recovered, lost
+  
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+
+  @@map("churn_alerts")
+  @@index([customerId])
+  @@index([riskLevel])
+  @@index([recoveryStatus])
+}
+
+// Business Intelligence
+model RevenueForecast {
+  id            String   @id @default(cuid())
+  
+  month         DateTime
+  forecastAmount Float
+  actualAmount  Float?
+  confidence    Float
+  
+  factors       Json?    // Factors influencing forecast
+  
+  createdAt     DateTime @default(now())
+
+  @@map("revenue_forecasts")
+  @@index([month])
+}
+
+model PackagePerformance {
+  id            String   @id @default(cuid())
+  
+  packageName   String
+  period        String   // weekly, monthly, quarterly
+  periodStart   DateTime
+  periodEnd     DateTime
+  
+  bookingsCount Int
+  revenue       Float
+  conversionRate Float
+  avgSatisfaction Float?
+  
+  trends        Json?
+  
+  createdAt     DateTime @default(now())
+
+  @@map("package_performance")
+  @@index([packageName])
+  @@index([periodStart])
+}
+
+
