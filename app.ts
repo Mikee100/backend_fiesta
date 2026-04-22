@@ -45,8 +45,9 @@ app.use('/webhooks/whatsapp', whatsappRoutes);
 app.use('/api/whatsapp', whatsappRoutes); 
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/customers', customerRoutes);
-app.use('/api/calendar/events', calendarController.getEvents.bind(calendarController));
-app.use('/api/calendar/sync', calendarController.sync.bind(calendarController));
+// Change 'use' to 'get' or 'post'
+app.get('/api/calendar/events', calendarController.getEvents.bind(calendarController));
+app.post('/api/calendar/sync', calendarController.sync.bind(calendarController));
 
 // Analytics Routes
 app.get('/api/analytics/booking-status-counts', analyticsController.getBookingStatusCounts.bind(analyticsController));
@@ -107,6 +108,49 @@ app.get('/api/bookings/:customerId', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+app.get('/api/invoices', async (req, res) => {
+  try {
+    const invoices = await prisma.invoice.findMany({ include: { customer: true } });
+    return res.json(invoices);
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/bookings', async (req, res) => {
+  try {
+    const bookings = await prisma.booking.findMany({ include: { customer: true }, orderBy: { dateTime: 'desc' } });
+    return res.json(bookings);
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/bookings/available-hours/:date', async (req, res) => {
+  try {
+    const { date } = req.params;
+    const { service } = req.query;
+    // Mocking for now to avoid logic duplication
+    return res.json(["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30"]);
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/invoices', async (req, res) => {
+  try {
+    const invoices = await prisma.invoice.findMany({ 
+      include: { customer: true, booking: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    return res.json(invoices);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/statistics/comprehensive', analyticsController.getBusinessKpis.bind(analyticsController));
+
 app.get('/api/invoices/customer/:customerId', (req, res) => res.json([]));
 app.get('/api/customers/:id/photo-links', (req, res) => res.json([]));
 app.get('/api/statistics/:type', (req, res) => res.json({}));
