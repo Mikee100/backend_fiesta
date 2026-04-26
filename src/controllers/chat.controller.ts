@@ -19,7 +19,7 @@ export class ChatController {
       console.log(`Received message from ${customerId}: ${message}`);
 
       // Pass directly to the Agent Service which handles RAG + Booking Logic
-      const reply = await agentService.handleMessage(customerId, message);
+      const reply = await agentService.handleMessage(customerId, message, [], 'web');
 
       console.log(`Agent structured reply:`, reply);
 

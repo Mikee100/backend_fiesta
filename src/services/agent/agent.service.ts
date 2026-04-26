@@ -112,7 +112,7 @@ export class BookingExtractor {
 
 
 export class AgentService {
-  private getSystemPrompt(businessContext: string): string {
+  private getSystemPrompt(businessContext: string, platform: string): string {
     const now = dayjs().format('dddd, MMMM D, YYYY h:mm A');
     return `Current Date/Time: ${now}
 You are the official AI assistant for Fiesta House Attire & Maternity.
@@ -126,22 +126,24 @@ Instructions:
 2. If you know the customer's name, greet them by name. If the name is "Unknown", ask for it when they want to book.
 3. If the customer asks about their past sessions or bookings, use the "Past Bookings" information provided above.
 4. If a customer asks a question, answer it using ONLY the provided Business Context.
-3. If they want to book a session, guide them through it. Gather their Name, the Service they want, a Date, and a Time.
-4. If they want to RESCHEDULE an existing booking, use the 'reschedule_booking' tool.
-5. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
-6. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
-5. Before confirming, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
-6. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
-7. Once you have the Name, Service, Date, and Time, and you've verified the slot is free, use 'make_booking' to finalize.
-8. Do NOT ask for payment or a deposit. Bookings are finalized without an upfront payment step.
-9. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
-10. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.`;
+5. PLATFORM RESTRICTIONS: You are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS. If a user wants to book, politely tell them that bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue.
+6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their Name, the Service they want, a Date, and a Time.
+7. If they want to RESCHEDULE an existing booking, use the 'reschedule_booking' tool.
+8. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
+9. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
+10. Before confirming, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
+11. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
+12. Once you have the Name, Service, Date, and Time, and you've verified the slot is free, use 'make_booking' to finalize.
+13. Do NOT ask for payment or a deposit. Bookings are finalized without an upfront payment step.
+14. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
+15. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
+16. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.`;
   }
 
   /**
    * Handles an incoming message from a customer, with conversation history.
    */
-  async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = []) {
+  async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp') {
     // 1. Fetch Customer and Booking History for Memory
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
@@ -166,7 +168,7 @@ ${contextString}`;
 
     // 3. Build conversation history
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: 'system', content: this.getSystemPrompt(fullContext) },
+      { role: 'system', content: this.getSystemPrompt(fullContext, platform) },
       ...history,
       { role: 'user', content: userMessage }
     ];
@@ -177,39 +179,7 @@ ${contextString}`;
     console.log('Extracted details:', extracted);
 
     // 4. Define the tools the AI can use
-    const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-      {
-        type: 'function',
-        function: {
-          name: 'make_booking',
-          description: 'Finalizes a booking for a customer.',
-          parameters: {
-            type: 'object',
-            properties: {
-              customerName: { type: 'string', description: 'The full name of the customer' },
-              service: { type: 'string', description: 'The photography or attire service requested' },
-              date: { type: 'string', description: 'The date for the booking (YYYY-MM-DD)' },
-              time: { type: 'string', description: 'The time for the booking (HH:mm)' }
-            },
-            required: ['customerName', 'service', 'date', 'time']
-          }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'reschedule_booking',
-          description: 'Reschedules an existing upcoming booking to a new date and time.',
-          parameters: {
-            type: 'object',
-            properties: {
-              newDate: { type: 'string', description: 'The new date for the booking (YYYY-MM-DD)' },
-              newTime: { type: 'string', description: 'The new time for the booking (HH:mm)' }
-            },
-            required: ['newDate', 'newTime']
-          }
-        }
-      },
+    const allTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       {
         type: 'function',
         function: {
@@ -225,29 +195,66 @@ ${contextString}`;
             required: ['bookingDate', 'note', 'type']
           }
         }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'get_available_slots',
-          description: 'Check available time slots for a specific date and service duration',
-          parameters: {
-            type: 'object',
-            properties: {
-              date: { type: 'string', description: 'The date to check (YYYY-MM-DD)' },
-              service: { type: 'string', description: 'The service name (to determine duration)' }
-            },
-            required: ['date', 'service']
-          }
-        }
       }
     ];
+
+    if (platform === 'whatsapp' || platform === 'web') {
+      allTools.push(
+        {
+          type: 'function',
+          function: {
+            name: 'make_booking',
+            description: 'Finalizes a booking for a customer.',
+            parameters: {
+              type: 'object',
+              properties: {
+                customerName: { type: 'string', description: 'The full name of the customer' },
+                service: { type: 'string', description: 'The photography or attire service requested' },
+                date: { type: 'string', description: 'The date for the booking (YYYY-MM-DD)' },
+                time: { type: 'string', description: 'The time for the booking (HH:mm)' }
+              },
+              required: ['customerName', 'service', 'date', 'time']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'reschedule_booking',
+            description: 'Reschedules an existing upcoming booking to a new date and time.',
+            parameters: {
+              type: 'object',
+              properties: {
+                newDate: { type: 'string', description: 'The new date for the booking (YYYY-MM-DD)' },
+                newTime: { type: 'string', description: 'The new time for the booking (HH:mm)' }
+              },
+              required: ['newDate', 'newTime']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'get_available_slots',
+            description: 'Check available time slots for a specific date and service duration',
+            parameters: {
+              type: 'object',
+              properties: {
+                date: { type: 'string', description: 'The date to check (YYYY-MM-DD)' },
+                service: { type: 'string', description: 'The service name (to determine duration)' }
+              },
+              required: ['date', 'service']
+            }
+          }
+        }
+      );
+    }
 
     // 5. Call LLM
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages,
-      tools,
+      tools: allTools,
       tool_choice: 'auto'
     });
 
@@ -311,7 +318,7 @@ ${contextString}`;
       const secondResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages,
-        tools
+        tools: allTools
       });
 
       return secondResponse.choices[0].message.content || 'I have processed your request.';

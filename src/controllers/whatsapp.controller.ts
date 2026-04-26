@@ -97,7 +97,7 @@ export class WhatsAppController {
           await whatsappService.markAsRead(msgId);
 
           // 4. Get AI Response with history
-          const aiReply = await agentService.handleMessage(from, msgBody, history);
+          const aiReply = await agentService.handleMessage(from, msgBody, history, 'whatsapp');
 
           // 5. Save Outbound Message
           await prisma.message.create({

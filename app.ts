@@ -4,10 +4,12 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import chatRoutes from './src/routes/chat.routes';
 import whatsappRoutes from './src/routes/whatsapp.routes';
+import instagramRoutes from './src/routes/instagram.routes';
 import bookingRoutes from './src/routes/booking.routes';
 import { calendarController } from './src/controllers/calendar.controller';
 import { customerController } from './src/controllers/customer.controller';
 import customerRoutes from './src/routes/customer.routes';
+import conversationRoutes from './src/routes/conversation.routes';
 import { analyticsController } from './src/controllers/analytics.controller';
 import prisma from './src/config/prisma';
 import { cronService } from './src/services/automation/cron.service';
@@ -57,9 +59,12 @@ app.use((req: any, _res, next) => {
 // Main Routes
 app.use('/api', chatRoutes);
 app.use('/webhooks/whatsapp', whatsappRoutes);
+app.use('/webhooks/instagram', instagramRoutes);
 app.use('/api/whatsapp', whatsappRoutes); 
+app.use('/api/instagram', instagramRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/customers', customerRoutes);
+app.use('/api/conversations', conversationRoutes);
 
 // Calendar Routes
 app.get('/api/calendar/events', calendarController.getEvents.bind(calendarController));
