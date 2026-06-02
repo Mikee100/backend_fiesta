@@ -6,6 +6,7 @@ import dayjs from 'dayjs';
 import { bookingService } from '../booking/booking.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
+import { mpesaService } from '../payment/mpesa.service';
 
 // Ensure you have OPENAI_API_KEY in your .env
 const openai = new OpenAI();
@@ -134,10 +135,11 @@ Instructions:
 10. Before confirming, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
 11. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
 12. Once you have the Name, Service, Date, and Time, and you've verified the slot is free, use 'make_booking' to finalize.
-13. Do NOT ask for payment or a deposit. Bookings are finalized without an upfront payment step.
-14. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
-15. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
-16. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.`;
+13. PAYMENT: A deposit is REQUIRED to confirm any booking. Once you call 'make_booking', the system will send an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
+14. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
+15. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
+16. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
+17. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.`;
   }
 
   /**
@@ -274,8 +276,8 @@ ${contextString}`;
 
           try {
             if (functionName === 'make_booking') {
-              await this.executeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
-              toolResponse = `SUCCESS: Booking confirmed for ${args.customerName} on ${args.date} at ${args.time}.`;
+              const result = await this.executeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
+              toolResponse = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${args.service} on ${args.date} at ${args.time} will be officially confirmed.`;
             } 
             else if (functionName === 'reschedule_booking') {
               const success = await this.executeRescheduleTool(customerId, args.newDate, args.newTime);
@@ -329,7 +331,7 @@ ${contextString}`;
   }
 
   /**
-   * Database Logic to execute the booking without payment
+   * Database Logic to execute the booking with M-Pesa payment initiation
    */
   private async executeBookingTool(customerId: string, name: string, service: string, date: string) {
     let customer = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -344,30 +346,65 @@ ${contextString}`;
     const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => service.toLowerCase().includes(k)) || 'standard';
     const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
 
-    // Create the confirmed booking
-    const booking = await prisma.booking.create({
-      data: {
+    // Fetch package to get deposit amount
+    const pkg = await prisma.package.findFirst({
+      where: { name: { contains: serviceKey, mode: 'insensitive' } }
+    });
+    const depositAmount = pkg?.deposit || 2000;
+
+    // Create or update a Booking Draft instead of a real Booking
+    const draft = await prisma.bookingDraft.upsert({
+      where: { customerId: customer.id },
+      update: {
+        service: service,
+        date: dayjs(date).format('YYYY-MM-DD'),
+        time: dayjs(date).format('HH:mm'),
+        dateTimeIso: date,
+        name: name,
+        step: 'payment_pending'
+      },
+      create: {
         customerId: customer.id,
         service: service,
-        dateTime: new Date(date),
-        status: 'confirmed',
-        durationMinutes: duration
+        date: dayjs(date).format('YYYY-MM-DD'),
+        time: dayjs(date).format('HH:mm'),
+        dateTimeIso: date,
+        name: name,
+        step: 'payment_pending'
       }
     });
 
-    // Sync with Google Calendar
-    const googleEventId = await googleCalendarService.createEvent({
-      service: service,
-      dateTime: new Date(date),
-      customerName: name,
-      durationMinutes: duration
-    });
-
-    if (googleEventId) {
-      await prisma.booking.update({
-        where: { id: booking.id },
-        data: { googleEventId }
+    // Initiate M-Pesa STK Push using draft ID as reference
+    try {
+      const mpesaResponse = await mpesaService.initiateStkPush(customerId, depositAmount, draft.id);
+      
+      // Upsert payment record linked to the draft
+      await prisma.payment.upsert({
+        where: { bookingDraftId: draft.id },
+        update: {
+          amount: depositAmount,
+          status: 'pending',
+          checkoutRequestId: mpesaResponse.CheckoutRequestID,
+          updatedAt: new Date()
+        },
+        create: {
+          bookingDraftId: draft.id,
+          amount: depositAmount,
+          phone: customerId,
+          status: 'pending',
+          checkoutRequestId: mpesaResponse.CheckoutRequestID
+        }
       });
+
+      return {
+        success: true,
+        draftId: draft.id,
+        depositAmount: depositAmount,
+        checkoutRequestId: mpesaResponse.CheckoutRequestID
+      };
+    } catch (error: any) {
+      console.error('Failed to initiate M-Pesa STK Push:', error);
+      throw new Error(`We couldn't initiate the payment request. Error: ${error.message}`);
     }
   }
 

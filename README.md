@@ -60,6 +60,26 @@ Autonomous AI booking system for Fiesta House, integrated with WhatsApp, Instagr
    npm run dev
    ```
 
+## 🔒 Security Checks
+
+Run the local secret scan before committing changes:
+
+```bash
+npm run security:check
+```
+
+What this does:
+- Scans source/config files for common exposed key patterns (OpenAI, Pinecone, private key blocks, etc.).
+- Fails with file and line output when a potential secret is detected.
+
+Startup also performs environment validation and will fail fast if required variables are missing or placeholder values are detected.
+
+Install the pre-commit hook to enforce this automatically:
+
+```bash
+npm run hooks:install
+```
+
 ## 🤖 Automation Jobs
 
 The system includes a background cron service that runs hourly to process:

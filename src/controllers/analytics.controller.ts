@@ -3,6 +3,150 @@ import prisma from '../config/prisma';
 import dayjs from 'dayjs';
 
 export class AnalyticsController {
+
+  /**
+   * Get AI performance metrics from persisted observability data
+   */
+  async getAiPerformance(req: Request, res: Response) {
+    try {
+      const daysRaw = Number(req.query.days || 30);
+      const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 180) : 30;
+      const since = dayjs().subtract(days, 'day').toDate();
+
+      const [jobMetrics, customerMemory, learningRows] = await Promise.all([
+        prisma.aiJobMetric.findMany({
+          where: { createdAt: { gte: since } },
+          select: {
+            latencyMs: true,
+            success: true,
+            isFallback: true,
+          },
+        }),
+        prisma.customerMemory.aggregate({
+          _avg: { satisfactionScore: true },
+        }),
+        prisma.conversationLearning.findMany({
+          where: { createdAt: { gte: since } },
+          select: {
+            extractedIntent: true,
+            wasSuccessful: true,
+          },
+        }),
+      ]);
+
+      const latencies = jobMetrics
+        .map((m) => m.latencyMs)
+        .filter((latency): latency is number => typeof latency === 'number' && Number.isFinite(latency));
+
+      const avgLatency = latencies.length > 0
+        ? Math.round(latencies.reduce((sum, current) => sum + current, 0) / latencies.length)
+        : 0;
+
+      const sortedLatencies = [...latencies].sort((a, b) => a - b);
+      const p95 = sortedLatencies.length > 0
+        ? sortedLatencies[Math.min(sortedLatencies.length - 1, Math.floor(sortedLatencies.length * 0.95))]
+        : 0;
+
+      const totalJobs = jobMetrics.length;
+      const successfulJobs = jobMetrics.filter((m) => m.success).length;
+      const fallbackJobs = jobMetrics.filter((m) => m.isFallback).length;
+
+      const successRate = totalJobs > 0 ? (successfulJobs / totalJobs) * 100 : 0;
+      const nonFallbackSuccessRate = totalJobs > 0
+        ? ((jobMetrics.filter((m) => m.success && !m.isFallback).length) / totalJobs) * 100
+        : 0;
+
+      const intentAccumulator = new Map<string, { count: number; successful: number }>();
+      for (const row of learningRows) {
+        const key = row.extractedIntent || 'unknown';
+        const current = intentAccumulator.get(key) || { count: 0, successful: 0 };
+        current.count += 1;
+        if (row.wasSuccessful) {
+          current.successful += 1;
+        }
+        intentAccumulator.set(key, current);
+      }
+
+      const byIntent = Array.from(intentAccumulator.entries()).map(([intent, data]) => {
+        const count = data.count;
+        const successful = data.successful;
+        return {
+          intent,
+          count,
+          successRate: count > 0 ? Math.round((successful / count) * 10000) / 100 : 0,
+        };
+      });
+
+      return res.json({
+        responseTime: {
+          average: avgLatency,
+          p95: Math.round(p95),
+        },
+        accuracy: {
+          successRate: Math.round(successRate * 100) / 100,
+          sampleSize: totalJobs,
+        },
+        userSatisfaction: {
+          averageRating: customerMemory._avg.satisfactionScore ? Math.round(customerMemory._avg.satisfactionScore * 100) / 100 : 0,
+        },
+        efficiency: {
+          cacheHitRate: Math.round(nonFallbackSuccessRate * 100) / 100,
+          fallbackRate: totalJobs > 0 ? Math.round((fallbackJobs / totalJobs) * 10000) / 100 : 0,
+        },
+        byIntent,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Get personalization effectiveness metrics from learning data
+   */
+  async getPersonalizedResponses(req: Request, res: Response) {
+    try {
+      const daysRaw = Number(req.query.days || 30);
+      const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 180) : 30;
+      const since = dayjs().subtract(days, 'day').toDate();
+
+      const [learningAggregate, learningCount, successfulConversations, styleBreakdown] = await Promise.all([
+        prisma.conversationLearning.aggregate({
+          where: { createdAt: { gte: since } },
+          _avg: { timeToResolution: true },
+        }),
+        prisma.conversationLearning.count({
+          where: { createdAt: { gte: since } },
+        }),
+        prisma.conversationLearning.count({
+          where: {
+            createdAt: { gte: since },
+            wasSuccessful: true,
+          },
+        }),
+        prisma.customerMemory.groupBy({
+          by: ['communicationStyle'],
+          _count: { id: true },
+          where: {
+            communicationStyle: { not: null },
+          },
+        }),
+      ]);
+
+      const byCommunicationStyle = styleBreakdown.map((row) => ({
+        style: row.communicationStyle || 'unknown',
+        customers: row._count.id,
+      }));
+
+      return res.json({
+        totalPersonalizedConversations: learningCount,
+        overallSuccessRate: learningCount > 0 ? Math.round((successfulConversations / learningCount) * 10000) / 100 : 0,
+        averageTimeToResolution: learningAggregate._avg.timeToResolution ? Math.round(learningAggregate._avg.timeToResolution) : 0,
+        byCommunicationStyle,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
   
   /**
    * Get booking counts by status

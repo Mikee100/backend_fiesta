@@ -8,15 +8,20 @@ import instagramRoutes from './src/routes/instagram.routes';
 import bookingRoutes from './src/routes/booking.routes';
 import { calendarController } from './src/controllers/calendar.controller';
 import { customerController } from './src/controllers/customer.controller';
+import paymentRoutes from './src/routes/payment.routes';
 import customerRoutes from './src/routes/customer.routes';
 import conversationRoutes from './src/routes/conversation.routes';
 import { analyticsController } from './src/controllers/analytics.controller';
 import prisma from './src/config/prisma';
 import { cronService } from './src/services/automation/cron.service';
 import dotenv from 'dotenv';
+import { validateStartupEnv } from './src/config/env-validation';
 
 // Load .env only if it exists (for local dev)
 dotenv.config();
+
+// Fail fast on invalid startup configuration
+validateStartupEnv();
 
 console.log('📝 Diagnostic Info:');
 console.log('🔹 Node Version:', process.version);
@@ -65,6 +70,7 @@ app.use('/api/instagram', instagramRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/conversations', conversationRoutes);
+app.use('/api/mpesa', paymentRoutes);
 
 // Calendar Routes
 app.get('/api/calendar/events', calendarController.getEvents.bind(calendarController));
@@ -84,8 +90,8 @@ app.get('/api/statistics/engaged-customers', analyticsController.getEngagedCusto
 app.get('/api/statistics/package-popularity', analyticsController.getPackagePopularity.bind(analyticsController));
 app.get('/api/statistics/customer-emotions', analyticsController.getSentimentAnalysis.bind(analyticsController));
 app.get('/api/statistics/comprehensive', analyticsController.getBusinessKpis.bind(analyticsController));
-app.get('/api/statistics/ai-performance', (req, res) => res.json({ responseTime: { average: 1500 }, accuracy: { successRate: 98 }, userSatisfaction: { averageRating: 4.8 }, efficiency: { cacheHitRate: 85 }, byIntent: [] }));
-app.get('/api/statistics/personalized-responses', (req, res) => res.json({ totalPersonalizedConversations: 120, overallSuccessRate: 95, averageTimeToResolution: 300, byCommunicationStyle: [] }));
+app.get('/api/statistics/ai-performance', analyticsController.getAiPerformance.bind(analyticsController));
+app.get('/api/statistics/personalized-responses', analyticsController.getPersonalizedResponses.bind(analyticsController));
 app.get('/api/statistics/system', (req, res) => res.json({ customers: { total: 0, active: 0 }, messages: { total: 0, responseRate: 100 }, bookings: { total: 0, completionRate: 100 } }));
 
 // Notifications

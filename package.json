@@ -10,7 +10,10 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "npx prisma generate && tsc",
     "start": "node dist/app.js",
-    "dev": "nodemon --exec ts-node app.ts"
+    "dev": "nodemon --exec ts-node app.ts",
+    "security:scan-secrets": "node scripts/security/scan-secrets.js",
+    "security:check": "npm run security:scan-secrets",
+    "hooks:install": "node scripts/setup-hooks.js"
   },
   "keywords": [],
   "author": "",

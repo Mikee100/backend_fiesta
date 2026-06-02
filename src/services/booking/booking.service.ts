@@ -27,10 +27,24 @@ export class BookingService {
       }
     });
 
+    // 1b. Fetch active booking drafts (pending payment) from last 15 minutes
+    const fifteenMinutesAgo = dayjs().subtract(15, 'minute').toDate();
+    const activeDrafts = await prisma.bookingDraft.findMany({
+      where: {
+        step: 'payment_pending',
+        updatedAt: {
+          gte: fifteenMinutesAgo
+        },
+        dateTimeIso: {
+          startsWith: date // Matches the YYYY-MM-DD part
+        }
+      }
+    });
+
     // 2. Fetch events from Google Calendar
     const googleEvents = await googleCalendarService.getEvents(startOfDay.toDate(), endOfDay.toDate());
 
-    console.log(`Found ${existingBookings.length} local bookings and ${googleEvents.length} Google Calendar events for ${date}`);
+    console.log(`Found ${existingBookings.length} local bookings, ${activeDrafts.length} active drafts, and ${googleEvents.length} Google Calendar events for ${date}`);
 
     // 3. Check if it's a Monday
     if (dayjs(date).day() === 1) {
@@ -64,6 +78,18 @@ export class BookingService {
         });
 
         if (overlapsLocal) continue;
+
+        // Check for overlap with pending drafts
+        const overlapsDraft = activeDrafts.some(draft => {
+          if (!draft.dateTimeIso) return false;
+          const dStart = dayjs(draft.dateTimeIso);
+          const dServiceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
+          const dDuration = SERVICE_DURATIONS[dServiceKey] || DEFAULT_DURATION;
+          const dEnd = dStart.add(dDuration, 'minute');
+          return slotStart.isBefore(dEnd) && slotEnd.isAfter(dStart);
+        });
+
+        if (overlapsDraft) continue;
 
         // Check for overlap with Google Calendar events
         const overlapsGoogle = googleEvents.some(event => {

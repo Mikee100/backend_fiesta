@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_DIR="$(CDPATH= cd -- "$HOOK_DIR/.." && pwd)"
+
+printf "\n[pre-commit] Running backend 2.0 security checks...\n"
+
+cd "$PROJECT_DIR" || exit 1
+npm run security:check
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+  printf "\n[pre-commit] Commit blocked: security checks failed.\n"
+  exit $STATUS
+fi
+
+printf "[pre-commit] Security checks passed.\n"
+exit 0
