@@ -6,14 +6,17 @@ import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
 export class BookingService {
   
   /**
-   * Get available time slots for a specific date and duration
+   * Get available time slots for a specific date and duration.
+   * excludeBookingId lets a reschedule check availability without the
+   * customer's own current booking (still 'confirmed' until the reschedule is
+   * applied) falsely counting as a conflict against itself.
    */
-  async getAvailableSlots(date: string, durationMinutes: number) {
+  async getAvailableSlots(date: string, durationMinutes: number, excludeBookingId?: string) {
     const startOfDay = dayjs(date).startOf('day');
     const endOfDay = dayjs(date).endOf('day');
 
     console.log(`Checking slots for ${date}, duration: ${durationMinutes} mins`);
-    
+
     // 1. Fetch existing bookings from local DB
     const existingBookings = await prisma.booking.findMany({
       where: {
@@ -23,7 +26,8 @@ export class BookingService {
         },
         status: {
           not: 'cancelled'
-        }
+        },
+        ...(excludeBookingId ? { id: { not: excludeBookingId } } : {})
       }
     });
 

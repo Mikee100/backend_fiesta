@@ -11,9 +11,12 @@ import { customerController } from './src/controllers/customer.controller';
 import paymentRoutes from './src/routes/payment.routes';
 import customerRoutes from './src/routes/customer.routes';
 import conversationRoutes from './src/routes/conversation.routes';
+import invoiceRoutes from './src/routes/invoice.routes';
 import { analyticsController } from './src/controllers/analytics.controller';
+import { whatsappAnalyticsController } from './src/controllers/whatsappAnalytics.controller';
 import prisma from './src/config/prisma';
 import { cronService } from './src/services/automation/cron.service';
+import { notificationEvents } from './src/services/notifications/notification.service';
 import dotenv from 'dotenv';
 import { validateStartupEnv } from './src/config/env-validation';
 
@@ -45,14 +48,33 @@ const io = new Server(httpServer, {
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Captures the raw request body alongside the parsed JSON - needed to verify
+// Meta's X-Hub-Signature-256 webhook signature, which is computed over the raw bytes.
+app.use(express.json({
+  verify: (req: any, _res, buf) => { req.rawBody = buf; }
+}));
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
+
+  // The dashboard (Navbar, MessengerPage, etc.) already emits 'join' with a
+  // platform name on connect, expecting to be put in that room - this was
+  // never actually handled server-side, so those joins were silently no-ops.
+  socket.on('join', ({ platform }: { platform?: string }) => {
+    if (platform) socket.join(platform);
+  });
+
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
   });
+});
+
+// Forward notifications (e.g. escalations) created anywhere in the backend to
+// admin dashboard clients in real time. Event name matches what Navbar.tsx
+// already listens for.
+notificationEvents.on('notification', (notification) => {
+  io.to('admin').emit('newNotification', notification);
 });
 
 // Attach io to request for use in controllers
@@ -70,6 +92,7 @@ app.use('/api/instagram', instagramRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/conversations', conversationRoutes);
+app.use('/api/invoices', invoiceRoutes);
 app.use('/api/mpesa', paymentRoutes);
 
 // Calendar Routes
@@ -84,6 +107,20 @@ app.get('/api/analytics/monthly-revenue', analyticsController.getMonthlyRevenue.
 app.get('/api/analytics/revenue-by-package', analyticsController.getRevenueByPackage.bind(analyticsController));
 app.get('/api/analytics/seasonal-trends', analyticsController.getSeasonalTrends.bind(analyticsController));
 
+// WhatsApp Channel Analytics Routes
+app.get('/api/analytics/total-whatsapp-customers', whatsappAnalyticsController.getTotalCustomers.bind(whatsappAnalyticsController));
+app.get('/api/analytics/total-inbound-whatsapp-messages', whatsappAnalyticsController.getTotalInboundMessages.bind(whatsappAnalyticsController));
+app.get('/api/analytics/total-outbound-whatsapp-messages', whatsappAnalyticsController.getTotalOutboundMessages.bind(whatsappAnalyticsController));
+app.get('/api/analytics/peak-chat-hours', whatsappAnalyticsController.getPeakChatHours.bind(whatsappAnalyticsController));
+app.get('/api/analytics/peak-chat-days', whatsappAnalyticsController.getPeakChatDays.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-booking-conversion-rate', whatsappAnalyticsController.getBookingConversionRate.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-sentiment', whatsappAnalyticsController.getSentiment.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-sentiment-trend', whatsappAnalyticsController.getSentimentTrend.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-sentiment-by-topic', whatsappAnalyticsController.getSentimentByTopic.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-most-extreme-messages', whatsappAnalyticsController.getMostExtremeMessages.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-keyword-trends', whatsappAnalyticsController.getKeywordTrends.bind(whatsappAnalyticsController));
+app.get('/api/analytics/whatsapp-agent-ai-performance', whatsappAnalyticsController.getAgentAIPerformance.bind(whatsappAnalyticsController));
+
 // Statistics Routes
 app.get('/api/statistics/active-users', analyticsController.getActiveUsers.bind(analyticsController));
 app.get('/api/statistics/engaged-customers', analyticsController.getEngagedCustomers.bind(analyticsController));
@@ -95,7 +132,14 @@ app.get('/api/statistics/personalized-responses', analyticsController.getPersona
 app.get('/api/statistics/system', (req, res) => res.json({ customers: { total: 0, active: 0 }, messages: { total: 0, responseRate: 100 }, bookings: { total: 0, completionRate: 100 } }));
 
 // Notifications
-app.get('/api/notifications/unread-count', (req, res) => res.json({ count: 0 }));
+app.get('/api/notifications/unread-count', async (req, res) => {
+  try {
+    const count = await prisma.notification.count({ where: { read: false } });
+    return res.json({ count });
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 // Messages & Bookings by Customer
 app.get('/api/messages/:customerId', async (req, res) => {
@@ -124,19 +168,6 @@ app.get('/api/bookings/:customerId', async (req, res) => {
   }
 });
 
-// General Invoices & Bookings
-app.get('/api/invoices', async (req, res) => {
-  try {
-    const invoices = await prisma.invoice.findMany({ 
-      include: { customer: true, booking: true },
-      orderBy: { createdAt: 'desc' }
-    });
-    return res.json(invoices);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
 app.get('/api/bookings', async (req, res) => {
   try {
     const bookings = await prisma.booking.findMany({ 
@@ -159,7 +190,6 @@ app.get('/api/bookings/available-hours/:date', async (req, res) => {
   }
 });
 
-app.get('/api/invoices/customer/:customerId', (req, res) => res.json([]));
 app.get('/api/customers/:id/photo-links', (req, res) => res.json([]));
 app.get('/api/statistics/:type', (req, res) => res.json({}));
 

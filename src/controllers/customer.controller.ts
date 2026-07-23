@@ -101,6 +101,47 @@ export class CustomerController {
   }
 
   /**
+   * Get this customer's own sentiment history (not business-wide stats)
+   */
+  async getSentiment(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const scores = await prisma.sentimentScore.findMany({
+        where: { customerId: id },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+      });
+      return res.json(scores);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Business-wide average messages/bookings per customer, so a single
+   * customer's activity can be honestly compared against a real baseline
+   * instead of arbitrary hardcoded thresholds.
+   */
+  async getAverageActivity(req: Request, res: Response) {
+    try {
+      const totalCustomers = await prisma.customer.count();
+      if (totalCustomers === 0) {
+        return res.json({ avgMessages: 0, avgBookings: 0 });
+      }
+      const [totalMessages, totalBookings] = await Promise.all([
+        prisma.message.count(),
+        prisma.booking.count(),
+      ]);
+      return res.json({
+        avgMessages: totalMessages / totalCustomers,
+        avgBookings: totalBookings / totalCustomers,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
    * Toggle AI enabled/disabled for a customer
    */
   async toggleAi(req: Request, res: Response) {

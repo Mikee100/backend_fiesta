@@ -18,7 +18,11 @@ export async function loadFaqChunks(embedder: any, chunkText: (text: string) => 
     const answerChunks = chunkText(a);
     for (const chunk of answerChunks) {
       if (!chunk.trim()) continue;
-      const output = await embedder(chunk, { pooling: 'mean', normalize: true });
+      // Embed the question alongside the answer chunk, not the answer alone.
+      // Customers query with questions, not answer-style statements - embedding
+      // only the answer text creates a systematic mismatch between query and
+      // stored vector that no amount of paraphrase entries can fully patch.
+      const output = await embedder(`${q}\n${chunk}`, { pooling: 'mean', normalize: true });
       const vector = Array.from(output.data);
       faqChunks.push({
         id: `faq_${chunkId++}`,

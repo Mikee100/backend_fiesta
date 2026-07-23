@@ -450,40 +450,66 @@ export class AnalyticsController {
    */
   async getSentimentAnalysis(req: Request, res: Response) {
     try {
-      const scores = await prisma.sentimentScore.findMany();
-      
+      const thirtyDaysAgo = dayjs().subtract(30, 'day').toDate();
+      const scores = await prisma.sentimentScore.findMany({
+        where: { createdAt: { gte: thirtyDaysAgo } },
+        include: { customer: { select: { name: true } } },
+        orderBy: { createdAt: 'asc' },
+      });
+
       const distribution = {
-        very_positive: scores.filter(s => s.label === 'very_positive').length,
-        positive: scores.filter(s => s.label === 'positive').length,
-        neutral: scores.filter(s => s.label === 'neutral').length,
-        negative: scores.filter(s => s.label === 'negative').length,
-        very_negative: scores.filter(s => s.label === 'very_negative').length,
+        very_positive: scores.filter(s => s.sentiment === 'very_positive').length,
+        positive: scores.filter(s => s.sentiment === 'positive').length,
+        neutral: scores.filter(s => s.sentiment === 'neutral').length,
+        negative: scores.filter(s => s.sentiment === 'negative').length,
+        very_negative: scores.filter(s => s.sentiment === 'very_negative').length,
       };
 
-      // Mocked trends and percentages for completeness
+      // Group by day for the last 7 days
+      const sevenDaysAgo = dayjs().subtract(7, 'day').startOf('day');
+      const trendMap = new Map<string, { positive: number; neutral: number; negative: number; total: number; scoreSum: number }>();
+      for (let i = 0; i < 7; i++) {
+        trendMap.set(sevenDaysAgo.add(i, 'day').format('YYYY-MM-DD'), { positive: 0, neutral: 0, negative: 0, total: 0, scoreSum: 0 });
+      }
+      for (const s of scores) {
+        const day = dayjs(s.createdAt).format('YYYY-MM-DD');
+        const bucket = trendMap.get(day);
+        if (!bucket) continue;
+        bucket.total++;
+        bucket.scoreSum += s.score;
+        if (s.sentiment === 'positive' || s.sentiment === 'very_positive') bucket.positive++;
+        else if (s.sentiment === 'negative' || s.sentiment === 'very_negative') bucket.negative++;
+        else bucket.neutral++;
+      }
+      const recentTrends = Array.from(trendMap.entries()).map(([date, b]) => ({
+        date,
+        positive: b.positive,
+        neutral: b.neutral,
+        negative: b.negative,
+        avgScore: b.total > 0 ? b.scoreSum / b.total : 0,
+      }));
+
+      // Customers whose most recent sentiment reading is negative/very_negative
+      const latestByCustomer = new Map<string, typeof scores[number]>();
+      for (const s of scores) latestByCustomer.set(s.customerId, s); // scores is ascending, so last write wins = most recent
+      const customersNeedingAttention = Array.from(latestByCustomer.values())
+        .filter(s => s.sentiment === 'negative' || s.sentiment === 'very_negative')
+        .map(s => ({ customerId: s.customerId, name: s.customer?.name || 'Unknown', score: s.score, sentiment: s.sentiment }));
+
       return res.json({
         total: scores.length,
         averageScore: scores.length > 0 ? scores.reduce((a, b) => a + b.score, 0) / scores.length : 0,
         distribution: {
           ...distribution,
           percentages: {
-            positive: scores.length > 0 ? (distribution.positive / scores.length) * 100 : 0
+            positive: scores.length > 0 ? ((distribution.positive + distribution.very_positive) / scores.length) * 100 : 0
           }
         },
-        recentTrends: [],
-        customersNeedingAttention: []
+        recentTrends,
+        customersNeedingAttention
       });
     } catch (error: any) {
-      return res.json({
-        total: 0,
-        averageScore: 0,
-        distribution: {
-          very_positive: 10, positive: 20, neutral: 5, negative: 2, very_negative: 1,
-          percentages: { positive: 60 }
-        },
-        recentTrends: [],
-        customersNeedingAttention: []
-      });
+      return res.status(500).json({ error: error.message });
     }
   }
 }

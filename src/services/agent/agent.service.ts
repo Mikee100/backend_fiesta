@@ -7,9 +7,17 @@ import { bookingService } from '../booking/booking.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
+import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE } from './resilience.service';
+import { notifyAdmin } from '../notifications/notification.service';
 
-// Ensure you have OPENAI_API_KEY in your .env
-const openai = new OpenAI();
+// Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
+// Ensure you have GROQ_API_KEY in your .env
+const openai = new OpenAI({
+  apiKey: process.env.GROQ_API_KEY,
+  baseURL: 'https://api.groq.com/openai/v1',
+});
+
+const CHAT_MODEL = 'llama-3.3-70b-versatile';
 
 // --- Hybrid Booking Extractor ---
 type BookingDetails = {
@@ -68,10 +76,10 @@ export class BookingExtractor {
   }
 
   // 🤖 STEP 3: AI Extraction (STRICT JSON)
-  private async aiExtract(message: string): Promise<BookingDetails> {
+  private async aiExtract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
     const now = dayjs().format('dddd, MMMM D, YYYY h:mm A');
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: CHAT_MODEL,
       messages: [
         {
           role: 'system',
@@ -86,27 +94,32 @@ export class BookingExtractor {
       ],
       temperature: 0
     });
+    let details: BookingDetails = {};
     try {
-      return JSON.parse(response.choices[0].message.content || '{}');
+      details = JSON.parse(response.choices[0].message.content || '{}');
     } catch {
-      return {};
+      details = {};
     }
+    return { details, tokensUsed: response.usage?.total_tokens || 0 };
   }
 
   // 🔥 FINAL HYBRID METHOD
-  async extract(message: string): Promise<BookingDetails> {
+  async extract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
     const regex = this.regexExtract(message);
     console.log('Regex result:', regex);
     if (regex.name && regex.service && regex.date && regex.time) {
-      return regex;
+      return { details: regex, tokensUsed: 0 };
     }
-    const ai = await this.aiExtract(message);
+    const { details: ai, tokensUsed } = await this.aiExtract(message);
     console.log('AI result:', ai);
     return {
-      name: regex.name || ai.name,
-      service: regex.service || ai.service,
-      date: regex.date || ai.date,
-      time: regex.time || ai.time
+      details: {
+        name: regex.name || ai.name,
+        service: regex.service || ai.service,
+        date: regex.date || ai.date,
+        time: regex.time || ai.time
+      },
+      tokensUsed
     };
   }
 }
@@ -124,18 +137,21 @@ ${businessContext}
 
 Instructions:
 1. Be friendly, empathetic, and professional.
-2. If you know the customer's name, greet them by name. If the name is "Unknown", ask for it when they want to book.
+2. If you know the customer's name, greet them by name. If the name is "Unknown", you MUST ask for their real full name before proposing any booking - never invent or reuse a placeholder name.
 3. If the customer asks about their past sessions or bookings, use the "Past Bookings" information provided above.
 4. If a customer asks a question, answer it using ONLY the provided Business Context.
 5. PLATFORM RESTRICTIONS: You are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS. If a user wants to book, politely tell them that bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue.
-6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their Name, the Service they want, a Date, and a Time.
-7. If they want to RESCHEDULE an existing booking, use the 'reschedule_booking' tool.
+6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their real Name, the Service they want, a Date, and a Time.
+7. RESCHEDULING IS TWO STEPS, NEVER SKIP OR COMBINE THEM: if they want to reschedule, but haven't given a specific new date/time in their message, DO NOT call any tool - ask them what date/time they want first. NEVER invent or guess a date/time yourself. Once they've stated a specific new date/time, call 'propose_reschedule' (this only tells them the proposed new date/time - it changes nothing yet), then STOP and wait. Only call 'confirm_reschedule' after they explicitly reply yes/confirm on their OWN later message - never in the same turn as propose_reschedule.
 8. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
 9. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
-10. Before confirming, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
+10. Before proposing, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
 11. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
-12. Once you have the Name, Service, Date, and Time, and you've verified the slot is free, use 'make_booking' to finalize.
-13. PAYMENT: A deposit is REQUIRED to confirm any booking. Once you call 'make_booking', the system will send an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
+12. BOOKING IS TWO STEPS, NEVER SKIP OR COMBINE THEM:
+    a) Once you have their real Name, Service, Date, and a confirmed-free Time, call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt.
+    b) STOP THERE and wait. Only after the customer explicitly replies yes/confirm/go ahead in their OWN next message do you call 'confirm_booking', which is what actually sends the M-Pesa payment prompt.
+    NEVER call propose_booking and confirm_booking in the same turn, even if the customer's message sounds enthusiastic - the deposit prompt must never appear without the customer explicitly agreeing to it first, in its own message.
+13. PAYMENT: Once 'confirm_booking' runs, the system sends an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
 14. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
 15. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
 16. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
@@ -143,9 +159,11 @@ Instructions:
   }
 
   /**
-   * Handles an incoming message from a customer, with conversation history.
+   * Runs the actual RAG + tool-calling pipeline. Can throw (provider errors,
+   * DB errors, etc.) - callers should go through handleMessage, which wraps
+   * this with the circuit breaker, rate limiting, and a safe fallback.
    */
-  async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp') {
+  private async runAgent(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<{ content: string; tokensUsed: number }> {
     // 1. Fetch Customer and Booking History for Memory
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
@@ -153,9 +171,24 @@ Instructions:
     });
 
     const customerName = customer?.name && customer.name !== 'WhatsApp User' ? customer.name : 'Unknown';
-    const pastBookings = customer?.bookings.map(b => 
+    const pastBookings = customer?.bookings.map(b =>
       `${b.service} on ${dayjs(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
     ).join(', ') || 'No past bookings';
+
+    // Snapshot the booking draft's step as it stood BEFORE this turn's tool calls
+    // run. confirm_booking checks against this snapshot, not the live value, so
+    // a propose_booking call made earlier in this same turn can never satisfy it -
+    // confirmation is only valid if it was already pending from a PRIOR message.
+    const draftBeforeThisTurn = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    const initialDraftStep = draftBeforeThisTurn?.step;
+
+    // 1b. Long-term memory beyond the last 10 messages of raw history
+    const memory = await prisma.customerMemory.findUnique({ where: { customerId } });
+    const memorySummary = memory
+      ? `Relationship Stage: ${memory.relationshipStage}. Total Past Bookings: ${memory.totalBookings}.`
+        + (memory.preferredPackages.length ? ` Preferred Packages: ${memory.preferredPackages.join(', ')}.` : '')
+        + (memory.lastInteractionSummary ? ` Last Interaction Summary: "${memory.lastInteractionSummary}"` : '')
+      : 'No prior interaction history - this looks like a new customer.';
 
     // 2. Retrieve RAG Context
     const relevantKnowledge = await knowledgeRetrieval.search(userMessage, 10);
@@ -164,6 +197,7 @@ Instructions:
     const fullContext = `Customer Phone: ${customerId}
 Customer Name: ${customerName}
 Past Bookings: ${pastBookings}
+Customer Memory: ${memorySummary}
 
 Business Context:
 ${contextString}`;
@@ -177,7 +211,7 @@ ${contextString}`;
 
     // 3. Hybrid Extraction (for logging/debug, we'll let LLM handle the tool calls)
     const extractor = new BookingExtractor();
-    const extracted = await extractor.extract(userMessage);
+    const { details: extracted, tokensUsed: extractorTokens } = await extractor.extract(userMessage);
     console.log('Extracted details:', extracted);
 
     // 4. Define the tools the AI can use
@@ -205,12 +239,12 @@ ${contextString}`;
         {
           type: 'function',
           function: {
-            name: 'make_booking',
-            description: 'Finalizes a booking for a customer.',
+            name: 'propose_booking',
+            description: 'Prepares a booking and tells the customer the exact deposit amount, once you have their real name, service, date, and a confirmed-free time. Does NOT charge anything or send any payment prompt yet - it only proposes. You must get an explicit yes/confirm from the customer on a LATER message before calling confirm_booking.',
             parameters: {
               type: 'object',
               properties: {
-                customerName: { type: 'string', description: 'The full name of the customer' },
+                customerName: { type: 'string', description: "The customer's real full name - never pass 'Unknown' or leave this as a placeholder, ask them for it first if you don't have it" },
                 service: { type: 'string', description: 'The photography or attire service requested' },
                 date: { type: 'string', description: 'The date for the booking (YYYY-MM-DD)' },
                 time: { type: 'string', description: 'The time for the booking (HH:mm)' }
@@ -222,16 +256,32 @@ ${contextString}`;
         {
           type: 'function',
           function: {
-            name: 'reschedule_booking',
-            description: 'Reschedules an existing upcoming booking to a new date and time.',
+            name: 'confirm_booking',
+            description: "Sends the actual M-Pesa deposit payment prompt to the customer's phone. Only call this after propose_booking has already told them the deposit amount AND the customer has explicitly replied yes/confirm/go ahead in their OWN message - never call this in the same turn as propose_booking.",
+            parameters: { type: 'object', properties: {} }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'propose_reschedule',
+            description: "Proposes moving the customer's upcoming booking to a new date/time they just told you. NEVER invent or guess a date/time yourself - only call this with a date/time the customer actually stated in their own message. If they just asked to reschedule without giving a new date/time, do not call this at all - ask them what date/time they want instead. Does NOT change anything yet - you must get an explicit yes/confirm from the customer on a LATER message before calling confirm_reschedule.",
             parameters: {
               type: 'object',
               properties: {
-                newDate: { type: 'string', description: 'The new date for the booking (YYYY-MM-DD)' },
-                newTime: { type: 'string', description: 'The new time for the booking (HH:mm)' }
+                newDate: { type: 'string', description: 'The new date, exactly as the customer stated it (YYYY-MM-DD)' },
+                newTime: { type: 'string', description: 'The new time, exactly as the customer stated it (HH:mm)' }
               },
               required: ['newDate', 'newTime']
             }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'confirm_reschedule',
+            description: 'Actually applies the reschedule. Only call this after propose_reschedule already told the customer the new date/time AND they explicitly replied yes/confirm on their OWN later message - never call this in the same turn as propose_reschedule.',
+            parameters: { type: 'object', properties: {} }
           }
         },
         {
@@ -252,21 +302,30 @@ ${contextString}`;
       );
     }
 
-    // 5. Call LLM
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+    // 5. Call LLM. Booking a slot is naturally multi-step (check availability,
+    // then book), so the model can legitimately want to chain more than one
+    // tool call in a single turn - loop until it returns plain text instead of
+    // assuming a single round. A hard cap prevents a runaway loop.
+    let tokensUsed = extractorTokens;
+    const MAX_TOOL_ROUNDS = 5;
+    let currentResponse = await openai.chat.completions.create({
+      model: CHAT_MODEL,
       messages,
       tools: allTools,
-      tool_choice: 'auto'
+      tool_choice: 'auto',
+      temperature: 0.3
     });
+    tokensUsed += currentResponse.usage?.total_tokens || 0;
 
-    const responseMessage = response.choices[0].message;
-
-    // 6. Handle Tool Calls
-    if (responseMessage.tool_calls) {
+    let rounds = 0;
+    let proposedThisTurn = false; // blocks confirm_booking if propose_booking (even a re-propose with changed details) ran earlier in this same turn
+    let confirmedActionThisTurn = false; // once a booking/reschedule is confirmed, blocks ALL further booking tool calls this turn - the model has looped and re-proposed unasked-for changes after a successful confirm before
+    while (currentResponse.choices[0].message.tool_calls && rounds < MAX_TOOL_ROUNDS) {
+      rounds++;
+      const responseMessage = currentResponse.choices[0].message;
       messages.push(responseMessage); // Add assistant message to history once
 
-      for (const toolCall of responseMessage.tool_calls) {
+      for (const toolCall of responseMessage.tool_calls!) {
         if (toolCall.type === 'function') {
           const functionName = toolCall.function.name;
           const args = JSON.parse(toolCall.function.arguments);
@@ -275,30 +334,59 @@ ${contextString}`;
           console.log(`Tool Called: ${functionName} with args:`, args);
 
           try {
-            if (functionName === 'make_booking') {
-              const result = await this.executeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
-              toolResponse = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${args.service} on ${args.date} at ${args.time} will be officially confirmed.`;
-            } 
-            else if (functionName === 'reschedule_booking') {
-              const success = await this.executeRescheduleTool(customerId, args.newDate, args.newTime);
-              toolResponse = success 
-                ? `SUCCESS: Booking rescheduled to ${args.newDate} at ${args.newTime}.`
-                : `ERROR: No upcoming booking found to reschedule.`;
-            } 
+            if (['propose_booking', 'confirm_booking', 'propose_reschedule', 'confirm_reschedule'].includes(functionName) && confirmedActionThisTurn) {
+              toolResponse = `ERROR: A booking/reschedule was already confirmed earlier in this same turn. The task is done - stop calling booking tools and just tell the customer it's confirmed.`;
+            }
+            else if (functionName === 'propose_booking') {
+              const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
+              proposedThisTurn = true;
+              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${args.date} at ${args.time}, deposit KSH ${result.depositAmount}. Tell the customer this deposit amount and ask them to explicitly confirm before you call confirm_booking - do NOT call confirm_booking in this same turn.`;
+            }
+            else if (functionName === 'confirm_booking') {
+              if (proposedThisTurn) {
+                toolResponse = `ERROR: You already called propose_booking earlier in this same turn - possibly with different details than what the customer last saw and agreed to. You must stop here and wait for the customer's own separate message explicitly confirming before calling confirm_booking.`;
+              } else {
+                const result = await this.executeConfirmBookingTool(customerId, initialDraftStep);
+                confirmedActionThisTurn = true;
+                toolResponse = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed. This is DONE - do not call any more booking tools this turn.`;
+              }
+            }
+            else if (functionName === 'propose_reschedule') {
+              if (!extracted.date || !extracted.time) {
+                toolResponse = `ERROR: The customer has not actually stated a specific new date and time in their message. Do NOT invent one - ask them what date and time they'd like to reschedule to.`;
+              } else {
+                const result = await this.executeProposeRescheduleTool(customerId, args.newDate, args.newTime);
+                proposedThisTurn = true;
+                toolResponse = `PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Tell the customer this and ask them to explicitly confirm before you call confirm_reschedule - do NOT call it in this same turn.`;
+              }
+            }
+            else if (functionName === 'confirm_reschedule') {
+              if (proposedThisTurn) {
+                toolResponse = `ERROR: You already called propose_reschedule earlier in this same turn - possibly with different details than what the customer last saw and agreed to. You must stop here and wait for the customer's own separate message explicitly confirming before calling confirm_reschedule.`;
+              } else {
+                const result = await this.executeConfirmRescheduleTool(customerId, initialDraftStep);
+                confirmedActionThisTurn = true;
+                toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${dayjs(result.newDateTime).format('YYYY-MM-DD HH:mm')}. This is DONE - do not call any more booking tools this turn.`;
+              }
+            }
             else if (functionName === 'add_session_note') {
               await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type);
               toolResponse = `SUCCESS: Note added to session on ${args.bookingDate}.`;
-            } 
+            }
             else if (functionName === 'get_available_slots') {
-              const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k)) || 'standard';
-              const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
-              const result: any = await bookingService.getAvailableSlots(args.date, duration);
-              
-              if (result.status === 'closed') {
-                toolResponse = `The business is CLOSED on ${args.date} because: ${result.reason}.`;
+              const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k));
+              if (!serviceKey) {
+                toolResponse = `ERROR: "${args.service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these.`;
               } else {
-                const slots = Array.isArray(result) ? result : [];
-                toolResponse = `Available slots for ${args.service} on ${args.date}: ${slots.length > 0 ? slots.join(', ') : 'None'}.`;
+                const duration = SERVICE_DURATIONS[serviceKey];
+                const result: any = await bookingService.getAvailableSlots(args.date, duration);
+
+                if (result.status === 'closed') {
+                  toolResponse = `The business is CLOSED on ${args.date} because: ${result.reason}.`;
+                } else {
+                  const slots = Array.isArray(result) ? result : [];
+                  toolResponse = `Available slots for ${args.service} on ${args.date}: ${slots.length > 0 ? slots.join(', ') : 'None'}.`;
+                }
               }
             } else {
               toolResponse = `ERROR: Tool ${functionName} not found.`;
@@ -316,24 +404,207 @@ ${contextString}`;
         }
       }
 
-      // After all tools are handled, get the final AI response
-      const secondResponse = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+      currentResponse = await openai.chat.completions.create({
+        model: CHAT_MODEL,
         messages,
-        tools: allTools
+        tools: allTools,
+        tool_choice: 'auto',
+        temperature: 0.3
       });
-
-      return secondResponse.choices[0].message.content || 'I have processed your request.';
+      tokensUsed += currentResponse.usage?.total_tokens || 0;
     }
 
-    // 7. Return normal text response
-    return responseMessage.content || "I'm sorry, I couldn't process that.";
+    return { content: currentResponse.choices[0].message.content || "I'm sorry, I couldn't process that.", tokensUsed };
   }
 
   /**
-   * Database Logic to execute the booking with M-Pesa payment initiation
+   * Handles an incoming message from a customer, with conversation history.
+   * Wraps runAgent with a circuit breaker, per-customer daily token budget,
+   * best-effort frustration detection, and AI job metrics. Never throws -
+   * always resolves to a string that's safe to send to the customer.
    */
-  private async executeBookingTool(customerId: string, name: string, service: string, date: string) {
+  async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
+    const startedAt = Date.now();
+
+    // Best-effort frustration flagging - keyword heuristic, no extra AI call/cost.
+    this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
+
+    if (circuitBreaker.isOpen()) {
+      await this.logAiJobMetric({
+        customerId, platform, success: false, isFallback: true,
+        failureReason: 'circuit_open', circuitBreakerTrip: true,
+        circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
+        latencyMs: Date.now() - startedAt
+      });
+      await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customer got the canned fallback message.');
+      return FALLBACK_MESSAGE;
+    }
+
+    const withinBudget = await this.checkTokenBudget(customerId);
+    if (!withinBudget) {
+      await this.logAiJobMetric({
+        customerId, platform, success: false, isFallback: true,
+        failureReason: 'daily_token_limit_exceeded', latencyMs: Date.now() - startedAt
+      });
+      await this.escalate(customerId, 'quota', 'Customer exceeded their daily AI token budget - customer got the canned fallback message.');
+      return FALLBACK_MESSAGE;
+    }
+
+    try {
+      const { content, tokensUsed } = await this.runAgent(customerId, userMessage, history, platform);
+      circuitBreaker.recordSuccess();
+      await this.recordTokenUsage(customerId, tokensUsed);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      this.touchCustomerMemory(customerId, userMessage, platform).catch(err => console.error('Customer memory update failed:', err));
+      return content;
+    } catch (error: any) {
+      console.error('Agent reply pipeline failed:', error);
+      const justTripped = circuitBreaker.recordFailure();
+      await this.logAiJobMetric({
+        customerId, platform, success: false, isFallback: true,
+        failureReason: String(error.message || error).slice(0, 200),
+        circuitBreakerTrip: justTripped,
+        circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
+        latencyMs: Date.now() - startedAt
+      });
+      if (justTripped) {
+        await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
+      }
+      return FALLBACK_MESSAGE;
+    }
+  }
+
+  /**
+   * Keyword-based frustration check, run on every inbound message. Cheap
+   * enough to never skip - no LLM call involved. Best-effort: failures here
+   * must never break the actual reply.
+   */
+  private async trackSentiment(customerId: string, userMessage: string): Promise<void> {
+    const { score, sentiment, confidence } = scoreSentiment(userMessage);
+
+    await prisma.sentimentScore.create({
+      data: { customerId, score, sentiment, confidence, triggeredAlert: score <= -0.6 }
+    });
+
+    if (score <= -0.6) {
+      await this.escalate(customerId, 'frustration', `Customer message scored ${score.toFixed(2)} (${sentiment}) on the frustration heuristic.`, score);
+    }
+  }
+
+  /**
+   * Keeps CustomerMemory current with cheap, directly-derivable facts (no
+   * extra LLM call - deeper summarization is a separate feature to build
+   * later if wanted). Best-effort: failures here must never break the reply.
+   */
+  private async touchCustomerMemory(customerId: string, userMessage: string, platform: string): Promise<void> {
+    const customer = await prisma.customer.findUnique({ where: { id: customerId } });
+    if (!customer) return; // customer doesn't exist yet (e.g. first-ever web chat message)
+
+    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + '…' : userMessage;
+    const existing = await prisma.customerMemory.findUnique({ where: { customerId } });
+
+    await prisma.customerMemory.upsert({
+      where: { customerId },
+      update: {
+        relationshipStage: existing?.relationshipStage === 'new' || !existing ? 'interested' : existing.relationshipStage,
+        lastInteractionSummary: summary,
+        preferredChannel: platform
+      },
+      create: {
+        customerId,
+        relationshipStage: 'interested',
+        lastInteractionSummary: summary,
+        preferredChannel: platform
+      }
+    });
+  }
+
+  /**
+   * Creates an escalation row so a human knows to follow up. Best-effort -
+   * a failure here must never break the actual customer-facing reply.
+   */
+  private async escalate(customerId: string, escalationType: string, description: string, sentimentScore?: number): Promise<void> {
+    try {
+      await prisma.escalation.create({
+        data: { customerId, escalationType, description, status: 'OPEN', sentimentScore }
+      });
+      await notifyAdmin(
+        'escalation',
+        `Customer ${customerId} needs attention`,
+        description,
+        { customerId, escalationType, sentimentScore }
+      );
+    } catch (err) {
+      console.error('Failed to create escalation:', err);
+    }
+  }
+
+  private async logAiJobMetric(data: {
+    customerId: string; platform: string; success: boolean; latencyMs: number;
+    failureReason?: string; isFallback?: boolean; circuitBreakerTrip?: boolean; circuitBreakerReason?: string;
+  }): Promise<void> {
+    try {
+      await prisma.aiJobMetric.create({ data });
+    } catch (err) {
+      console.error('Failed to log AI job metric:', err);
+    }
+  }
+
+  /**
+   * Resets and checks a customer's rolling daily token budget. Missing customer
+   * = allow (nothing to enforce yet). Only enforced in production - during
+   * development a single person's own testing traffic blows past a budget
+   * meant to catch runaway/abusive customers long before real usage would.
+   */
+  private async checkTokenBudget(customerId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return true;
+
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+      select: { dailyTokenUsage: true, tokenResetDate: true }
+    });
+    if (!customer) return true;
+
+    const isNewDay = !customer.tokenResetDate || customer.tokenResetDate.toDateString() !== new Date().toDateString();
+    const currentUsage = isNewDay ? 0 : customer.dailyTokenUsage;
+    return currentUsage < DAILY_TOKEN_CAP;
+  }
+
+  /** Records token usage after a successful reply, resetting the daily counter if a new day has started. */
+  private async recordTokenUsage(customerId: string, tokensUsed: number): Promise<void> {
+    if (tokensUsed <= 0) return;
+    try {
+      const customer = await prisma.customer.findUnique({
+        where: { id: customerId },
+        select: { dailyTokenUsage: true, tokenResetDate: true }
+      });
+      if (!customer) return; // customer created later in the flow (e.g. at booking time) - nothing to update yet
+
+      const isNewDay = !customer.tokenResetDate || customer.tokenResetDate.toDateString() !== new Date().toDateString();
+      await prisma.customer.update({
+        where: { id: customerId },
+        data: {
+          dailyTokenUsage: isNewDay ? tokensUsed : { increment: tokensUsed },
+          tokenResetDate: new Date(),
+          totalTokensUsed: { increment: tokensUsed }
+        }
+      });
+    } catch (err) {
+      console.error('Failed to record token usage:', err);
+    }
+  }
+
+  /**
+   * Step 1 of 2: validates the package/date and saves a BookingDraft in
+   * 'awaiting_confirmation' - tells the customer the deposit amount, but never
+   * touches M-Pesa. No payment prompt gets sent until confirm_booking runs,
+   * which can only happen on a later turn (see initialDraftStep in runAgent).
+   */
+  private async executeProposeBookingTool(customerId: string, name: string, service: string, date: string) {
+    if (!name || name.trim() === '' || name.trim().toLowerCase() === 'unknown') {
+      throw new Error('Customer name is required before proposing a booking. Ask the customer for their full name first.');
+    }
+
     let customer = await prisma.customer.findUnique({ where: { id: customerId } });
     if (!customer) {
        customer = await prisma.customer.create({
@@ -343,8 +614,10 @@ ${contextString}`;
        await prisma.customer.update({ where: { id: customerId }, data: { name }});
     }
 
-    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => service.toLowerCase().includes(k)) || 'standard';
-    const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => service.toLowerCase().includes(k));
+    if (!serviceKey) {
+      throw new Error(`"${service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these before booking.`);
+    }
 
     // Fetch package to get deposit amount
     const pkg = await prisma.package.findFirst({
@@ -352,8 +625,7 @@ ${contextString}`;
     });
     const depositAmount = pkg?.deposit || 2000;
 
-    // Create or update a Booking Draft instead of a real Booking
-    const draft = await prisma.bookingDraft.upsert({
+    await prisma.bookingDraft.upsert({
       where: { customerId: customer.id },
       update: {
         service: service,
@@ -361,7 +633,7 @@ ${contextString}`;
         time: dayjs(date).format('HH:mm'),
         dateTimeIso: date,
         name: name,
-        step: 'payment_pending'
+        step: 'awaiting_confirmation'
       },
       create: {
         customerId: customer.id,
@@ -370,14 +642,45 @@ ${contextString}`;
         time: dayjs(date).format('HH:mm'),
         dateTimeIso: date,
         name: name,
-        step: 'payment_pending'
+        step: 'awaiting_confirmation'
       }
+    });
+
+    return { depositAmount };
+  }
+
+  /**
+   * Step 2 of 2: actually sends the M-Pesa STK push. Only proceeds if
+   * initialDraftStep (captured at the START of this turn, before any tool
+   * calls ran) was already 'awaiting_confirmation' - meaning propose_booking
+   * happened on a PRIOR message, not earlier in this same turn. This is what
+   * guarantees the customer explicitly agreed before any prompt is sent.
+   */
+  private async executeConfirmBookingTool(customerId: string, initialDraftStep: string | undefined) {
+    if (initialDraftStep !== 'awaiting_confirmation') {
+      throw new Error('No pending booking proposal from a prior message. Call propose_booking first and wait for the customer to explicitly confirm on their own next message before calling confirm_booking.');
+    }
+
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!draft || draft.step !== 'awaiting_confirmation') {
+      throw new Error('No pending booking proposal found. Call propose_booking first.');
+    }
+
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
+    const pkg = await prisma.package.findFirst({
+      where: { name: { contains: serviceKey, mode: 'insensitive' } }
+    });
+    const depositAmount = pkg?.deposit || 2000;
+
+    await prisma.bookingDraft.update({
+      where: { customerId },
+      data: { step: 'payment_pending' }
     });
 
     // Initiate M-Pesa STK Push using draft ID as reference
     try {
       const mpesaResponse = await mpesaService.initiateStkPush(customerId, depositAmount, draft.id);
-      
+
       // Upsert payment record linked to the draft
       await prisma.payment.upsert({
         where: { bookingDraftId: draft.id },
@@ -400,6 +703,9 @@ ${contextString}`;
         success: true,
         draftId: draft.id,
         depositAmount: depositAmount,
+        service: draft.service,
+        date: draft.date,
+        time: draft.time,
         checkoutRequestId: mpesaResponse.CheckoutRequestID
       };
     } catch (error: any) {
@@ -409,37 +715,91 @@ ${contextString}`;
   }
 
   /**
-   * Logic to reschedule an upcoming booking
+   * Step 1 of 2 for rescheduling: validates there's an upcoming confirmed
+   * booking and saves the proposed new date/time on the customer's
+   * BookingDraft. Does NOT touch the real booking yet.
    */
-  private async executeRescheduleTool(customerId: string, newDate: string, newTime: string) {
-    // Find the nearest upcoming confirmed booking
+  private async executeProposeRescheduleTool(customerId: string, newDate: string, newTime: string) {
     const upcomingBooking = await prisma.booking.findFirst({
-      where: {
-        customerId: customerId,
-        status: 'confirmed',
-        dateTime: {
-          gte: new Date()
-        }
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' }
+    });
+
+    if (!upcomingBooking) {
+      throw new Error('No upcoming confirmed booking found to reschedule.');
+    }
+
+    // Verify the proposed new slot is actually free before proposing it - this
+    // can't be left to the model remembering to call get_available_slots first.
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k)) || 'standard';
+    const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+    const slotsResult: any = await bookingService.getAvailableSlots(newDate, duration, upcomingBooking.id);
+
+    if (slotsResult.status === 'closed') {
+      throw new Error(`We're closed on ${newDate} (${slotsResult.reason}). Ask the customer to pick a different date.`);
+    }
+    const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
+    if (!availableSlots.includes(newTime)) {
+      throw new Error(`${newTime} on ${newDate} isn't available. Available times that day: ${availableSlots.length > 0 ? availableSlots.join(', ') : 'none'}. Ask the customer to pick one of these instead.`);
+    }
+
+    const newDateTimeIso = `${newDate}T${newTime}`;
+
+    await prisma.bookingDraft.upsert({
+      where: { customerId },
+      update: {
+        bookingId: upcomingBooking.id,
+        service: upcomingBooking.service,
+        date: newDate,
+        time: newTime,
+        dateTimeIso: newDateTimeIso,
+        step: 'reschedule_confirm'
       },
-      include: { customer: true },
-      orderBy: {
-        dateTime: 'asc'
+      create: {
+        customerId,
+        bookingId: upcomingBooking.id,
+        service: upcomingBooking.service,
+        date: newDate,
+        time: newTime,
+        dateTimeIso: newDateTimeIso,
+        step: 'reschedule_confirm'
       }
     });
 
-    if (!upcomingBooking) return false;
+    return { service: upcomingBooking.service };
+  }
 
-    const newDateTime = new Date(`${newDate}T${newTime}`);
+  /**
+   * Step 2 of 2: applies the reschedule for real. Only proceeds if
+   * initialDraftStep (captured at the START of this turn) was already
+   * 'reschedule_confirm' - meaning propose_reschedule happened on a PRIOR
+   * message, not earlier in this same turn.
+   */
+  private async executeConfirmRescheduleTool(customerId: string, initialDraftStep: string | undefined) {
+    if (initialDraftStep !== 'reschedule_confirm') {
+      throw new Error('No pending reschedule proposal from a prior message. Call propose_reschedule first and wait for the customer to explicitly confirm on their own next message.');
+    }
 
-    // Update the booking
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!draft || draft.step !== 'reschedule_confirm' || !draft.bookingId || !draft.dateTimeIso) {
+      throw new Error('No pending reschedule proposal found. Call propose_reschedule first.');
+    }
+
+    const upcomingBooking = await prisma.booking.findUnique({
+      where: { id: draft.bookingId },
+      include: { customer: true }
+    });
+    if (!upcomingBooking) {
+      throw new Error('The booking being rescheduled no longer exists.');
+    }
+
+    const newDateTime = new Date(draft.dateTimeIso);
+
     await prisma.booking.update({
       where: { id: upcomingBooking.id },
-      data: {
-        dateTime: newDateTime
-      }
+      data: { dateTime: newDateTime }
     });
 
-    // Update Google Calendar
     if (upcomingBooking.googleEventId) {
       const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k)) || 'standard';
       const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
@@ -452,23 +812,36 @@ ${contextString}`;
       });
     }
 
-    return true;
+    await prisma.bookingDraft.delete({ where: { customerId } }).catch(err => console.error('Failed to clear reschedule draft:', err));
+
+    return { newDateTime, service: upcomingBooking.service };
   }
 
   /**
    * Logic to save a note for a customer session
    */
   private async executeAddNoteTool(customerId: string, bookingDate: string, note: string, type: string) {
-    // Try to find the booking for this date
-    const booking = await prisma.booking.findFirst({
-      where: {
-        customerId: customerId,
-        dateTime: {
-          gte: new Date(`${bookingDate}T00:00:00`),
-          lte: new Date(`${bookingDate}T23:59:59`)
-        }
-      }
-    });
+    // Customers often mention session details ("bringing family") before they've
+    // confirmed a booking date at all - the AI still calls this tool, but with no
+    // real date to work with (empty string, "unknown", etc). new Date() on that
+    // silently produces an Invalid Date, which Prisma then throws on. Validate
+    // first, and fall back to the nearest upcoming booking when there's no
+    // usable date, so the note still lands somewhere instead of crashing the tool call.
+    const parsedDate = bookingDate ? dayjs(bookingDate) : null;
+    const booking = parsedDate?.isValid()
+      ? await prisma.booking.findFirst({
+          where: {
+            customerId: customerId,
+            dateTime: {
+              gte: parsedDate.startOf('day').toDate(),
+              lte: parsedDate.endOf('day').toDate()
+            }
+          }
+        })
+      : await prisma.booking.findFirst({
+          where: { customerId, dateTime: { gte: new Date() } },
+          orderBy: { dateTime: 'asc' }
+        });
 
     await prisma.customerSessionNote.create({
       data: {

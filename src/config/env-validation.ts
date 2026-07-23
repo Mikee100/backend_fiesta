@@ -1,6 +1,6 @@
 const REQUIRED_ENV_VARS = [
   'DATABASE_URL',
-  'OPENAI_API_KEY',
+  'GROQ_API_KEY',
 ] as const;
 
 const PLACEHOLDER_PATTERNS: RegExp[] = [
@@ -63,9 +63,9 @@ export function validateStartupEnv(): void {
     }
   }
 
-  const openAiKey = process.env.OPENAI_API_KEY;
-  if (openAiKey && !openAiKey.startsWith('sk-')) {
-    errors.push('OPENAI_API_KEY must start with sk-');
+  const groqKey = process.env.GROQ_API_KEY;
+  if (groqKey && !groqKey.startsWith('gsk_')) {
+    errors.push('GROQ_API_KEY must start with gsk_');
   }
 
   const pineconeKey = process.env.PINECONE_API_KEY;
@@ -87,8 +87,8 @@ export function validateStartupEnv(): void {
     process.exit(1);
   }
 
-  const openAiMasked = mask(process.env.OPENAI_API_KEY || '');
+  const groqMasked = mask(process.env.GROQ_API_KEY || '');
   const dbConfigured = Boolean(process.env.DATABASE_URL);
   const pineconeConfigured = Boolean(process.env.PINECONE_API_KEY);
-  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, OPENAI_API_KEY=${openAiMasked}, PINECONE_API_KEY=${pineconeConfigured})`);
+  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, GROQ_API_KEY=${groqMasked}, PINECONE_API_KEY=${pineconeConfigured})`);
 }

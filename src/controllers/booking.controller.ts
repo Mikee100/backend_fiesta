@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../config/prisma';
+import { googleCalendarService } from '../services/calendar/calendar.service';
+import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
 
 export class BookingController {
   
@@ -26,17 +28,58 @@ export class BookingController {
    * Get available packages
    */
   async getPackages(req: Request, res: Response) {
-    // For now, return hardcoded packages matching the knowledge base
-    const packages = [
-      { id: 'standard', name: 'Standard Package', price: 10000, duration: '1.5h' },
-      { id: 'economy', name: 'Economy Package', price: 15000, duration: '2h' },
-      { id: 'executive', name: 'Executive Package', price: 20000, duration: '2.5h' },
-      { id: 'gold', name: 'Gold Package', price: 30000, duration: '2.5h' },
-      { id: 'platinum', name: 'Platinum Package', price: 35000, duration: '2.5h' },
-      { id: 'vip', name: 'VIP Package', price: 45000, duration: '3.5h' },
-      { id: 'vvip', name: 'VVIP Package', price: 50000, duration: '3.5h' },
-    ];
-    return res.json(packages);
+    try {
+      const packages = await prisma.package.findMany({ orderBy: { price: 'asc' } });
+      return res.json(packages);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  private pickPackageFields(body: any) {
+    const {
+      name, type, price, deposit, duration, images, makeup, outfits,
+      styling, photobook, photobookSize, mount, balloonBackdrop, wig, notes
+    } = body;
+    return { name, type, price, deposit, duration, images, makeup, outfits, styling, photobook, photobookSize, mount, balloonBackdrop, wig, notes };
+  }
+
+  /**
+   * Create a new package
+   */
+  async createPackage(req: Request, res: Response) {
+    try {
+      const pkg = await prisma.package.create({ data: this.pickPackageFields(req.body) });
+      return res.status(201).json(pkg);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Update an existing package
+   */
+  async updatePackage(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      const pkg = await prisma.package.update({ where: { id }, data: this.pickPackageFields(req.body) });
+      return res.json(pkg);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Delete a package
+   */
+  async deletePackage(req: Request, res: Response) {
+    try {
+      const { id } = req.params;
+      await prisma.package.delete({ where: { id } });
+      return res.status(204).send();
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
   }
 
   /**
@@ -113,6 +156,47 @@ export class BookingController {
         where: { id },
         data: { status: 'confirmed' }
       });
+      return res.json(booking);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Update a booking's date/time and/or service - used by admins to manually
+   * reschedule a booking (e.g. a customer called in directly instead of
+   * messaging), rather than only through the WhatsApp AI flow.
+   */
+  async updateBooking(req: Request, res: Response) {
+    try {
+      const id = req.params.id as string;
+      const { dateTime, service } = req.body;
+
+      const existing = await prisma.booking.findUnique({ where: { id }, include: { customer: true } });
+      if (!existing) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+      const customerName = existing.customer.name;
+
+      const newDateTime = dateTime ? new Date(dateTime) : existing.dateTime;
+      const newService = service || existing.service;
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => newService.toLowerCase().includes(k)) || 'standard';
+      const durationMinutes = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+
+      const booking = await prisma.booking.update({
+        where: { id },
+        data: { dateTime: newDateTime, service: newService, durationMinutes },
+      });
+
+      if (existing.googleEventId) {
+        await googleCalendarService.updateEvent(existing.googleEventId, {
+          service: newService,
+          dateTime: newDateTime,
+          customerName,
+          durationMinutes,
+        });
+      }
+
       return res.json(booking);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });

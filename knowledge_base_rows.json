@@ -628,5 +628,45 @@
     "mediaUrls": "[]",
     "createdAt": "2026-04-22 12:40:00.000",
     "updatedAt": "2026-04-22 12:40:00.000"
+  },
+  {
+    "id": "faq_manual_location_1",
+    "question": "Where is the photoshoot at?",
+    "answer": "We are located at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi, Kenya. Phone: 0720 111928. Email: info@fiestahouseattire.com.",
+    "category": "General",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-07-23 11:55:37.437",
+    "updatedAt": "2026-07-23 11:55:37.437"
+  },
+  {
+    "id": "faq_manual_location_2",
+    "question": "Where does the shoot take place?",
+    "answer": "We are located at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi, Kenya. Phone: 0720 111928. Email: info@fiestahouseattire.com.",
+    "category": "General",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-07-23 11:55:37.437",
+    "updatedAt": "2026-07-23 11:55:37.437"
+  },
+  {
+    "id": "faq_manual_location_3",
+    "question": "Where do I come for my session?",
+    "answer": "We are located at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi, Kenya. Phone: 0720 111928. Email: info@fiestahouseattire.com.",
+    "category": "General",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-07-23 11:55:37.437",
+    "updatedAt": "2026-07-23 11:55:37.437"
+  },
+  {
+    "id": "faq_manual_location_4",
+    "question": "Which area/neighborhood is the studio in?",
+    "answer": "We are located at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi, Kenya. Phone: 0720 111928. Email: info@fiestahouseattire.com.",
+    "category": "General",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-07-23 11:55:37.437",
+    "updatedAt": "2026-07-23 11:55:37.437"
   }
 ]

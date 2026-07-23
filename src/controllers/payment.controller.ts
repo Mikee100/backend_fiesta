@@ -105,8 +105,34 @@ export class PaymentController {
           // Notify customer via WhatsApp
           const message = `🌟 *Payment Received!* 🌟\n\nYour booking for *${targetBooking.service}* on *${targetBooking.dateTime.toLocaleDateString()}* at *${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}* has been officially *CONFIRMED*.\n\nWe look forward to seeing you at Fiesta House Attire & Maternity! ✨`;
           await whatsappService.sendMessage(targetBooking.customer.id, message);
-          
+
           console.log(`Booking ${targetBooking.id} confirmed after successful payment.`);
+
+          // Best-effort: keep CustomerMemory current with this confirmed booking.
+          // Never let a memory-update failure break the payment confirmation flow.
+          try {
+            const existingMemory = await prisma.customerMemory.findUnique({ where: { customerId: targetBooking.customerId } });
+            const newTotal = (existingMemory?.totalBookings || 0) + 1;
+            const preferredPackages = existingMemory?.preferredPackages || [];
+            if (!preferredPackages.includes(targetBooking.service)) preferredPackages.push(targetBooking.service);
+
+            await prisma.customerMemory.upsert({
+              where: { customerId: targetBooking.customerId },
+              update: {
+                totalBookings: { increment: 1 },
+                relationshipStage: newTotal > 1 ? 'returning' : 'booked',
+                preferredPackages
+              },
+              create: {
+                customerId: targetBooking.customerId,
+                totalBookings: 1,
+                relationshipStage: 'booked',
+                preferredPackages: [targetBooking.service]
+              }
+            });
+          } catch (memErr) {
+            console.error('Failed to update customer memory after booking:', memErr);
+          }
         }
       } else {
         // Failed

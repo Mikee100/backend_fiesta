@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { agentService } from '../services/agent/agent.service';
 import { instagramService } from '../services/messaging/instagram.service';
+import * as messageDebouncer from '../services/messaging/debounce.service';
 import prisma from '../config/prisma';
 import dotenv from 'dotenv';
 
@@ -43,10 +44,18 @@ export class InstagramController {
                 // We only care about message events
                 if (event.message && !event.message.is_echo) {
                   const senderId = event.sender.id; // Instagram scoped user ID
-                  const msgBody = event.message.text;
                   const msgId = event.message.mid;
 
-                  if (!msgBody) continue;
+                  // Non-text messages (images, audio, etc.) arrive as attachments,
+                  // not `.text` - previously these were silently dropped with no
+                  // reply, leaving the customer thinking the bot was broken.
+                  const attachmentType = event.message.attachments?.[0]?.type;
+                  const isNonText = !event.message.text;
+                  const msgBody = isNonText
+                    ? `[Customer sent ${attachmentType ? `a${['image','audio'].includes(attachmentType) ? 'n' : ''} ${attachmentType}` : 'a message'} - not yet supported by the AI]`
+                    : event.message.text;
+
+                  if (isNonText && !attachmentType) continue; // no text and no recognizable attachment - nothing to process
 
                   console.log(`Instagram message from ${senderId}: ${msgBody}`);
 
@@ -61,17 +70,17 @@ export class InstagramController {
                   }
 
                   // 2. Ensure Customer exists
-                  let customer = await prisma.customer.findFirst({ 
-                    where: { instagramId: senderId } 
+                  let customer = await prisma.customer.findFirst({
+                    where: { instagramId: senderId }
                   });
-                  
+
                   if (!customer) {
-                    customer = await prisma.customer.create({ 
-                      data: { 
-                        instagramId: senderId, 
+                    customer = await prisma.customer.create({
+                      data: {
+                        instagramId: senderId,
                         name: 'Instagram User',
                         // Note: Prisma will auto-generate the CUID for the 'id' field
-                      } 
+                      }
                     });
                   }
 
@@ -94,39 +103,20 @@ export class InstagramController {
                     throw e;
                   }
 
-                  // 4. Load recent history (last 10 messages)
-                  const recentMessages = await prisma.message.findMany({
-                    where: { customerId: customer.id },
-                    orderBy: { createdAt: 'desc' },
-                    take: 10,
-                    skip: 1 // Skip the message we just saved
-                  });
-
-                  // Format for OpenAI (reverse because we took 'desc')
-                  const history = recentMessages.reverse().map(m => ({
-                    role: (m.direction === 'inbound' ? 'user' : 'assistant') as 'user' | 'assistant',
-                    content: m.content
-                  }));
-
-                  // 5. Mark as read
                   await instagramService.markAsRead(senderId);
 
-                  // 6. Get AI Response with history
-                  const aiReply = await agentService.handleMessage(customer.id, msgBody, history, 'instagram');
-
-                  // 7. Save Outbound Message
-                  await prisma.message.create({
-                    data: {
-                      content: aiReply,
-                      platform: 'instagram',
-                      direction: 'outbound',
-                      customerId: customer.id,
-                      handledBy: 'ai'
-                    }
-                  });
-
-                  // 8. Send reply back to Instagram
-                  await instagramService.sendMessage(senderId, aiReply);
+                  if (isNonText) {
+                    const reply = "Thanks for sending that! I can only read text messages right now, but I've saved it and one of our team members will take a look. Feel free to type out your question in the meantime and I'll answer right away.";
+                    await prisma.message.create({
+                      data: { content: reply, platform: 'instagram', direction: 'outbound', customerId: customer.id, handledBy: 'system' }
+                    });
+                    await instagramService.sendMessage(senderId, reply);
+                  } else {
+                    // Debounce: if the customer sends several messages in quick
+                    // succession, wait for them to pause before running the AI once
+                    // on the whole burst, instead of a disjointed reply per message.
+                    messageDebouncer.scheduleTurn(customer.id, () => this.processPendingTurn(customer!.id, senderId));
+                  }
                 }
               }
             }
@@ -143,6 +133,56 @@ export class InstagramController {
         console.error('Error response data:', JSON.stringify(error.response.data, null, 2));
       }
       return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Runs after a customer has paused sending messages (see debounce.service.ts).
+   * Gathers every inbound message received since the last reply - which may be
+   * more than one if they sent a burst - and processes them as a single turn.
+   */
+  private async processPendingTurn(customerId: string, senderId: string): Promise<void> {
+    try {
+      const lastOutbound = await prisma.message.findFirst({
+        where: { customerId, platform: 'instagram', direction: 'outbound' },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      const pendingInbound = await prisma.message.findMany({
+        where: {
+          customerId,
+          platform: 'instagram',
+          direction: 'inbound',
+          ...(lastOutbound ? { createdAt: { gt: lastOutbound.createdAt } } : {})
+        },
+        orderBy: { createdAt: 'asc' }
+      });
+
+      if (pendingInbound.length === 0) return; // nothing unresponded - shouldn't normally happen
+
+      const combinedMessage = pendingInbound.map(m => m.content).join('\n');
+
+      const recentMessages = await prisma.message.findMany({
+        where: { customerId, createdAt: { lt: pendingInbound[0].createdAt } },
+        orderBy: { createdAt: 'desc' },
+        take: 10
+      });
+      const history = recentMessages.reverse().map(m => ({
+        role: (m.direction === 'inbound' ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: m.content
+      }));
+
+      // handleMessage never throws - on any internal failure it resolves to a
+      // safe fallback string, logged distinctly in AiJobMetric.
+      const aiReply = await agentService.handleMessage(customerId, combinedMessage, history, 'instagram');
+
+      await prisma.message.create({
+        data: { content: aiReply, platform: 'instagram', direction: 'outbound', customerId, handledBy: 'ai' }
+      });
+
+      await instagramService.sendMessage(senderId, aiReply);
+    } catch (error: any) {
+      console.error('Error processing debounced Instagram turn:', error);
     }
   }
 

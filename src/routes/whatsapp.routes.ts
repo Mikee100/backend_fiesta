@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { whatsappController } from '../controllers/whatsapp.controller';
+import { verifyWhatsAppWebhook } from '../middleware/verifyWebhook';
 
 const router = Router();
 
@@ -7,7 +8,7 @@ const router = Router();
 router.get('/', whatsappController.verifyWebhook);
 
 // Handle Incoming Messages
-router.post('/', whatsappController.handleWebhook);
+router.post('/', verifyWhatsAppWebhook, whatsappController.handleWebhook.bind(whatsappController));
 
 // Dashboard Routes
 router.get('/conversations', whatsappController.getConversations.bind(whatsappController));
