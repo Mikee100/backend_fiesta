@@ -12,6 +12,7 @@ interface InvoicePdfData {
   discount: number;
   total: number;
   depositPaid: number;
+  depositReceipts: string[];
   balanceDue: number;
   createdAt: Date;
 }
@@ -25,6 +26,7 @@ const MUTED = '#6b7280';
 const BORDER = '#e5e7eb';
 
 const PAGE_WIDTH = 595.28; // A4 in points
+const PAGE_HEIGHT = 841.89;
 const MARGIN = 50;
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 
@@ -58,9 +60,10 @@ export class InvoiceService {
       // --- Billed To / Session info ---
       const infoY = 125;
       doc.fillColor(MUTED).font('Helvetica-Bold').fontSize(9).text('BILLED TO', MARGIN, infoY);
-      doc.fillColor(INK).font('Helvetica').fontSize(11)
-        .text(data.customerName, MARGIN, infoY + 14)
-        .fillColor(MUTED).fontSize(10).text(data.customerPhone || '', MARGIN, infoY + 30);
+      doc.fillColor(INK).font('Helvetica').fontSize(11).text(data.customerName, MARGIN, infoY + 14);
+      if (data.customerPhone) {
+        doc.fillColor(MUTED).fontSize(10).text(data.customerPhone, MARGIN, infoY + 30);
+      }
 
       const sessionX = MARGIN + CONTENT_WIDTH / 2;
       doc.fillColor(MUTED).font('Helvetica-Bold').fontSize(9).text('SESSION', sessionX, infoY);
@@ -106,6 +109,11 @@ export class InvoiceService {
 
       summaryRow('Total', `KSh ${data.total.toLocaleString()}`, true);
       summaryRow('Deposit Paid', `KSh ${data.depositPaid.toLocaleString()}`);
+      if (data.depositReceipts.length > 0) {
+        doc.fillColor(MUTED).font('Helvetica').fontSize(8)
+          .text(`M-Pesa Receipt${data.depositReceipts.length > 1 ? 's' : ''}: ${data.depositReceipts.join(', ')}`, summaryLabelX, y, { width: 228, align: 'right' });
+        y += 12;
+      }
       doc.moveTo(summaryLabelX, y).lineTo(PAGE_WIDTH - MARGIN, y).strokeColor(BORDER).lineWidth(1).stroke();
       y += 8;
 
@@ -121,11 +129,24 @@ export class InvoiceService {
       }
       y += 50;
 
+      // --- Payment instructions (only relevant while a balance remains) ---
+      if (data.balanceDue > 0) {
+        doc.rect(MARGIN, y, CONTENT_WIDTH, 34).fill(BRAND_LIGHT);
+        doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(9).text('HOW TO PAY THE BALANCE', MARGIN + 12, y + 8);
+        doc.fillColor(INK).font('Helvetica').fontSize(9)
+          .text('Pay via M-Pesa Till Number 670241 on the day of your session, or transfer in advance.', MARGIN + 12, y + 20);
+        y += 34 + 16;
+      }
+
       // --- Footer ---
       doc.moveTo(MARGIN, y).lineTo(PAGE_WIDTH - MARGIN, y).strokeColor(BORDER).lineWidth(1).stroke();
       y += 16;
       doc.fillColor(MUTED).font('Helvetica').fontSize(9)
         .text('Thank you for choosing Fiesta House Attire & Maternity. We look forward to seeing you!', MARGIN, y, { width: CONTENT_WIDTH, align: 'center' });
+
+      // --- Closing brand bar, mirrors the header so the page doesn't just
+      // trail off into blank space below a short line-item list ---
+      doc.rect(0, PAGE_HEIGHT - 12, PAGE_WIDTH, 12).fill(BRAND);
 
       doc.end();
     });

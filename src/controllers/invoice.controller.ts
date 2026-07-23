@@ -82,6 +82,7 @@ export class InvoiceController {
 
       const payments = await prisma.payment.findMany({ where: { bookingId, status: 'success' } });
       const depositPaid = payments.reduce((sum, p) => sum + p.amount, 0);
+      const depositReceipts = payments.map((p) => p.mpesaReceipt).filter((r): r is string => !!r);
       const balanceDue = Math.max(total - depositPaid, 0);
 
       const year = new Date().getFullYear();
@@ -99,6 +100,7 @@ export class InvoiceController {
         discount,
         total,
         depositPaid,
+        depositReceipts,
         balanceDue,
         createdAt: new Date(),
       });
