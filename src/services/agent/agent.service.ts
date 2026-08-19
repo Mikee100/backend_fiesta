@@ -126,6 +126,71 @@ export class BookingExtractor {
 
 
 export class AgentService {
+  private inferIntent(userMessage: string): { intent: string; confidence: number; rule: string } {
+    const text = userMessage.toLowerCase();
+
+    if (/(reschedule|change|move|postpone)/.test(text)) return { intent: 'reschedule', confidence: 0.92, rule: 'reschedule_keywords' };
+    if (/(book|booking|appointment|session)/.test(text)) return { intent: 'booking', confidence: 0.88, rule: 'booking_keywords' };
+    if (/(pay|paid|payment|mpesa|deposit|receipt|balance)/.test(text)) return { intent: 'payment', confidence: 0.9, rule: 'payment_keywords' };
+    if (/(price|cost|package|rate|services|service list)/.test(text)) return { intent: 'pricing', confidence: 0.86, rule: 'pricing_keywords' };
+    if (/(where|location|located|address)/.test(text)) return { intent: 'location', confidence: 0.9, rule: 'location_keywords' };
+    if (/(time|hours|open|close|availability|available|how long|duration)/.test(text)) return { intent: 'availability', confidence: 0.82, rule: 'availability_keywords' };
+
+    return { intent: 'general_inquiry', confidence: 0.35, rule: 'fallback_default' };
+  }
+
+  private inferOutcome(aiResponse: string, isFallback: boolean): string {
+    if (isFallback) return 'escalated';
+
+    const text = aiResponse.toLowerCase();
+    if (text.includes('m-pesa') && text.includes('deposit')) return 'booked';
+    if (text.includes('rescheduled')) return 'resolved';
+    if (text.includes('team member') || text.includes('follow up')) return 'escalated';
+
+    return 'resolved';
+  }
+
+  private async logConversationLearning(params: {
+    customerId: string;
+    userMessage: string;
+    aiResponse: string;
+    platform: string;
+    latencyMs: number;
+    wasSuccessful: boolean;
+    isFallback: boolean;
+  }): Promise<void> {
+    try {
+      const { score, sentiment, confidence: toneConfidence } = scoreSentiment(params.userMessage);
+      const inferred = this.inferIntent(params.userMessage);
+      const conversationLength = Math.max(1, params.userMessage.split('\n').filter(Boolean).length);
+
+      await prisma.conversationLearning.create({
+        data: {
+          customerId: params.customerId,
+          userMessage: params.userMessage,
+          aiResponse: params.aiResponse,
+          extractedIntent: inferred.intent,
+          detectedEmotionalTone: sentiment,
+          wasSuccessful: params.wasSuccessful,
+          conversationOutcome: this.inferOutcome(params.aiResponse, params.isFallback),
+          conversationLength,
+          timeToResolution: Math.max(1, Math.round(params.latencyMs / 1000)),
+          metadata: {
+            platform: params.platform,
+            isFallback: params.isFallback,
+            sentimentScore: score,
+            toneConfidence,
+            intentConfidence: inferred.confidence,
+            intentRule: inferred.rule,
+            classifierVersion: 'v2',
+          },
+        },
+      });
+    } catch (err) {
+      console.error('Failed to log conversation learning:', err);
+    }
+  }
+
   private getSystemPrompt(businessContext: string, platform: string): string {
     const now = dayjs().format('dddd, MMMM D, YYYY h:mm A');
     return `Current Date/Time: ${now}
@@ -334,8 +399,20 @@ ${contextString}`;
       for (const toolCall of responseMessage.tool_calls!) {
         if (toolCall.type === 'function') {
           const functionName = toolCall.function.name;
-          const args = JSON.parse(toolCall.function.arguments);
+          let args: any = {};
           let toolResponse: string;
+
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch {
+            toolResponse = `ERROR: Invalid arguments for tool ${functionName}. Ask the customer for the missing details again and then retry the correct tool.`;
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: toolResponse
+            });
+            continue;
+          }
 
           console.log(`Tool Called: ${functionName} with args:`, args);
 
@@ -436,11 +513,21 @@ ${contextString}`;
     this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
 
     if (circuitBreaker.isOpen()) {
+      const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
         failureReason: 'circuit_open', circuitBreakerTrip: true,
         circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
         latencyMs: Date.now() - startedAt
+      });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: fallbackReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: false,
+        isFallback: true,
       });
       // Rate-limited to one admin alert per cooldown window - the circuit
       // stays open across many incoming messages while tripped, and without
@@ -448,17 +535,27 @@ ${contextString}`;
       if (shouldNotifyOutage()) {
         await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
       }
-      return FALLBACK_MESSAGE;
+      return fallbackReply;
     }
 
     const withinBudget = await this.checkTokenBudget(customerId);
     if (!withinBudget) {
+      const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
         failureReason: 'daily_token_limit_exceeded', latencyMs: Date.now() - startedAt
       });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: fallbackReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: false,
+        isFallback: true,
+      });
       await this.escalate(customerId, 'quota', 'Customer exceeded their daily AI token budget - customer got the canned fallback message.');
-      return FALLBACK_MESSAGE;
+      return fallbackReply;
     }
 
     // Deterministic confirm fast-path: short explicit confirmations like
@@ -468,6 +565,15 @@ ${contextString}`;
       const immediate = await this.tryImmediateConfirmation(customerId);
       if (immediate) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: immediate,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
         return immediate;
       }
     }
@@ -477,18 +583,37 @@ ${contextString}`;
       circuitBreaker.recordSuccess();
       await this.recordTokenUsage(customerId, tokensUsed);
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: content,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
       this.touchCustomerMemory(customerId, userMessage, platform).catch(err => console.error('Customer memory update failed:', err));
       return content;
     } catch (error: any) {
       console.error('Agent reply pipeline failed:', error);
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
+      const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
         failureReason: isOutage ? 'groq_daily_token_cap_reached' : String(error.message || error).slice(0, 200),
         circuitBreakerTrip: justTripped,
         circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
         latencyMs: Date.now() - startedAt
+      });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: fallbackReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: false,
+        isFallback: true,
       });
       // The Groq account-wide daily cap is a total outage affecting every
       // customer, not this one - flag it distinctly (and rate-limited) so it
@@ -498,7 +623,7 @@ ${contextString}`;
       } else if (justTripped && !isOutage) {
         await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
       }
-      return FALLBACK_MESSAGE;
+      return fallbackReply;
     }
   }
 
