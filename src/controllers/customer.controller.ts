@@ -2,21 +2,120 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 
 export class CustomerController {
+  private getActivityWindows() {
+    const now = new Date();
+
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const startOfYesterday = new Date(startOfToday);
+    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+
+    const endOfYesterday = new Date(startOfToday.getTime() - 1);
+    const onlineSince = new Date(now.getTime() - 5 * 60 * 1000);
+
+    return { now, startOfToday, startOfYesterday, endOfYesterday, onlineSince };
+  }
+
+  private inRange(date: Date, start: Date, end: Date) {
+    return date >= start && date <= end;
+  }
   
   /**
    * Get all customers
    */
   async getCustomers(req: Request, res: Response) {
     try {
+      const segment = String(req.query.segment || 'all').toLowerCase();
+      const { now, startOfToday, startOfYesterday, endOfYesterday, onlineSince } = this.getActivityWindows();
+
       const customers = await prisma.customer.findMany({
         orderBy: { updatedAt: 'desc' },
         include: {
+          messages: {
+            select: { createdAt: true, content: true, direction: true, platform: true },
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+          },
           _count: {
             select: { bookings: true, messages: true }
           }
         }
       });
-      return res.json(customers);
+
+      const enriched = customers.map((customer) => {
+        const lastMessage = customer.messages[0];
+        const lastActivityAt = lastMessage?.createdAt || customer.updatedAt;
+
+        return {
+          ...customer,
+          lastActivityAt,
+          lastMessagePreview: lastMessage?.content || null,
+          lastMessageDirection: lastMessage?.direction || null,
+          lastMessagePlatform: lastMessage?.platform || null,
+        };
+      });
+
+      const filtered = enriched.filter((customer) => {
+        const activity = new Date(customer.lastActivityAt);
+
+        if (segment === 'online') return activity >= onlineSince && activity <= now;
+        if (segment === 'today') return activity >= startOfToday && activity <= now;
+        if (segment === 'yesterday') return this.inRange(activity, startOfYesterday, endOfYesterday);
+
+        return true;
+      });
+
+      filtered.sort((a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime());
+      return res.json(filtered);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Summary counters for customer activity dashboard segments.
+   */
+  async getActivitySummary(req: Request, res: Response) {
+    try {
+      const { now, startOfToday, startOfYesterday, endOfYesterday, onlineSince } = this.getActivityWindows();
+
+      const [
+        onlineRows,
+        todayRows,
+        yesterdayRows,
+        newToday,
+        pausedAi,
+        totalCustomers,
+      ] = await Promise.all([
+        prisma.message.findMany({
+          where: { createdAt: { gte: onlineSince, lte: now } },
+          select: { customerId: true },
+          distinct: ['customerId'],
+        }),
+        prisma.message.findMany({
+          where: { createdAt: { gte: startOfToday, lte: now } },
+          select: { customerId: true },
+          distinct: ['customerId'],
+        }),
+        prisma.message.findMany({
+          where: { createdAt: { gte: startOfYesterday, lte: endOfYesterday } },
+          select: { customerId: true },
+          distinct: ['customerId'],
+        }),
+        prisma.customer.count({ where: { createdAt: { gte: startOfToday, lte: now } } }),
+        prisma.customer.count({ where: { OR: [{ aiEnabled: false }, { isAiPaused: true }] } }),
+        prisma.customer.count(),
+      ]);
+
+      return res.json({
+        onlineNow: onlineRows.length,
+        activeToday: todayRows.length,
+        activeYesterday: yesterdayRows.length,
+        newToday,
+        pausedAi,
+        totalCustomers,
+      });
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

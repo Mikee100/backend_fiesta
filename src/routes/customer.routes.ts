@@ -5,6 +5,7 @@ const router = Router();
 
 router.get('/', customerController.getCustomers.bind(customerController));
 router.get('/stats/averages', customerController.getAverageActivity.bind(customerController));
+router.get('/stats/activity-summary', customerController.getActivitySummary.bind(customerController));
 router.get('/:id', customerController.getCustomer.bind(customerController));
 router.get('/:id/messages', customerController.getMessages.bind(customerController));
 router.get('/:id/session-notes', customerController.getSessionNotes.bind(customerController));
