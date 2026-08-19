@@ -7,7 +7,7 @@ import { bookingService } from '../booking/booking.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
-import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE } from './resilience.service';
+import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
@@ -17,7 +17,7 @@ const openai = new OpenAI({
   baseURL: 'https://api.groq.com/openai/v1',
 });
 
-const CHAT_MODEL = 'llama-3.3-70b-versatile';
+const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant';
 
 // --- Hybrid Booking Extractor ---
 type BookingDetails = {
@@ -138,7 +138,7 @@ ${businessContext}
 Instructions:
 1. Be friendly, empathetic, and professional.
 2. If you know the customer's name, greet them by name. If the name is "Unknown", you MUST ask for their real full name before proposing any booking - never invent or reuse a placeholder name.
-3. If the customer asks about their past sessions or bookings, use the "Past Bookings" information provided above.
+3. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
 4. If a customer asks a question, answer it using ONLY the provided Business Context.
 5. PLATFORM RESTRICTIONS: You are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS. If a user wants to book, politely tell them that bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue.
 6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their real Name, the Service they want, a Date, and a Time.
@@ -171,6 +171,11 @@ Instructions:
     });
 
     const customerName = customer?.name && customer.name !== 'WhatsApp User' ? customer.name : 'Unknown';
+    const now2 = dayjs();
+    const upcomingBooking = customer?.bookings.find(b => dayjs(b.dateTime).isAfter(now2) && b.status !== 'cancelled');
+    const upcomingBookingSummary = upcomingBooking
+      ? `${upcomingBooking.service} on ${dayjs(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status})`
+      : 'None';
     const pastBookings = customer?.bookings.map(b =>
       `${b.service} on ${dayjs(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
     ).join(', ') || 'No past bookings';
@@ -196,6 +201,7 @@ Instructions:
 
     const fullContext = `Customer Phone: ${customerId}
 Customer Name: ${customerName}
+Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
 Past Bookings: ${pastBookings}
 Customer Memory: ${memorySummary}
 
@@ -265,7 +271,7 @@ ${contextString}`;
           type: 'function',
           function: {
             name: 'propose_reschedule',
-            description: "Proposes moving the customer's upcoming booking to a new date/time they just told you. NEVER invent or guess a date/time yourself - only call this with a date/time the customer actually stated in their own message. If they just asked to reschedule without giving a new date/time, do not call this at all - ask them what date/time they want instead. Does NOT change anything yet - you must get an explicit yes/confirm from the customer on a LATER message before calling confirm_reschedule.",
+            description: "Proposes moving the customer's upcoming booking to a new date/time they just told you. Only call this if the customer EXPLICITLY asked to reschedule/change/move/postpone their booking - merely asking about their appointment or its details (e.g. 'tell me about my appointment') is NOT a reschedule request, do not call this tool for that. NEVER invent or guess a date/time yourself - only call this with a date/time the customer actually stated in their own message. If they asked to reschedule without giving a new date/time, do not call this at all - ask them what date/time they want instead. Does NOT change anything yet - you must get an explicit yes/confirm from the customer on a LATER message before calling confirm_reschedule.",
             parameters: {
               type: 'object',
               properties: {
@@ -436,7 +442,12 @@ ${contextString}`;
         circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
         latencyMs: Date.now() - startedAt
       });
-      await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customer got the canned fallback message.');
+      // Rate-limited to one admin alert per cooldown window - the circuit
+      // stays open across many incoming messages while tripped, and without
+      // this guard each one would raise its own duplicate escalation.
+      if (shouldNotifyOutage()) {
+        await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
+      }
       return FALLBACK_MESSAGE;
     }
 
@@ -450,6 +461,17 @@ ${contextString}`;
       return FALLBACK_MESSAGE;
     }
 
+    // Deterministic confirm fast-path: short explicit confirmations like
+    // "yes" / "confirm" should finalize an already pending draft instead of
+    // relying on the model to pick the right tool every time.
+    if ((platform === 'whatsapp' || platform === 'web') && this.isExplicitConfirmation(userMessage)) {
+      const immediate = await this.tryImmediateConfirmation(customerId);
+      if (immediate) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        return immediate;
+      }
+    }
+
     try {
       const { content, tokensUsed } = await this.runAgent(customerId, userMessage, history, platform);
       circuitBreaker.recordSuccess();
@@ -460,18 +482,59 @@ ${contextString}`;
     } catch (error: any) {
       console.error('Agent reply pipeline failed:', error);
       const justTripped = circuitBreaker.recordFailure();
+      const isOutage = isProviderRateLimitError(error);
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
-        failureReason: String(error.message || error).slice(0, 200),
+        failureReason: isOutage ? 'groq_daily_token_cap_reached' : String(error.message || error).slice(0, 200),
         circuitBreakerTrip: justTripped,
         circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
         latencyMs: Date.now() - startedAt
       });
-      if (justTripped) {
+      // The Groq account-wide daily cap is a total outage affecting every
+      // customer, not this one - flag it distinctly (and rate-limited) so it
+      // doesn't get buried among normal per-customer escalations.
+      if (isOutage && shouldNotifyOutage()) {
+        await this.escalate(customerId, 'error', `AI PROVIDER OUTAGE: Groq's daily token limit has been reached - ALL customers are currently getting the fallback message, not just this one. It resets on its own; check console.groq.com/settings/billing if this keeps recurring. Original error: ${error.message}`);
+      } else if (justTripped && !isOutage) {
         await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
       }
       return FALLBACK_MESSAGE;
     }
+  }
+
+  private isExplicitConfirmation(userMessage: string): boolean {
+    const normalized = userMessage
+      .trim()
+      .toLowerCase()
+      .replace(/[!?.,]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!normalized || normalized.length > 40) return false;
+
+    const confirmations = new Set([
+      'yes', 'y', 'yep', 'yeah', 'ok', 'okay', 'confirm', 'confirmed',
+      'go ahead', 'go-ahead', 'proceed', 'continue', 'sawa', 'ndio'
+    ]);
+
+    return confirmations.has(normalized);
+  }
+
+  private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!draft?.step) return null;
+
+    if (draft.step === 'awaiting_confirmation') {
+      const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation');
+      return `Great - I've sent an M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Please enter your PIN to complete payment. Once successful, your booking for ${result.service} on ${result.date} at ${result.time} will be confirmed.`;
+    }
+
+    if (draft.step === 'reschedule_confirm') {
+      const result = await this.executeConfirmRescheduleTool(customerId, 'reschedule_confirm');
+      return `Perfect - your ${result.service} session has been rescheduled to ${dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+    }
+
+    return null;
   }
 
   /**
