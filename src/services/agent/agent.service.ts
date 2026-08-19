@@ -334,8 +334,20 @@ ${contextString}`;
       for (const toolCall of responseMessage.tool_calls!) {
         if (toolCall.type === 'function') {
           const functionName = toolCall.function.name;
-          const args = JSON.parse(toolCall.function.arguments);
+          let args: any = {};
           let toolResponse: string;
+
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch {
+            toolResponse = `ERROR: Invalid arguments for tool ${functionName}. Ask the customer for the missing details again and then retry the correct tool.`;
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: toolResponse
+            });
+            continue;
+          }
 
           console.log(`Tool Called: ${functionName} with args:`, args);
 

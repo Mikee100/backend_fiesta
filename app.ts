@@ -46,6 +46,29 @@ const io = new Server(httpServer, {
   }
 });
 
+const unreadCountCache = {
+  value: 0,
+  expiresAt: 0,
+};
+
+const unreadCountTtlMs = 5000;
+
+const invalidateUnreadCountCache = () => {
+  unreadCountCache.expiresAt = 0;
+};
+
+const getUnreadNotificationCount = async (): Promise<number> => {
+  const now = Date.now();
+  if (now < unreadCountCache.expiresAt) {
+    return unreadCountCache.value;
+  }
+
+  const count = await prisma.notification.count({ where: { read: false } });
+  unreadCountCache.value = count;
+  unreadCountCache.expiresAt = now + unreadCountTtlMs;
+  return count;
+};
+
 // Middleware
 app.use(cors());
 // Captures the raw request body alongside the parsed JSON - needed to verify
@@ -75,6 +98,15 @@ io.on('connection', (socket) => {
 // already listens for.
 notificationEvents.on('notification', (notification) => {
   io.to('admin').emit('newNotification', notification);
+  void (async () => {
+    try {
+      invalidateUnreadCountCache();
+      const count = await getUnreadNotificationCount();
+      io.to('admin').emit('notificationCountUpdate', { count });
+    } catch (err) {
+      console.error('Failed to emit notificationCountUpdate:', err);
+    }
+  })();
 });
 
 // Attach io to request for use in controllers
@@ -178,7 +210,7 @@ app.get('/api/notifications', async (req, res) => {
 
 app.get('/api/notifications/unread-count', async (req, res) => {
   try {
-    const count = await prisma.notification.count({ where: { read: false } });
+    const count = await getUnreadNotificationCount();
     return res.json({ count });
   } catch (e: any) {
     return res.status(500).json({ error: e.message });
@@ -192,6 +224,9 @@ app.patch('/api/notifications/:id/read', async (req, res) => {
       where: { id },
       data: { read: true },
     });
+    invalidateUnreadCountCache();
+    const count = await getUnreadNotificationCount();
+    io.to('admin').emit('notificationCountUpdate', { count });
     return res.json({ success: true });
   } catch (e: any) {
     if (e?.code === 'P2025') {
@@ -207,6 +242,10 @@ app.patch('/api/notifications/mark-all-read', async (_req, res) => {
       where: { read: false },
       data: { read: true },
     });
+    invalidateUnreadCountCache();
+    unreadCountCache.value = 0;
+    unreadCountCache.expiresAt = Date.now() + unreadCountTtlMs;
+    io.to('admin').emit('notificationCountUpdate', { count: 0 });
     return res.json({ success: true, updated: result.count });
   } catch (e: any) {
     return res.status(500).json({ error: e.message });

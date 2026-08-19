@@ -51,6 +51,8 @@ model Customer {
   churnAlerts ChurnAlert[]
 
   @@map("customers")
+  @@index([updatedAt])
+  @@index([createdAt])
 }
 
 // ============================================
@@ -84,6 +86,9 @@ model Message {
   isEscalated Boolean?
 
   @@map("messages")
+  @@index([customerId, createdAt])
+  @@index([platform, direction, createdAt])
+  @@index([platform, createdAt])
 }
 
 model Booking {
@@ -107,6 +112,9 @@ model Booking {
   sessionNotes CustomerSessionNote[]
 
   @@map("bookings")
+  @@index([customerId, dateTime])
+  @@index([status, dateTime])
+  @@index([dateTime])
 }
 
 model KnowledgeBase {
@@ -253,6 +261,8 @@ model Escalation {
   updatedAt DateTime @updatedAt
 
   @@map("escalations")
+  @@index([status, createdAt])
+  @@index([customerId, status])
 }
 
 model Notification {
@@ -266,6 +276,8 @@ model Notification {
 
   @@map("notifications")
   @@index([read, createdAt])
+  @@index([type, createdAt])
+  @@index([createdAt])
 }
 
 model ConversationMetrics {
@@ -346,6 +358,8 @@ model Invoice {
   updatedAt       DateTime @updatedAt
 
   @@map("invoices")
+  @@index([customerId, createdAt])
+  @@index([status, createdAt])
 }
 
 model PostShootFollowup {
@@ -362,6 +376,8 @@ model PostShootFollowup {
   updatedAt      DateTime @updatedAt
 
   @@map("post_shoot_followups")
+  @@index([bookingId, scheduledFor])
+  @@index([status, scheduledFor])
 }
 
 model BookingReminder {
@@ -377,6 +393,8 @@ model BookingReminder {
   updatedAt      DateTime @updatedAt
 
   @@map("booking_reminders")
+  @@index([bookingId, scheduledFor])
+  @@index([status, scheduledFor])
 }
 
 // ============================================
