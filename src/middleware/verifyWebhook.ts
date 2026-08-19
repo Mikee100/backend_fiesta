@@ -30,6 +30,30 @@ export function verifyMetaSignature(appSecretEnvVar: string) {
   };
 }
 
+function verifyMetaSignatureAgainstSecrets(secretValues: string[], req: Request, res: Response, next: NextFunction) {
+  const signatureHeader = req.headers['x-hub-signature-256'] as string | undefined;
+  const rawBody: Buffer | undefined = (req as any).rawBody;
+
+  if (!signatureHeader || !rawBody || secretValues.length === 0) {
+    console.error('Webhook rejected: missing signature, app secret, or raw body');
+    return res.sendStatus(401);
+  }
+
+  const received = Buffer.from(signatureHeader);
+
+  for (const secret of secretValues) {
+    const expectedSignature = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    const expected = Buffer.from(expectedSignature);
+
+    if (received.length === expected.length && crypto.timingSafeEqual(received, expected)) {
+      return next();
+    }
+  }
+
+  console.error('Webhook rejected: signature mismatch');
+  return res.sendStatus(401);
+}
+
 /**
  * Rejects incoming webhook POSTs that don't prove they came from the
  * configured WhatsApp provider. Without this, the webhook URL is a public,
@@ -38,6 +62,13 @@ export function verifyMetaSignature(appSecretEnvVar: string) {
  */
 export function verifyWhatsAppWebhook(req: Request, res: Response, next: NextFunction) {
   const provider = process.env.WHATSAPP_PROVIDER || 'meta';
+  const skipSignature = String(process.env.WHATSAPP_WEBHOOK_SKIP_SIGNATURE || '').toLowerCase() === 'true';
+
+  // Local/dev escape hatch for troubleshooting webhook delivery.
+  // Never enable this in production.
+  if (skipSignature) {
+    return next();
+  }
 
   if (provider === '360dialog') {
     const expected = process.env.WEBHOOK_SHARED_SECRET;
@@ -50,8 +81,15 @@ export function verifyWhatsAppWebhook(req: Request, res: Response, next: NextFun
     return next();
   }
 
-  // Direct Meta integration: verify X-Hub-Signature-256 over the raw request body
-  return verifyMetaSignature('WHATSAPP_APP_SECRET')(req, res, next);
+  // Direct Meta integration: verify X-Hub-Signature-256 over the raw request body.
+  // Some deployments keep the active Meta app secret under different env keys,
+  // so we accept any configured Meta app secret for this channel.
+  const candidateSecrets = [
+    process.env.WHATSAPP_APP_SECRET,
+    process.env.INSTAGRAM_APP_SECRET,
+  ].filter((v): v is string => Boolean(v && v.trim()));
+
+  return verifyMetaSignatureAgainstSecrets(candidateSecrets, req, res, next);
 }
 
 /**

@@ -85,5 +85,30 @@ export function scoreSentiment(text: string): { score: number; sentiment: string
 // one runaway conversation (or loop bug) burning through the whole day's limit.
 export const DAILY_TOKEN_CAP = 20000;
 
+// The Groq account has its own account-wide daily token cap, shared across
+// every customer on every channel. When it's hit, EVERY customer gets the
+// fallback message until it resets - this is a total outage, not a
+// per-customer issue, and it can stay tripped for 30+ minutes. Without a
+// cooldown here, every single incoming message during that window would
+// create its own escalation row and admin notification, flooding the
+// dashboard with duplicates of the same root cause.
+const OUTAGE_NOTIFY_COOLDOWN_MS = 10 * 60_000;
+let lastOutageNotifyAt: number | null = null;
+
+/** True at most once per cooldown window - call before raising an outage-level alert. */
+export function shouldNotifyOutage(): boolean {
+  const now = Date.now();
+  if (lastOutageNotifyAt !== null && now - lastOutageNotifyAt < OUTAGE_NOTIFY_COOLDOWN_MS) {
+    return false;
+  }
+  lastOutageNotifyAt = now;
+  return true;
+}
+
+/** Detects the specific "whole Groq account is out of daily tokens" error shape. */
+export function isProviderRateLimitError(error: any): boolean {
+  return error?.status === 429 || error?.code === 'rate_limit_exceeded' || error?.error?.code === 'rate_limit_exceeded';
+}
+
 export const FALLBACK_MESSAGE =
   "Sorry for the delay! We're experiencing high demand right now — one of our team members will follow up with you shortly.";
