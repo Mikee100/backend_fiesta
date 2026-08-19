@@ -132,11 +132,141 @@ app.get('/api/statistics/personalized-responses', analyticsController.getPersona
 app.get('/api/statistics/system', (req, res) => res.json({ customers: { total: 0, active: 0 }, messages: { total: 0, responseRate: 100 }, bookings: { total: 0, completionRate: 100 } }));
 
 // Notifications
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(String(req.query.page || '1'), 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20'), 10) || 20, 1), 100);
+    const skip = (page - 1) * limit;
+
+    const type = String(req.query.type || '').trim();
+    const search = String(req.query.search || '').trim();
+    const readQuery = String(req.query.read || '').trim().toLowerCase();
+
+    const where: any = {};
+
+    if (type && type !== 'all') {
+      where.type = type;
+    }
+
+    if (readQuery === 'true' || readQuery === 'false') {
+      where.read = readQuery === 'true';
+    }
+
+    if (search) {
+      where.OR = [
+        { title: { contains: search, mode: 'insensitive' } },
+        { message: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+
+    const [notifications, total, unreadCount] = await Promise.all([
+      prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      prisma.notification.count({ where }),
+      prisma.notification.count({ where: { read: false } }),
+    ]);
+
+    return res.json({ notifications, total, unreadCount });
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/notifications/unread-count', async (req, res) => {
   try {
     const count = await prisma.notification.count({ where: { read: false } });
     return res.json({ count });
   } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/notifications/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.notification.update({
+      where: { id },
+      data: { read: true },
+    });
+    return res.json({ success: true });
+  } catch (e: any) {
+    if (e?.code === 'P2025') {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/notifications/mark-all-read', async (_req, res) => {
+  try {
+    const result = await prisma.notification.updateMany({
+      where: { read: false },
+      data: { read: true },
+    });
+    return res.json({ success: true, updated: result.count });
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Escalations
+app.get('/api/escalations', async (_req, res) => {
+  try {
+    const escalations = await prisma.escalation.findMany({
+      where: { status: 'OPEN' },
+      include: {
+        customer: {
+          select: {
+            name: true,
+            phone: true,
+            email: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return res.json(escalations);
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/escalations/:id/resolve', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const escalation = await prisma.escalation.update({
+      where: { id },
+      data: { status: 'RESOLVED' },
+      include: {
+        customer: {
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+
+    // As the UI label says "Resolve & Unpause AI", re-enable AI for the
+    // affected customer when the escalation is resolved.
+    await prisma.customer.update({
+      where: { id: escalation.customer.id },
+      data: { aiEnabled: true },
+    }).catch((err) => {
+      console.error('Failed to re-enable AI after escalation resolve:', err);
+    });
+
+    io.to('admin').emit('escalationResolved', { escalationId: id });
+    return res.json({ success: true });
+  } catch (e: any) {
+    if (e?.code === 'P2025') {
+      return res.status(404).json({ error: 'Escalation not found' });
+    }
     return res.status(500).json({ error: e.message });
   }
 });
@@ -192,6 +322,98 @@ app.get('/api/bookings/available-hours/:date', async (req, res) => {
 
 app.get('/api/customers/:id/photo-links', (req, res) => res.json([]));
 app.get('/api/statistics/:type', (req, res) => res.json({}));
+
+// Knowledge Base CRUD
+app.get('/api/knowledge-base', async (req, res) => {
+  try {
+    const search = String(req.query.search || '').trim();
+    const category = String(req.query.category || '').trim();
+
+    const where: any = {};
+    if (search) {
+      where.OR = [
+        { question: { contains: search, mode: 'insensitive' } },
+        { answer: { contains: search, mode: 'insensitive' } },
+        { category: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+    if (category) {
+      where.category = { equals: category, mode: 'insensitive' };
+    }
+
+    const [items, total] = await Promise.all([
+      prisma.knowledgeBase.findMany({ where, orderBy: { updatedAt: 'desc' } }),
+      prisma.knowledgeBase.count({ where }),
+    ]);
+
+    return res.json({ items, total });
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/knowledge-base', async (req, res) => {
+  try {
+    const { question, answer, category } = req.body || {};
+
+    if (!question || !answer || !category) {
+      return res.status(400).json({ error: 'question, answer and category are required' });
+    }
+
+    const created = await prisma.knowledgeBase.create({
+      data: {
+        question: String(question).trim(),
+        answer: String(answer).trim(),
+        category: String(category).trim(),
+        embedding: [],
+        mediaUrls: [],
+      },
+    });
+
+    return res.status(201).json(created);
+  } catch (e: any) {
+    if (e?.code === 'P2002') {
+      return res.status(409).json({ error: 'Knowledge base question already exists' });
+    }
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/knowledge-base/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { question, answer, category } = req.body || {};
+
+    const data: any = {};
+    if (typeof question === 'string') data.question = question.trim();
+    if (typeof answer === 'string') data.answer = answer.trim();
+    if (typeof category === 'string') data.category = category.trim();
+
+    const updated = await prisma.knowledgeBase.update({ where: { id }, data });
+    return res.json(updated);
+  } catch (e: any) {
+    if (e?.code === 'P2025') {
+      return res.status(404).json({ error: 'Knowledge base entry not found' });
+    }
+    if (e?.code === 'P2002') {
+      return res.status(409).json({ error: 'Knowledge base question already exists' });
+    }
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/knowledge-base/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.knowledgeBase.delete({ where: { id } });
+    return res.json({ success: true });
+  } catch (e: any) {
+    if (e?.code === 'P2025') {
+      return res.status(404).json({ error: 'Knowledge base entry not found' });
+    }
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 // Health check
 app.get('/health', (req, res) => res.status(200).send('OK'));
