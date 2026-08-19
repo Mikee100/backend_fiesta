@@ -249,12 +249,15 @@ References:
    - success rate
    - fallback rate
    - intent-level rollups (from `ConversationLearning`)
+- Conversation learning inspector endpoint:
+   - `GET /api/analytics/conversation-learning/recent?limit=50`
+   - returns most recent learning rows for quick data-quality checks.
 
 Reference:
 - [backend 2.0/src/controllers/analytics.controller.ts](src/controllers/analytics.controller.ts)
 
 ### Important caveat
-`ConversationLearning` is queried for some AI analytics but is not currently written by the main agent pipeline shown here. That means intent-level stats can be sparse unless other processes populate it.
+`ConversationLearning` is now written from the main agent pipeline (success and fallback paths). Early datasets may still be sparse/uneven until enough post-change traffic accumulates.
 
 ## 11) Data Structures the AI Relies On
 
