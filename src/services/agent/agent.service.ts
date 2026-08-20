@@ -126,6 +126,63 @@ export class BookingExtractor {
 
 
 export class AgentService {
+  private normalizeToolName(rawName: string): string {
+    return String(rawName || '').split('<|')[0].trim();
+  }
+
+  private isToolNameValidationError(error: any): boolean {
+    const message = String(error?.error?.message || error?.message || '');
+    return (
+      error?.status === 400 &&
+      error?.code === 'tool_use_failed' &&
+      message.includes('attempted to call tool')
+    );
+  }
+
+  private async createCompletionWithToolNameGuard(params: any, allowedToolNames: string[]) {
+    try {
+      return await openai.chat.completions.create(params);
+    } catch (error: any) {
+      if (!this.isToolNameValidationError(error)) {
+        throw error;
+      }
+
+      // Some providers occasionally append transport/control tokens to tool
+      // names, which fails request.tools validation. Retry once with an
+      // explicit hard rule and lower temperature.
+      let attemptedRawName: string | undefined;
+      try {
+        const failedGeneration = error?.error?.failed_generation;
+        if (failedGeneration) {
+          const parsed = JSON.parse(failedGeneration);
+          attemptedRawName = parsed?.name;
+        }
+      } catch {
+        // Best-effort parse only; keep retrying even if parsing fails.
+      }
+
+      const attemptedNormalized = this.normalizeToolName(attemptedRawName || '');
+      console.warn('Retrying completion after malformed tool name:', {
+        attemptedRawName,
+        attemptedNormalized,
+      });
+
+      const retryMessages = [
+        ...params.messages,
+        {
+          role: 'system',
+          content: `CRITICAL TOOL RULE: If you call a tool, the function name must be EXACTLY one of: ${allowedToolNames.join(', ')}. Do not add any extra suffixes, prefixes, tags, or channel markers.`
+        }
+      ];
+
+      return await openai.chat.completions.create({
+        ...params,
+        messages: retryMessages,
+        temperature: 0,
+      });
+    }
+  }
+
   private inferIntent(userMessage: string): { intent: string; confidence: number; rule: string } {
     const text = userMessage.toLowerCase();
 
@@ -148,6 +205,147 @@ export class AgentService {
     if (text.includes('team member') || text.includes('follow up')) return 'escalated';
 
     return 'resolved';
+  }
+
+  private shouldUsePackageCatalogReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages)/.test(text);
+  }
+
+  private shouldUseBookingProcessReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(process\s+of\s+booking|booking\s+process|how\s+to\s+book|how\s+does\s+booking\s+work|what\s+does\s+booking\s+entail|steps\s+to\s+book|explain\s+booking)/.test(text);
+  }
+
+  private shouldUsePostShootProcessReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(after\s+the\s+shoot|what\s+happens\s+after\s+the\s+shoot|post\s*shoot\s*process|after\s+session|after\s+my\s+shoot)/.test(text);
+  }
+
+  private shouldUseRawFilesReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(raw\s+file|raw\s+files|unedited\s+photos|original\s+files|can\s+i\s+get\s+raw)/.test(text);
+  }
+
+  private buildPackageLine(pkg: {
+    name: string;
+    price: number;
+    duration: string;
+    images: number;
+    makeup: boolean;
+    outfits: number;
+    photobook: boolean;
+    photobookSize: string | null;
+    mount: boolean;
+    balloonBackdrop: boolean;
+    wig: boolean;
+    notes: string | null;
+  }): string {
+    const features: string[] = [];
+    features.push(`${pkg.images} soft-copy images`);
+    if (pkg.makeup) features.push('makeup');
+    if (pkg.outfits > 0) features.push(`${pkg.outfits} outfit${pkg.outfits > 1 ? 's' : ''}`);
+
+    const extras: string[] = [];
+    if (pkg.mount) extras.push('A3 mount');
+    if (pkg.balloonBackdrop) extras.push('balloon backdrop');
+    if (pkg.photobook) extras.push(pkg.photobookSize ? `${pkg.photobookSize} photobook` : 'photobook');
+    if (pkg.wig) extras.push('styled wig');
+    if (pkg.notes?.trim()) extras.push(pkg.notes.trim());
+
+    const extrasPart = extras.length > 0 ? ` | Extras: ${extras.join(', ')}` : '';
+    return `${pkg.name}: Ksh ${pkg.price.toLocaleString()} (${pkg.duration}) - ${features.join(', ')}${extrasPart}`;
+  }
+
+  private async getPackageCatalogReply(): Promise<string | null> {
+    try {
+      const packages = await prisma.package.findMany({
+        orderBy: [{ price: 'asc' }, { name: 'asc' }],
+        select: {
+          name: true,
+          price: true,
+          duration: true,
+          images: true,
+          makeup: true,
+          outfits: true,
+          photobook: true,
+          photobookSize: true,
+          mount: true,
+          balloonBackdrop: true,
+          wig: true,
+          notes: true,
+        }
+      });
+
+      if (!packages.length) return null;
+
+      const lines = packages.map((pkg, index) => `${index + 1}) ${this.buildPackageLine(pkg)}`);
+      return `We offer the following maternity packages:\n\n${lines.join('\n')}\n\nTell me which package you want and your preferred date, and I'll check availability.`;
+    } catch (err) {
+      console.error('Failed to build package catalog reply:', err);
+      return null;
+    }
+  }
+
+  private async getBookingProcessReply(): Promise<string> {
+    let startingDeposit = 2000;
+    let location = '4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi';
+
+    try {
+      const [lowestDepositPackage, studioInfo] = await Promise.all([
+        prisma.package.findFirst({
+          orderBy: { deposit: 'asc' },
+          select: { deposit: true },
+        }),
+        prisma.studioInfo.findFirst({
+          orderBy: { createdAt: 'desc' },
+          select: { location: true },
+        }),
+      ]);
+
+      if (lowestDepositPackage?.deposit && lowestDepositPackage.deposit > 0) {
+        startingDeposit = lowestDepositPackage.deposit;
+      }
+      if (studioInfo?.location?.trim()) {
+        location = studioInfo.location.trim();
+      }
+    } catch (err) {
+      console.error('Failed to resolve booking process context:', err);
+    }
+
+    return [
+      'Great question. Booking is simple:',
+      '1) Choose your package.',
+      '2) Share your preferred date and time (we are closed on Mondays).',
+      `3) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
+      '4) Once deposit is received, your booking is confirmed and reminders are scheduled.',
+      `5) Come for your session at ${location}.`,
+      '6) Pay the remaining balance after the shoot (M-Pesa or cash).',
+      '',
+      "If you're ready, tell me your package and preferred date/time and I'll check slots now."
+    ].join('\n');
+  }
+
+  private getPostShootProcessReply(): string {
+    return [
+      'After the shoot:',
+      '1) Any remaining balance is cleared as per your package terms (M-Pesa or cash).',
+      '2) Edited photos are ready within 10 working days.',
+      '3) Edited photos are delivered as a secure download link only.',
+      '4) We can share that link via WhatsApp or email, based on your preference.',
+      '5) Express delivery is available at an extra fee if you need them sooner.',
+      '6) Raw files are available at an extra fee if requested.',
+      '',
+      "Tell me your preferred delivery method and I'll save it now."
+    ].join('\n');
+  }
+
+  private getRawFilesReply(): string {
+    return [
+      'Yes, raw files are available at an extra fee.',
+      'They are shared as a secure download link (not sent directly as attachments).',
+      'If you want, I can have the team confirm the raw-file fee for your specific package/session.'
+    ].join('\n');
   }
 
   private async logConversationLearning(params: {
@@ -208,19 +406,22 @@ Instructions:
 5. PLATFORM RESTRICTIONS: You are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS. If a user wants to book, politely tell them that bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue.
 6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their real Name, the Service they want, a Date, and a Time.
 7. RESCHEDULING IS TWO STEPS, NEVER SKIP OR COMBINE THEM: if they want to reschedule, but haven't given a specific new date/time in their message, DO NOT call any tool - ask them what date/time they want first. NEVER invent or guess a date/time yourself. Once they've stated a specific new date/time, call 'propose_reschedule' (this only tells them the proposed new date/time - it changes nothing yet), then STOP and wait. Only call 'confirm_reschedule' after they explicitly reply yes/confirm on their OWN later message - never in the same turn as propose_reschedule.
-8. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
-9. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
-10. Before proposing, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
-11. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
-12. BOOKING IS TWO STEPS, NEVER SKIP OR COMBINE THEM:
+8. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel their appointment, call 'cancel_booking' before telling them it is cancelled. Never claim a cancellation succeeded unless this tool returns success.
+9. PHOTO DELIVERY PREFERENCES MUST BE CAPTURED: if a customer asks about receiving edited photos, clarify that delivery is always via a secure download link, then capture their preferred channel (email/WhatsApp/download link) using 'save_delivery_preference'. If they requested email but have not provided the exact email address (and it isn't already known), ask for the email first before calling the tool.
+10. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
+11. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
+12. Before proposing, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
+13. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
+14. BOOKING IS TWO STEPS, NEVER SKIP OR COMBINE THEM:
     a) Once you have their real Name, Service, Date, and a confirmed-free Time, call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt.
     b) STOP THERE and wait. Only after the customer explicitly replies yes/confirm/go ahead in their OWN next message do you call 'confirm_booking', which is what actually sends the M-Pesa payment prompt.
     NEVER call propose_booking and confirm_booking in the same turn, even if the customer's message sounds enthusiastic - the deposit prompt must never appear without the customer explicitly agreeing to it first, in its own message.
-13. PAYMENT: Once 'confirm_booking' runs, the system sends an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
-14. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
-15. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
-16. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
-17. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.`;
+15. PAYMENT: Once 'confirm_booking' runs, the system sends an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
+16. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
+17. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
+18. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
+19. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.
+20. When confirming a saved delivery email, use plain text (no markdown asterisks around the email). Say clearly that the email has been saved and remind them edited photos are delivered within 10 working days.`;
   }
 
   /**
@@ -369,9 +570,38 @@ ${contextString}`;
               required: ['date', 'service']
             }
           }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'cancel_booking',
+            description: 'Cancels the customer\'s next upcoming confirmed appointment. Use this only when they explicitly ask to cancel. This actually updates the booking status and removes the Google Calendar event when present.',
+            parameters: { type: 'object', properties: {} }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'save_delivery_preference',
+            description: 'Saves how the customer wants to receive the secure download link for edited photos (especially email delivery). If email delivery is requested, include the exact email address when known.',
+            parameters: {
+              type: 'object',
+              properties: {
+                method: { type: 'string', enum: ['email', 'download_link', 'whatsapp'], description: 'Preferred channel for receiving the secure download link for edited photos' },
+                email: { type: 'string', description: 'Customer email address if method is email (optional only when already known and previously confirmed)' },
+                whatsappNumber: { type: 'string', description: 'WhatsApp number to receive the download link when method is whatsapp (optional if same as customer number on file)' },
+                note: { type: 'string', description: 'Any extra delivery preference details (e.g. express requested)' }
+              },
+              required: ['method']
+            }
+          }
         }
       );
     }
+
+    const allowedToolNames = allTools
+      .map((tool) => tool.type === 'function' ? tool.function.name : '')
+      .filter((name): name is string => !!name);
 
     // 5. Call LLM. Booking a slot is naturally multi-step (check availability,
     // then book), so the model can legitimately want to chain more than one
@@ -379,13 +609,13 @@ ${contextString}`;
     // assuming a single round. A hard cap prevents a runaway loop.
     let tokensUsed = extractorTokens;
     const MAX_TOOL_ROUNDS = 5;
-    let currentResponse = await openai.chat.completions.create({
+    let currentResponse = await this.createCompletionWithToolNameGuard({
       model: CHAT_MODEL,
       messages,
       tools: allTools,
       tool_choice: 'auto',
       temperature: 0.3
-    });
+    }, allowedToolNames);
     tokensUsed += currentResponse.usage?.total_tokens || 0;
 
     let rounds = 0;
@@ -417,7 +647,7 @@ ${contextString}`;
           console.log(`Tool Called: ${functionName} with args:`, args);
 
           try {
-            if (['propose_booking', 'confirm_booking', 'propose_reschedule', 'confirm_reschedule'].includes(functionName) && confirmedActionThisTurn) {
+            if (['propose_booking', 'confirm_booking', 'propose_reschedule', 'confirm_reschedule', 'cancel_booking'].includes(functionName) && confirmedActionThisTurn) {
               toolResponse = `ERROR: A booking/reschedule was already confirmed earlier in this same turn. The task is done - stop calling booking tools and just tell the customer it's confirmed.`;
             }
             else if (functionName === 'propose_booking') {
@@ -439,6 +669,14 @@ ${contextString}`;
                 toolResponse = `ERROR: The customer has not actually stated a specific new date and time in their message. Do NOT invent one - ask them what date and time they'd like to reschedule to.`;
               } else {
                 const result = await this.executeProposeRescheduleTool(customerId, args.newDate, args.newTime);
+                await this.notifyRescheduleAdmin({
+                  customerId,
+                  event: 'proposed',
+                  service: result.service,
+                  oldDateTime: result.oldDateTime,
+                  newDate: args.newDate,
+                  newTime: args.newTime,
+                });
                 proposedThisTurn = true;
                 toolResponse = `PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Tell the customer this and ask them to explicitly confirm before you call confirm_reschedule - do NOT call it in this same turn.`;
               }
@@ -448,13 +686,39 @@ ${contextString}`;
                 toolResponse = `ERROR: You already called propose_reschedule earlier in this same turn - possibly with different details than what the customer last saw and agreed to. You must stop here and wait for the customer's own separate message explicitly confirming before calling confirm_reschedule.`;
               } else {
                 const result = await this.executeConfirmRescheduleTool(customerId, initialDraftStep);
+                await this.notifyRescheduleAdmin({
+                  customerId,
+                  event: 'confirmed',
+                  service: result.service,
+                  oldDateTime: result.oldDateTime,
+                  newDateTime: result.newDateTime,
+                });
                 confirmedActionThisTurn = true;
                 toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${dayjs(result.newDateTime).format('YYYY-MM-DD HH:mm')}. This is DONE - do not call any more booking tools this turn.`;
               }
             }
+            else if (functionName === 'cancel_booking') {
+              const result = await this.executeCancelBookingTool(customerId);
+              confirmedActionThisTurn = true;
+              toolResponse = `SUCCESS: Cancelled ${result.service} on ${dayjs(result.dateTime).format('YYYY-MM-DD HH:mm')}. Refund policy: ${result.refundEligible ? 'Eligible for refund (more than 72 hours before appointment).' : 'Not eligible for automatic refund (within 72 hours).'} This is DONE - do not call any more booking tools this turn.`;
+            }
+            else if (functionName === 'save_delivery_preference') {
+              const result = await this.executeSaveDeliveryPreferenceTool(customerId, args.method, args.email, args.whatsappNumber, args.note, platform);
+              if (result.method === 'email' && result.email) {
+                toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved ${result.email} as your delivery email. We'll share your secure download link within 10 working days after the shoot."`;
+              } else if (result.method === 'whatsapp' && result.whatsappNumber) {
+                toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved WhatsApp delivery to ${result.whatsappNumber}. We'll share your secure download link within 10 working days after the shoot."`;
+              } else {
+                toolResponse = `SUCCESS: Delivery preference saved as ${result.method}. Use this exact customer-facing confirmation: "Perfect, I've saved your delivery preference. We'll share your secure download link within 10 working days after the shoot."`;
+              }
+            }
             else if (functionName === 'add_session_note') {
-              await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type);
-              toolResponse = `SUCCESS: Note added to session on ${args.bookingDate}.`;
+              const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type);
+              if (noteResult.created) {
+                toolResponse = `SUCCESS: Note added to session as ${noteResult.type}.`;
+              } else {
+                toolResponse = `INFO: Note not queued (${noteResult.reason || 'non-actionable'}).`;
+              }
             }
             else if (functionName === 'get_available_slots') {
               const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k));
@@ -476,6 +740,23 @@ ${contextString}`;
             }
           } catch (e: any) {
             console.error(`Tool execution error (${functionName}):`, e);
+            if (functionName === 'propose_reschedule' || functionName === 'confirm_reschedule') {
+              await this.notifyRescheduleAdmin({
+                customerId,
+                event: 'failed',
+                newDate: args?.newDate,
+                newTime: args?.newTime,
+                reason: e?.message,
+              });
+            }
+            if (functionName === 'cancel_booking') {
+              await notifyAdmin(
+                'booking',
+                `Cancellation failed for ${customerId}`,
+                `Cancellation tool failed: ${e?.message || 'Unknown error'}`,
+                { customerId, event: 'cancel_failed', reason: e?.message }
+              );
+            }
             toolResponse = `ERROR: ${e.message}`;
           }
 
@@ -487,13 +768,13 @@ ${contextString}`;
         }
       }
 
-      currentResponse = await openai.chat.completions.create({
+      currentResponse = await this.createCompletionWithToolNameGuard({
         model: CHAT_MODEL,
         messages,
         tools: allTools,
         tool_choice: 'auto',
         temperature: 0.3
-      });
+      }, allowedToolNames);
       tokensUsed += currentResponse.usage?.total_tokens || 0;
     }
 
@@ -556,6 +837,74 @@ ${contextString}`;
       });
       await this.escalate(customerId, 'quota', 'Customer exceeded their daily AI token budget - customer got the canned fallback message.');
       return fallbackReply;
+    }
+
+    // Deterministic raw-files policy response for direct, accurate answers.
+    if (this.shouldUseRawFilesReply(userMessage)) {
+      const rawFilesReply = this.getRawFilesReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: rawFilesReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return rawFilesReply;
+    }
+
+    // Deterministic post-shoot process response for consistent expectations
+    // and delivery-preference capture CTA.
+    if (this.shouldUsePostShootProcessReply(userMessage)) {
+      const postShootReply = this.getPostShootProcessReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: postShootReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return postShootReply;
+    }
+
+    // Deterministic booking process response for consistent policy wording.
+    if (this.shouldUseBookingProcessReply(userMessage)) {
+      const processReply = await this.getBookingProcessReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: processReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return processReply;
+    }
+
+    // Deterministic catalog response to avoid unreadable markdown tables and
+    // keep package replies consistent across chat channels.
+    if (this.shouldUsePackageCatalogReply(userMessage)) {
+      const catalogReply = await this.getPackageCatalogReply();
+      if (catalogReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: catalogReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return catalogReply;
+      }
     }
 
     // Deterministic confirm fast-path: short explicit confirmations like
@@ -637,12 +986,33 @@ ${contextString}`;
 
     if (!normalized || normalized.length > 40) return false;
 
+    // Guard against ambiguous/negative replies that should not auto-confirm.
+    if (/\b(no|not|don't|dont|cancel|wait|hold)\b/.test(normalized)) return false;
+
     const confirmations = new Set([
-      'yes', 'y', 'yep', 'yeah', 'ok', 'okay', 'confirm', 'confirmed',
-      'go ahead', 'go-ahead', 'proceed', 'continue', 'sawa', 'ndio'
+      'yes', 'y', 'yep', 'yeah', 'yess', 'yesss',
+      'ok', 'okay', 'confirm', 'confirmed',
+      'go ahead', 'go-ahead', 'proceed', 'continue',
+      'that works', 'works for me', 'that one', 'same one',
+      'sawa', 'ndio'
     ]);
 
-    return confirmations.has(normalized);
+    if (confirmations.has(normalized)) return true;
+
+    // Accept short natural affirmations like "yes that works for me" or
+    // "yess that one" for pending booking/reschedule drafts.
+    return [
+      /^yes+s?\b/,
+      /^yep\b/,
+      /^yeah\b/,
+      /^ok(ay)?\b/,
+      /^confirm(ed)?\b/,
+      /^go[\s-]?ahead\b/,
+      /^that works\b/,
+      /^works for me\b/,
+      /^that one\b/,
+      /^same one\b/
+    ].some((pattern) => pattern.test(normalized));
   }
 
   private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
@@ -656,6 +1026,13 @@ ${contextString}`;
 
     if (draft.step === 'reschedule_confirm') {
       const result = await this.executeConfirmRescheduleTool(customerId, 'reschedule_confirm');
+      await this.notifyRescheduleAdmin({
+        customerId,
+        event: 'confirmed',
+        service: result.service,
+        oldDateTime: result.oldDateTime,
+        newDateTime: result.newDateTime,
+      });
       return `Perfect - your ${result.service} session has been rescheduled to ${dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
     }
 
@@ -724,6 +1101,81 @@ ${contextString}`;
       );
     } catch (err) {
       console.error('Failed to create escalation:', err);
+    }
+  }
+
+  /**
+   * Emits operational notifications for reschedule milestones/failures
+   * without automatically creating escalations.
+   */
+  private async notifyRescheduleAdmin(params: {
+    customerId: string;
+    event: 'proposed' | 'confirmed' | 'failed';
+    service?: string;
+    oldDateTime?: Date;
+    newDate?: string;
+    newTime?: string;
+    newDateTime?: Date;
+    reason?: string;
+  }): Promise<void> {
+    try {
+      const customer = await prisma.customer.findUnique({
+        where: { id: params.customerId },
+        select: { name: true, phone: true }
+      });
+
+      const actor = customer?.name && customer.name !== 'WhatsApp User'
+        ? `${customer.name} (${customer.phone || params.customerId})`
+        : customer?.phone || params.customerId;
+
+      if (params.event === 'proposed') {
+        await notifyAdmin(
+          'reschedule',
+          `Reschedule proposed: ${actor}`,
+          `${params.service || 'Session'} proposed from ${params.oldDateTime ? dayjs(params.oldDateTime).format('YYYY-MM-DD HH:mm') : 'current slot'} to ${params.newDate} ${params.newTime}. Awaiting customer confirmation.`,
+          {
+            customerId: params.customerId,
+            event: params.event,
+            service: params.service,
+            oldDateTime: params.oldDateTime?.toISOString(),
+            newDate: params.newDate,
+            newTime: params.newTime,
+          }
+        );
+        return;
+      }
+
+      if (params.event === 'confirmed') {
+        await notifyAdmin(
+          'reschedule',
+          `Reschedule confirmed: ${actor}`,
+          `${params.service || 'Session'} moved from ${params.oldDateTime ? dayjs(params.oldDateTime).format('YYYY-MM-DD HH:mm') : 'previous slot'} to ${params.newDateTime ? dayjs(params.newDateTime).format('YYYY-MM-DD HH:mm') : `${params.newDate} ${params.newTime}`}.`,
+          {
+            customerId: params.customerId,
+            event: params.event,
+            service: params.service,
+            oldDateTime: params.oldDateTime?.toISOString(),
+            newDateTime: params.newDateTime?.toISOString(),
+          }
+        );
+        return;
+      }
+
+      await notifyAdmin(
+        'reschedule',
+        `Reschedule failed: ${actor}`,
+        `Reschedule attempt failed: ${params.reason || 'Unknown reason'}`,
+        {
+          customerId: params.customerId,
+          event: params.event,
+          service: params.service,
+          newDate: params.newDate,
+          newTime: params.newTime,
+          reason: params.reason,
+        }
+      );
+    } catch (err) {
+      console.error('Failed to emit reschedule admin notification:', err);
     }
   }
 
@@ -954,7 +1406,10 @@ ${contextString}`;
       }
     });
 
-    return { service: upcomingBooking.service };
+    return {
+      service: upcomingBooking.service,
+      oldDateTime: upcomingBooking.dateTime,
+    };
   }
 
   /**
@@ -1002,13 +1457,208 @@ ${contextString}`;
 
     await prisma.bookingDraft.delete({ where: { customerId } }).catch(err => console.error('Failed to clear reschedule draft:', err));
 
-    return { newDateTime, service: upcomingBooking.service };
+    return {
+      newDateTime,
+      oldDateTime: upcomingBooking.dateTime,
+      service: upcomingBooking.service,
+    };
+  }
+
+  /**
+   * Cancels the next upcoming confirmed booking and removes its Google
+   * Calendar event if linked.
+   */
+  private async executeCancelBookingTool(customerId: string) {
+    const booking = await prisma.booking.findFirst({
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' }
+    });
+
+    if (!booking) {
+      throw new Error('No upcoming confirmed booking found to cancel.');
+    }
+
+    if (booking.googleEventId) {
+      const deleted = await googleCalendarService.deleteEvent(booking.googleEventId);
+      if (!deleted) {
+        console.warn('Google Calendar delete failed during cancellation:', booking.googleEventId);
+      }
+    }
+
+    await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        status: 'cancelled',
+        googleEventId: null,
+      }
+    });
+
+    await prisma.bookingDraft.deleteMany({ where: { customerId } });
+
+    const hoursUntil = dayjs(booking.dateTime).diff(dayjs(), 'hour', true);
+    const refundEligible = hoursUntil > 72;
+
+    await notifyAdmin(
+      'booking',
+      `Booking cancelled for ${customerId}`,
+      `${booking.service} on ${dayjs(booking.dateTime).format('YYYY-MM-DD HH:mm')} was cancelled via AI assistant.`,
+      {
+        customerId,
+        event: 'cancel_confirmed',
+        bookingId: booking.id,
+        service: booking.service,
+        dateTime: booking.dateTime.toISOString(),
+        refundEligible,
+      }
+    );
+
+    return {
+      bookingId: booking.id,
+      service: booking.service,
+      dateTime: booking.dateTime,
+      refundEligible,
+    };
+  }
+
+  private isPlaceholderContactEmail(email?: string | null): boolean {
+    if (!email) return true;
+    const value = email.trim().toLowerCase();
+    if (!value) return true;
+    return value.endsWith('@whatsapp.local') || value.endsWith('@messenger.local') || value.endsWith('@instagram.local');
+  }
+
+  /**
+   * Saves customer's preferred edited-photo delivery method (especially email)
+   * and emits an admin notification so the team can follow through.
+   */
+  private async executeSaveDeliveryPreferenceTool(
+    customerId: string,
+    method: 'email' | 'download_link' | 'whatsapp',
+    email?: string,
+    whatsappNumber?: string,
+    note?: string,
+    platform?: string,
+  ) {
+    const normalizedMethod = (method || '').toLowerCase();
+    if (!['email', 'download_link', 'whatsapp'].includes(normalizedMethod)) {
+      throw new Error('Invalid delivery method. Use email, download_link, or whatsapp.');
+    }
+
+    const customer = await prisma.customer.findUnique({ where: { id: customerId } });
+    if (!customer) {
+      throw new Error('Customer not found while saving delivery preference.');
+    }
+
+    const normalizedEmail = email?.trim().toLowerCase();
+    const normalizedWhatsappNumber = whatsappNumber?.trim();
+    const emailFromCustomer = this.isPlaceholderContactEmail(customer.email) ? undefined : customer.email?.trim().toLowerCase();
+    const resolvedEmail = normalizedEmail || emailFromCustomer;
+    const resolvedWhatsappNumber = normalizedWhatsappNumber || customer.phone || customerId;
+
+    if (normalizedMethod === 'email') {
+      if (!resolvedEmail) {
+        throw new Error('Email delivery requested but no email address is on file. Ask the customer for their exact email address first.');
+      }
+      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailPattern.test(resolvedEmail)) {
+        throw new Error('The provided email format looks invalid. Ask the customer to confirm the exact email address.');
+      }
+
+      if (customer.email !== resolvedEmail) {
+        await prisma.customer.update({ where: { id: customerId }, data: { email: resolvedEmail } });
+      }
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: { customerId, dateTime: { gte: new Date() }, status: { not: 'cancelled' } },
+      orderBy: { dateTime: 'asc' }
+    });
+
+    const description = [
+      `Delivery preference: ${normalizedMethod}`,
+      normalizedMethod === 'email' && resolvedEmail ? `Email: ${resolvedEmail}` : '',
+      normalizedMethod === 'whatsapp' && resolvedWhatsappNumber ? `WhatsApp: ${resolvedWhatsappNumber}` : '',
+      note ? `Note: ${note}` : ''
+    ].filter(Boolean).join(' | ');
+
+    await prisma.customerSessionNote.create({
+      data: {
+        customerId,
+        bookingId: booking?.id,
+        type: 'special_request',
+        description,
+        status: 'pending',
+        platform: platform || 'whatsapp',
+        sourceMessage: note?.trim() || undefined,
+      }
+    });
+
+    await notifyAdmin(
+      'booking',
+      `Delivery preference captured for ${customerId}`,
+      `${customer.name || customerId} prefers ${normalizedMethod}${normalizedMethod === 'email' && resolvedEmail ? ` via ${resolvedEmail}` : ''}${normalizedMethod === 'whatsapp' && resolvedWhatsappNumber ? ` via ${resolvedWhatsappNumber}` : ''}.`,
+      {
+        customerId,
+        bookingId: booking?.id,
+        event: 'delivery_preference',
+        deliveryMethod: normalizedMethod,
+        deliveryEmail: normalizedMethod === 'email' ? resolvedEmail : undefined,
+        deliveryPhone: normalizedMethod === 'whatsapp' ? resolvedWhatsappNumber : undefined,
+      }
+    );
+
+    return {
+      method: normalizedMethod,
+      email: normalizedMethod === 'email' ? resolvedEmail : undefined,
+      whatsappNumber: normalizedMethod === 'whatsapp' ? resolvedWhatsappNumber : undefined,
+    };
   }
 
   /**
    * Logic to save a note for a customer session
    */
-  private async executeAddNoteTool(customerId: string, bookingDate: string, note: string, type: string) {
+  private async executeAddNoteTool(customerId: string, bookingDate: string, note: string, type: string): Promise<{ created: boolean; reason?: string; type?: string }> {
+    const rawNote = (note || '').trim();
+    if (!rawNote) {
+      return { created: false, reason: 'empty_note' };
+    }
+
+    const normalized = rawNote.toLowerCase();
+    const nonActionablePatterns = [
+      /^no special requests? mentioned$/,
+      /^no special requests?$/,
+      /^no requests?$/,
+      /^none$/,
+      /^n\/a$/,
+    ];
+    if (nonActionablePatterns.some((pattern) => pattern.test(normalized))) {
+      return { created: false, reason: 'non_actionable_note' };
+    }
+
+    let normalizedType = (type || 'other').trim().toLowerCase();
+    if (normalizedType === 'other') {
+      if (/(list of services|service list|show.*services|send.*services|package list|pricing)/i.test(rawNote)) {
+        normalizedType = 'action_request';
+      } else if (/(delivery preference|download link|email.*link|whatsapp.*link)/i.test(rawNote)) {
+        normalizedType = 'special_request';
+      }
+    }
+
+    const duplicateWindowStart = dayjs().subtract(24, 'hour').toDate();
+    const duplicate = await prisma.customerSessionNote.findFirst({
+      where: {
+        customerId,
+        status: 'pending',
+        type: normalizedType,
+        description: rawNote,
+        createdAt: { gte: duplicateWindowStart },
+      },
+      select: { id: true },
+    });
+    if (duplicate) {
+      return { created: false, reason: 'duplicate_pending_note', type: normalizedType };
+    }
+
     // Customers often mention session details ("bringing family") before they've
     // confirmed a booking date at all - the AI still calls this tool, but with no
     // real date to work with (empty string, "unknown", etc). new Date() on that
@@ -1031,15 +1681,32 @@ ${contextString}`;
           orderBy: { dateTime: 'asc' }
         });
 
-    await prisma.customerSessionNote.create({
+    const createdNote = await prisma.customerSessionNote.create({
       data: {
         customerId: customerId,
         bookingId: booking?.id,
-        description: note,
-        type: type,
-        status: 'pending'
+        description: rawNote,
+        type: normalizedType,
+        status: 'pending',
       }
     });
+
+    if (normalizedType === 'action_request' || normalizedType === 'special_request') {
+      await notifyAdmin(
+        'booking',
+        `Session note requires review for ${customerId}`,
+        `${rawNote}${booking ? ` (Booking: ${booking.service} on ${dayjs(booking.dateTime).format('YYYY-MM-DD HH:mm')})` : ''}`,
+        {
+          customerId,
+          bookingId: booking?.id,
+          sessionNoteId: createdNote.id,
+          noteType: normalizedType,
+          event: 'session_note_review_required',
+        }
+      );
+    }
+
+    return { created: true, type: normalizedType };
   }
 }
 
