@@ -2,6 +2,38 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 
 export class CustomerController {
+  private inferPlatform(customer: {
+    platform?: string | null;
+    whatsappId?: string | null;
+    instagramId?: string | null;
+    messengerId?: string | null;
+    email?: string | null;
+  }, fallbackPlatform?: string | null): string {
+    if (customer.platform) return customer.platform;
+    if (customer.whatsappId) return 'whatsapp';
+    if (customer.instagramId) return 'instagram';
+    if (customer.messengerId) return 'messenger';
+    if (fallbackPlatform) return fallbackPlatform;
+
+    const email = (customer.email || '').toLowerCase();
+    if (email.endsWith('@whatsapp.local')) return 'whatsapp';
+    if (email.endsWith('@instagram.local')) return 'instagram';
+    if (email.endsWith('@messenger.local')) return 'messenger';
+
+    return 'other';
+  }
+
+  private inferDisplayPhone(customer: {
+    id: string;
+    phone?: string | null;
+    whatsappId?: string | null;
+  }, inferredPlatform: string): string | null {
+    if (customer.phone?.trim()) return customer.phone;
+    if (customer.whatsappId?.trim()) return customer.whatsappId;
+    if (inferredPlatform === 'whatsapp' && /^\+?\d{8,}$/.test(customer.id)) return customer.id;
+    return null;
+  }
+
   private getActivityWindows() {
     const now = new Date();
 
@@ -46,9 +78,14 @@ export class CustomerController {
       const enriched = customers.map((customer) => {
         const lastMessage = customer.messages[0];
         const lastActivityAt = lastMessage?.createdAt || customer.updatedAt;
+        const inferredPlatform = this.inferPlatform(customer as any, lastMessage?.platform || null);
+        const displayPhone = this.inferDisplayPhone(customer as any, inferredPlatform);
 
         return {
           ...customer,
+          platform: inferredPlatform,
+          phone: customer.phone || displayPhone,
+          displayPhone,
           lastActivityAt,
           lastMessagePreview: lastMessage?.content || null,
           lastMessageDirection: lastMessage?.direction || null,
@@ -138,7 +175,16 @@ export class CustomerController {
         }
       });
       if (!customer) return res.status(404).json({ error: 'Customer not found' });
-      return res.json(customer);
+
+      const inferredPlatform = this.inferPlatform(customer as any, customer.messages?.[0]?.platform || null);
+      const displayPhone = this.inferDisplayPhone(customer as any, inferredPlatform);
+
+      return res.json({
+        ...customer,
+        platform: inferredPlatform,
+        phone: customer.phone || displayPhone,
+        displayPhone,
+      });
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

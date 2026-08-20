@@ -86,7 +86,25 @@ export class WhatsAppController {
           // 2. Ensure Customer exists and Save Inbound Message
           let customer = await prisma.customer.findUnique({ where: { id: from } });
           if (!customer) {
-            customer = await prisma.customer.create({ data: { id: from, name: 'WhatsApp User' } });
+            customer = await prisma.customer.create({
+              data: {
+                id: from,
+                name: 'WhatsApp User',
+                phone: from,
+                whatsappId: from,
+              }
+            });
+          } else if (!customer.phone || !customer.whatsappId) {
+            // Legacy customer rows were created without phone/whatsappId in some
+            // flows. Backfill these fields whenever we receive a new inbound
+            // WhatsApp message so profile details are no longer blank.
+            customer = await prisma.customer.update({
+              where: { id: from },
+              data: {
+                phone: customer.phone || from,
+                whatsappId: customer.whatsappId || from,
+              }
+            });
           }
 
           try {

@@ -2,6 +2,8 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import { googleCalendarService } from '../services/calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
+import { notifyAdmin } from '../services/notifications/notification.service';
+import dayjs from 'dayjs';
 
 export class BookingController {
   
@@ -197,6 +199,25 @@ export class BookingController {
         });
       }
 
+      const dateChanged = newDateTime.getTime() !== new Date(existing.dateTime).getTime();
+      const serviceChanged = newService !== existing.service;
+      if (dateChanged || serviceChanged) {
+        await notifyAdmin(
+          'reschedule',
+          `Manual reschedule: ${customerName}`,
+          `${existing.service} moved from ${dayjs(existing.dateTime).format('YYYY-MM-DD HH:mm')} to ${dayjs(newDateTime).format('YYYY-MM-DD HH:mm')}${serviceChanged ? ` (service changed to ${newService})` : ''}.`,
+          {
+            event: 'manual_reschedule',
+            bookingId: existing.id,
+            customerId: existing.customerId,
+            oldService: existing.service,
+            newService,
+            oldDateTime: existing.dateTime.toISOString(),
+            newDateTime: newDateTime.toISOString(),
+          }
+        );
+      }
+
       return res.json(booking);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
@@ -209,10 +230,39 @@ export class BookingController {
   async cancelBooking(req: Request, res: Response) {
     try {
       const { id } = req.params;
+      const existing = await prisma.booking.findUnique({ where: { id } });
+      if (!existing) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+
+      if (existing.googleEventId) {
+        await googleCalendarService.deleteEvent(existing.googleEventId);
+      }
+
       const booking = await prisma.booking.update({
         where: { id },
-        data: { status: 'cancelled' }
+        data: {
+          status: 'cancelled',
+          googleEventId: null,
+        }
       });
+
+      const hoursUntil = dayjs(existing.dateTime).diff(dayjs(), 'hour', true);
+      const refundEligible = hoursUntil > 72;
+      await notifyAdmin(
+        'booking',
+        `Booking cancelled: ${existing.customerId}`,
+        `${existing.service} on ${dayjs(existing.dateTime).format('YYYY-MM-DD HH:mm')} was cancelled.${refundEligible ? ' Refund eligible (>72h).' : ' Not automatically refundable (<=72h).'}`,
+        {
+          event: 'manual_cancel',
+          bookingId: existing.id,
+          customerId: existing.customerId,
+          service: existing.service,
+          dateTime: existing.dateTime.toISOString(),
+          refundEligible,
+        }
+      );
+
       return res.json(booking);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
