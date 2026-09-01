@@ -4,11 +4,16 @@ import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
 import { bookingService } from '../booking/booking.service';
+import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
+import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
+import { ConversationFlowMatcher } from './conversation-flow.matcher';
+import { ConversationFlowHandler } from './conversation-flow.handler';
+import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
 // Ensure you have GROQ_API_KEY in your .env
@@ -61,7 +66,7 @@ export class BookingExtractor {
     }
     if (dateMatch) {
       const day = dateMatch[1];
-      const parsed = dayjs().date(Number(day));
+      const parsed = nowInBusinessTimezone().date(Number(day));
       if (parsed.isValid()) {
         date = parsed.format('YYYY-MM-DD');
       }
@@ -77,7 +82,7 @@ export class BookingExtractor {
 
   // 🤖 STEP 3: AI Extraction (STRICT JSON)
   private async aiExtract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
-    const now = dayjs().format('dddd, MMMM D, YYYY h:mm A');
+    const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     const response = await openai.chat.completions.create({
       model: CHAT_MODEL,
       messages: [
@@ -126,6 +131,18 @@ export class BookingExtractor {
 
 
 export class AgentService {
+  private readonly naturalAssistantMode = String(process.env.AI_ASSISTANT_NATURAL_MODE || 'false').toLowerCase() === 'true';
+  private readonly conversationFlows = new ConversationFlowMatcher();
+  private readonly conversationFlowHandler = new ConversationFlowHandler(this.conversationFlows);
+
+  private isNaturalAssistantModeEnabled(): boolean {
+    return this.naturalAssistantMode;
+  }
+
+  private formatCustomerReply(reply: string): string {
+    return formatCustomerReply(reply);
+  }
+
   private normalizeToolName(rawName: string): string {
     return String(rawName || '').split('<|')[0].trim();
   }
@@ -207,9 +224,37 @@ export class AgentService {
     return 'resolved';
   }
 
-  private shouldUsePackageCatalogReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages)/.test(text);
+  private getWeekdayReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant', content: string }[]
+  ): string | null {
+    const match = userMessage.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
+    if (!match) return null;
+
+    const day = Number(match[1]);
+    if (day < 1 || day > 31) return null;
+
+    const recentDateMention = [...history]
+      .reverse()
+      .map((message) => message.content.match(/\b(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{4})\b/i))
+      .find((dateMatch) => dateMatch && Number(dateMatch[1]) === day);
+
+    if (recentDateMention) {
+      const contextualDate = dayjs(`${recentDateMention[1]} ${recentDateMention[2]} ${recentDateMention[3]}`, 'D MMMM YYYY');
+      if (contextualDate.isValid()) {
+        return `${contextualDate.format('MMMM D, YYYY')} is a ${contextualDate.format('dddd')}.`;
+      }
+    }
+
+    const current = nowInBusinessTimezone();
+    let date = current.date(day);
+    if (date.isBefore(current, 'day')) date = date.add(1, 'month');
+
+    return `${date.format('MMMM D, YYYY')} is a ${date.format('dddd')}.`;
+  }
+
+  private getBusinessIntroductionReply(): string {
+    return 'Fiesta House is a photography studio in Parklands, Nairobi, specialising in maternity, newborn and family sessions. We help plan the look of the shoot, guide you through posing, handle the photography, and deliver your edited photos afterwards. For maternity sessions, we can also help with makeup, styling and outfit choices so you feel comfortable in front of the camera. Is there one part of the experience you want to know more about?';
   }
 
   private shouldUseBookingProcessReply(userMessage: string): boolean {
@@ -222,10 +267,60 @@ export class AgentService {
     return /(after\s+the\s+shoot|what\s+happens\s+after\s+the\s+shoot|post\s*shoot\s*process|after\s+session|after\s+my\s+shoot)/.test(text);
   }
 
+  private shouldUseEarliestImageDeliveryReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(when\s+(can|will)\s+i\s+get\s+(the\s+)?(images|photos)|earliest\s+i\s+can\s+get\s+(the\s+)?(images|photos)|how\s+soon\s+can\s+i\s+get\s+(the\s+)?(images|photos)|when\s+are\s+(the\s+)?(images|photos)\s+ready|delivery\s+date\s+for\s+(images|photos))/.test(text);
+  }
+
   private shouldUseRawFilesReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     return /(raw\s+file|raw\s+files|unedited\s+photos|original\s+files|can\s+i\s+get\s+raw)/.test(text);
   }
+
+  private shouldUseSocialMediaReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(social\s+media|instagram|facebook|website|where\s+can\s+i\s+find\s+you\s+online)/.test(text);
+  }
+
+  private shouldHandleResendRequest(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(resend|send\s+again|retry|repeat|send\s+it\s+again)/.test(text);
+  }
+
+  private shouldUseMultiPersonBookingReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    const mentionsAnotherPerson = /(my\s+sister|my\s+brother|my\s+friend|my\s+husband|my\s+wife|my\s+partner|my\s+family|also\s+coming|come\s+with\s+her|come\s+with\s+him|joining\s+the\s+shoot|join\s+the\s+shoot)/.test(text);
+    const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
+    return mentionsAnotherPerson && bookingContext;
+  }
+
+  private shouldUseBookingStatusReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed)/.test(text);
+  }
+
+    private shouldUsePastAppointmentReply(userMessage: string): boolean {
+      const text = userMessage.toLowerCase();
+      return /(that|the|my)\s+(date|day|appointment|booking|session).*(already\s+)?(passed|past)|already\s+passed|that\s+was\s+in\s+the\s+past/.test(text);
+    }
+
+      private isPastAppointmentFollowUp(
+        userMessage: string,
+        history: { role: 'user' | 'assistant', content: string }[]
+      ): boolean {
+        const text = userMessage.toLowerCase().trim();
+        const isFollowUp = /^(say|tell|repeat)\s+(that|it|again)\b|^(so\s+)?(how|what)\b|what\s+(do|should)\s+i\s+do|which\s+(one|option)|(?:do|choose|pick|i(?:'ll| will) take)\s+(?:number\s+)?[12]\b/.test(text);
+        const recentAssistantMessages = history
+          .filter((message) => message.role === 'assistant')
+          .slice(-3)
+          .map((message) => message.content.toLowerCase());
+        const invalidPastAppointmentMenu = recentAssistantMessages.some((message) => {
+          const describesPastAppointment = /(date|day|appointment|booking|session).*(already\s+)?(passed|past)|already\s+passed/.test(message);
+          return describesPastAppointment && /reschedule/.test(message) && /cancel/.test(message);
+        });
+
+        return isFollowUp && invalidPastAppointmentMenu;
+      }
 
   private buildPackageLine(pkg: {
     name: string;
@@ -279,12 +374,175 @@ export class AgentService {
 
       if (!packages.length) return null;
 
-      const lines = packages.map((pkg, index) => `${index + 1}) ${this.buildPackageLine(pkg)}`);
-      return `We offer the following maternity packages:\n\n${lines.join('\n')}\n\nTell me which package you want and your preferred date, and I'll check availability.`;
+      const lines = packages.map((pkg) => this.buildPackageLine(pkg));
+      return `Here are the maternity packages we currently offer:\n\n${lines.join('\n')}\n\nIf one catches your eye, I can tell you more about it or help you find one that suits the kind of shoot you have in mind.`;
     } catch (err) {
       console.error('Failed to build package catalog reply:', err);
       return null;
     }
+  }
+
+  private async getPackageAdviceReply(userMessage: string): Promise<string | null> {
+    const packages = await prisma.package.findMany({
+      orderBy: [{ price: 'asc' }, { name: 'asc' }],
+      select: {
+        name: true,
+        price: true,
+        duration: true,
+        images: true,
+        makeup: true,
+        outfits: true,
+        photobook: true,
+        photobookSize: true,
+        mount: true,
+        balloonBackdrop: true,
+        wig: true,
+        notes: true,
+      },
+    });
+
+    const text = userMessage.toLowerCase();
+    const mentionedPackages = packages.filter((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
+    if (mentionedPackages.length >= 2) {
+      const [first, second] = mentionedPackages;
+      const differences: string[] = [];
+      if (first.price !== second.price) differences.push(`${first.name} is Ksh ${first.price.toLocaleString()}, while ${second.name} is Ksh ${second.price.toLocaleString()}`);
+      if (first.images !== second.images) differences.push(`${first.name} includes ${first.images} edited images and ${second.name} includes ${second.images}`);
+      if (first.duration !== second.duration) differences.push(`${first.name} is ${first.duration}, while ${second.name} is ${second.duration}`);
+      if (first.photobook !== second.photobook) differences.push(second.photobook ? `${second.name} includes an ${second.photobookSize || ''} photobook`.replace('an  photobook', 'a photobook') : `${first.name} includes an ${first.photobookSize || ''} photobook`.replace('an  photobook', 'a photobook'));
+      if (first.mount !== second.mount) differences.push(first.mount ? `${first.name} includes an A3 mount` : `${second.name} includes an A3 mount`);
+
+      const higherValuePackage = first.price >= second.price ? first : second;
+      const lowerCostPackage = higherValuePackage === first ? second : first;
+      return `${differences.join('. ')}. ${higherValuePackage.name} makes sense if its extra inclusions matter to you; ${lowerCostPackage.name} is the lower-cost option. Will your older child be joining you in the shoot?`;
+    }
+
+    const gold = packages.find((pkg) => pkg.name.toLowerCase() === 'gold package');
+    const executive = packages.find((pkg) => pkg.name.toLowerCase() === 'executive package');
+    if (!gold || !executive) return null;
+
+    return `Congratulations on your second baby. I would lean toward the Gold Package if you would enjoy more variety: it includes ${gold.images} edited images and an ${gold.photobookSize || ''} photobook for Ksh ${gold.price.toLocaleString()}. Executive is Ksh ${executive.price.toLocaleString()} and includes ${executive.images} images with an A3 mount, so it is a lovely lower-cost option. Will your older child be joining you in the shoot?`;
+  }
+
+  private async getPackageSelectionReply(customerId: string, userMessage: string): Promise<string | null> {
+    const text = userMessage.toLowerCase();
+    const packages = await prisma.package.findMany({ select: { name: true } });
+    const selectedPackage = packages.find((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
+    if (!selectedPackage) return null;
+
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (draft?.step === 'awaiting_confirmation' && draft.date && draft.time && draft.dateTimeIso) {
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => selectedPackage.name.toLowerCase().includes(key));
+      const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
+      const slotsResult = await bookingService.getAvailableSlots(draft.date, duration);
+
+      if (!Array.isArray(slotsResult)) {
+        return `We are closed on ${dayjs(draft.date).format('dddd, MMMM D')}, so that date will not work. What other day would suit you?`;
+      }
+
+      if (!slotsResult.includes(draft.time)) {
+        const alternatives = slotsResult.slice(0, 3).join(', ');
+        return `${selectedPackage.name} needs a different amount of time, and ${draft.time} is not free on ${dayjs(draft.date).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would you prefer?`;
+      }
+
+      const selectedPackageDetails = await prisma.package.findUnique({
+        where: { name: selectedPackage.name },
+        select: { deposit: true },
+      });
+      const deposit = selectedPackageDetails?.deposit || 2000;
+      await prisma.bookingDraft.update({
+        where: { customerId },
+        data: { service: selectedPackage.name, step: 'awaiting_confirmation' },
+      });
+
+      return `${selectedPackage.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+    }
+
+    return `${selectedPackage.name} is a lovely choice. What date are you considering? Once you have a day in mind, I can check the available times for you.`;
+  }
+
+  private async getSameBookingSlotReply(
+    customerId: string,
+    history: { role: 'user' | 'assistant', content: string }[]
+  ): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (draft?.step !== 'awaiting_confirmation' || !draft.date || !draft.time || !draft.dateTimeIso || !draft.service) {
+      return null;
+    }
+
+    const packages = await prisma.package.findMany({ select: { name: true, deposit: true } });
+    const selectedPackage = history
+      .filter((message) => message.role === 'user')
+      .reverse()
+      .map((message) => packages.find((pkg) => message.content.toLowerCase().includes(pkg.name.replace(/ package$/i, '').toLowerCase())))
+      .find((pkg): pkg is { name: string; deposit: number } => Boolean(pkg));
+    const packageToUse = selectedPackage || packages.find((pkg) => pkg.name === draft.service);
+    if (!packageToUse) return null;
+
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => packageToUse.name.toLowerCase().includes(key));
+    const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
+    const slotsResult = await bookingService.getAvailableSlots(draft.date, duration);
+    if (!Array.isArray(slotsResult)) {
+      return `We are closed on ${dayjs(draft.date).format('dddd, MMMM D')}, so that date will not work. What other day would suit you?`;
+    }
+    if (!slotsResult.includes(draft.time)) {
+      const alternatives = slotsResult.slice(0, 3).join(', ');
+      return `${packageToUse.name} is not available at ${draft.time} on ${dayjs(draft.date).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would you prefer?`;
+    }
+
+    await prisma.bookingDraft.update({
+      where: { customerId },
+      data: { service: packageToUse.name, step: 'awaiting_confirmation' },
+    });
+
+    return `${packageToUse.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${packageToUse.deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+  }
+
+  private async getRescheduleTimeReply(customerId: string): Promise<string | null> {
+    const booking = await prisma.booking.findFirst({
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' },
+      select: { service: true, dateTime: true },
+    });
+    if (!booking) return null;
+
+    return `Of course. Your ${booking.service} session is currently on ${dayjs(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
+  }
+
+  private async getRescheduleTimeProposalReply(customerId: string, userMessage: string): Promise<string | null> {
+    const newTime = this.conversationFlows.parseTimeOnly(userMessage);
+    if (!newTime) return null;
+
+    const booking = await prisma.booking.findFirst({
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' },
+      select: { id: true, service: true, dateTime: true },
+    });
+    if (!booking) return null;
+
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key)) || 'standard';
+    const slotsResult = await bookingService.getAvailableSlots(
+      dayjs(booking.dateTime).format('YYYY-MM-DD'),
+      SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION,
+      booking.id
+    );
+    const availableSlots = Array.isArray(slotsResult) ? slotsResult : [];
+    if (!availableSlots.includes(newTime)) {
+      const alternatives = availableSlots.slice(0, 3).map((time) => dayjs(`2000-01-01T${time}`).format('h:mm A')).join(', ');
+      return `${dayjs(`2000-01-01T${newTime}`).format('h:mm A')} is not free on ${dayjs(booking.dateTime).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would work for you?`;
+    }
+
+    const result = await this.executeProposeRescheduleTool(customerId, dayjs(booking.dateTime).format('YYYY-MM-DD'), newTime);
+    await this.notifyRescheduleAdmin({
+      customerId,
+      event: 'proposed',
+      service: result.service,
+      oldDateTime: result.oldDateTime,
+      newDate: dayjs(booking.dateTime).format('YYYY-MM-DD'),
+      newTime,
+    });
+
+    return `I can move your ${result.service} session to ${dayjs(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(`2000-01-01T${newTime}`).format('h:mm A')}. Would you like me to confirm that change?`;
   }
 
   private async getBookingProcessReply(): Promise<string> {
@@ -340,12 +598,169 @@ export class AgentService {
     ].join('\n');
   }
 
+  private addWorkingDays(from: dayjs.Dayjs, days: number): dayjs.Dayjs {
+    let cursor = from;
+    let remaining = days;
+
+    while (remaining > 0) {
+      cursor = cursor.add(1, 'day');
+      const day = cursor.day(); // 0=Sun, 6=Sat
+      if (day !== 0 && day !== 6) {
+        remaining -= 1;
+      }
+    }
+
+    return cursor;
+  }
+
+  private async getEarliestImageDeliveryReply(customerId: string): Promise<string> {
+    const upcomingConfirmed = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: 'confirmed',
+        dateTime: { gte: new Date() },
+      },
+      orderBy: { dateTime: 'asc' },
+      select: { dateTime: true },
+    });
+
+    if (!upcomingConfirmed) {
+      return [
+        'Edited photos are ready 10 working days after the shoot.',
+        'If you share your booked date, I can give you the exact earliest delivery date.',
+        'Express delivery is available at an extra fee if you need them sooner.'
+      ].join('\n');
+    }
+
+    const shootDate = dayjs(upcomingConfirmed.dateTime);
+    const earliest = this.addWorkingDays(shootDate, 10);
+
+    return [
+      'Edited photos are ready 10 working days after the shoot.',
+      `Since your session is on ${shootDate.format('dddd, MMMM D, YYYY')}, the earliest delivery date is ${earliest.format('dddd, MMMM D, YYYY')}.`,
+      'If you need them sooner, we offer express delivery at an extra fee.'
+    ].join('\n');
+  }
+
   private getRawFilesReply(): string {
     return [
       'Yes, raw files are available at an extra fee.',
       'They are shared as a secure download link (not sent directly as attachments).',
       'If you want, I can have the team confirm the raw-file fee for your specific package/session.'
     ].join('\n');
+  }
+
+  private getSocialMediaReply(): string {
+    return [
+      'Instagram: @fiestahousematernity',
+      'https://www.instagram.com/fiestahousematernity',
+      '',
+      'Facebook: Fiesta House Attire',
+      'https://www.facebook.com/fiestahouseattire/',
+      '',
+      'Website: https://www.fiestahousematernity.com/',
+      '',
+      'We only share client photos with consent.'
+    ].join('\n');
+  }
+
+  private getPortfolioReply(): string {
+    return 'You can see our maternity, newborn and family sessions in the portfolio here: https://www.fiestahousematernity.com/. Have a look and tell me which style feels most like you.';
+  }
+
+  private getWebsiteReply(): string {
+    return 'You can find us here: https://www.fiestahousematernity.com/. It has our portfolio, current packages and more about the studio.';
+  }
+
+  private getContactDetailsReply(): string {
+    return 'We are at Diamond Plaza Annex, 2nd Floor, on 4th Avenue in Parklands, Nairobi. You can reach us on 0720 111928 or at info@fiestahouseattire.com. Our website is https://www.fiestahousematernity.com/.';
+  }
+
+  private getMultiPersonBookingReply(): string {
+    return [
+      'Great question, and yes, we can plan that.',
+      'Do you want:',
+      '1) one joint session together, or',
+      '2) separate bookings for each of you?',
+      '',
+      "I've noted that another person may join.",
+      "Once you confirm option 1 or 2, share your package, date, and preferred time and I'll check availability."
+    ].join('\n');
+  }
+
+  private async captureMultiPersonBookingNote(customerId: string, userMessage: string): Promise<void> {
+    const lower = userMessage.toLowerCase();
+    const relation =
+      lower.includes('sister') ? 'sister' :
+      lower.includes('brother') ? 'brother' :
+      lower.includes('friend') ? 'friend' :
+      lower.includes('husband') ? 'husband' :
+      lower.includes('wife') ? 'wife' :
+      lower.includes('partner') ? 'partner' :
+      lower.includes('family') ? 'family member' :
+      'another person';
+
+    await this.executeAddNoteTool(
+      customerId,
+      '',
+      `Customer mentioned ${relation} may join the shoot; confirm if this is a joint session or separate bookings before finalizing package/price.`,
+      'special_request'
+    );
+  }
+
+  private async getBookingStatusReply(customerId: string): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+
+    if (draft?.step === 'reschedule_confirm') {
+      return customerReplyTemplates.rescheduleAwaitingConfirmation();
+    }
+
+    if (draft?.step === 'awaiting_confirmation') {
+      return customerReplyTemplates.bookingAwaitingConfirmation();
+    }
+
+    if (draft?.step === 'payment_pending') {
+      const pendingPayment = await prisma.payment.findFirst({
+        where: { bookingDraftId: draft.id, status: 'pending' },
+        orderBy: { updatedAt: 'desc' },
+      });
+
+      if (pendingPayment) {
+        return customerReplyTemplates.paymentPending();
+      }
+    }
+
+    const upcomingConfirmed = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: 'confirmed',
+        dateTime: { gte: new Date() },
+      },
+      orderBy: { dateTime: 'asc' },
+      select: { service: true, dateTime: true },
+    });
+
+    if (upcomingConfirmed) {
+      return `Yes, it's done. Your ${upcomingConfirmed.service} session is confirmed for ${dayjs(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+    }
+
+    return null;
+  }
+
+  private async getPastAppointmentReply(customerId: string): Promise<string | null> {
+    const pastBooking = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: { not: 'cancelled' },
+        dateTime: { lt: new Date() },
+      },
+      orderBy: { dateTime: 'desc' },
+      select: { service: true, dateTime: true },
+    });
+
+    if (!pastBooking) return null;
+
+    return `You're right - that ${pastBooking.service} appointment was on ${dayjs(pastBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. Did the session happen, or did you miss it? We can't change or cancel a past appointment, but I can help arrange a new session.`;
   }
 
   private async logConversationLearning(params: {
@@ -421,7 +836,12 @@ Instructions:
 17. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
 18. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
 19. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.
-20. When confirming a saved delivery email, use plain text (no markdown asterisks around the email). Say clearly that the email has been saved and remind them edited photos are delivered within 10 working days.`;
+20. When confirming a saved delivery email, use plain text (no markdown asterisks around the email). Say clearly that the email has been saved and remind them edited photos are delivered within 10 working days.
+21. VOICE: You are a thoughtful, capable studio assistant having a real conversation, not a chatbot reading a script. Many customers are expectant mothers planning an important photo session: be warm, calm, and personally attentive without being overly familiar or assuming anything they have not said. Start by responding directly to what the customer just said. Use plain, everyday language and contractions. Prefer one or two short sentences; ask one clear question only when you genuinely need an answer. Do not use canned openers such as "Sure thing", "Absolutely", "No worries", or "I understand" unless they add genuine meaning. Do not restate the customer's message, narrate obvious steps, or repeat options they have already seen.
+22. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context.
+23. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
+24. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
+25. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.`;
   }
 
   /**
@@ -653,7 +1073,7 @@ ${contextString}`;
             else if (functionName === 'propose_booking') {
               const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
               proposedThisTurn = true;
-              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${args.date} at ${args.time}, deposit KSH ${result.depositAmount}. Tell the customer this deposit amount and ask them to explicitly confirm before you call confirm_booking - do NOT call confirm_booking in this same turn.`;
+              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${args.date} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "Great, I can hold ${args.service} for ${args.date} at ${args.time}. The deposit is KSH ${result.depositAmount}. If that works for you, just reply yes and I'll send the M-Pesa prompt." Do NOT call confirm_booking in this same turn.`;
             }
             else if (functionName === 'confirm_booking') {
               if (proposedThisTurn) {
@@ -678,7 +1098,7 @@ ${contextString}`;
                   newTime: args.newTime,
                 });
                 proposedThisTurn = true;
-                toolResponse = `PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Tell the customer this and ask them to explicitly confirm before you call confirm_reschedule - do NOT call it in this same turn.`;
+                toolResponse = `PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "Great, I can move your ${result.service} session to ${args.newDate} at ${args.newTime}. If that works for you, just reply yes and I'll confirm it." Do NOT call confirm_reschedule in this same turn.`;
               }
             }
             else if (functionName === 'confirm_reschedule') {
@@ -778,7 +1198,10 @@ ${contextString}`;
       tokensUsed += currentResponse.usage?.total_tokens || 0;
     }
 
-    return { content: currentResponse.choices[0].message.content || "I'm sorry, I couldn't process that.", tokensUsed };
+    return {
+      content: this.formatCustomerReply(currentResponse.choices[0].message.content || "I'm sorry, I couldn't process that."),
+      tokensUsed,
+    };
   }
 
   /**
@@ -789,6 +1212,7 @@ ${contextString}`;
    */
   async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
     const startedAt = Date.now();
+    const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
 
     // Best-effort frustration flagging - keyword heuristic, no extra AI call/cost.
     this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
@@ -839,8 +1263,182 @@ ${contextString}`;
       return fallbackReply;
     }
 
+    // Deterministic status reply to prevent contradictions after booking or
+    // reschedule confirmations when the customer asks if it's done.
+    if (this.shouldUseBookingStatusReply(userMessage)) {
+      const statusReply = await this.getBookingStatusReply(customerId);
+      if (statusReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: statusReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return statusReply;
+      }
+    }
+
+      if (this.shouldUsePastAppointmentReply(userMessage) || this.isPastAppointmentFollowUp(userMessage, history)) {
+        const pastAppointmentReply = await this.getPastAppointmentReply(customerId);
+        if (pastAppointmentReply) {
+          await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+          await this.logConversationLearning({
+            customerId,
+            userMessage,
+            aiResponse: pastAppointmentReply,
+            platform,
+            latencyMs: Date.now() - startedAt,
+            wasSuccessful: true,
+            isFallback: false,
+          });
+          return pastAppointmentReply;
+        }
+      }
+
+    // Deterministic multi-person booking clarification to avoid pricing/
+    // scheduling ambiguity before booking confirmation.
+    if (this.shouldUseMultiPersonBookingReply(userMessage)) {
+      await this.captureMultiPersonBookingNote(customerId, userMessage).catch((err) => {
+        console.error('Failed to capture multi-person booking note:', err);
+      });
+
+      const multiPersonReply = this.getMultiPersonBookingReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: multiPersonReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return multiPersonReply;
+    }
+
+    // Deterministic resend handling: only resend payment prompts when there's
+    // an actual pending payment; never offer resend after successful payment.
+    if (this.shouldHandleResendRequest(userMessage)) {
+      const resendReply = await this.tryHandlePaymentResend(customerId);
+      if (resendReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: resendReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return resendReply;
+      }
+    }
+
+    // In natural assistant mode, keep critical guardrails deterministic but
+    // let low-risk informational replies be generated naturally by the LLM.
+    const allowDeterministicInfoReplies = !naturalAssistantMode;
+    const informationalFlow = this.conversationFlowHandler.resolveInformationalFlow(userMessage, history);
+
+    if (informationalFlow === 'business_introduction') {
+      const businessIntroductionReply = this.getBusinessIntroductionReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: businessIntroductionReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return businessIntroductionReply;
+    }
+
+    if (informationalFlow === 'weekday') {
+      const weekdayReply = this.getWeekdayReply(userMessage, history);
+      if (weekdayReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: weekdayReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return weekdayReply;
+      }
+    }
+
+    if (informationalFlow === 'website') {
+      const websiteReply = this.getWebsiteReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: websiteReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return websiteReply;
+    }
+
+    if (informationalFlow === 'contact_details') {
+      const contactDetailsReply = this.getContactDetailsReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: contactDetailsReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return contactDetailsReply;
+    }
+
+    if (informationalFlow === 'portfolio') {
+      const portfolioReply = this.getPortfolioReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: portfolioReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return portfolioReply;
+    }
+
+    // Deterministic social media response for concise, consistent links.
+    if (allowDeterministicInfoReplies && this.shouldUseSocialMediaReply(userMessage)) {
+      const socialReply = this.getSocialMediaReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: socialReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return socialReply;
+    }
+
     // Deterministic raw-files policy response for direct, accurate answers.
-    if (this.shouldUseRawFilesReply(userMessage)) {
+    if (allowDeterministicInfoReplies && this.shouldUseRawFilesReply(userMessage)) {
       const rawFilesReply = this.getRawFilesReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -855,9 +1453,25 @@ ${contextString}`;
       return rawFilesReply;
     }
 
+    // Deterministic earliest-delivery-date response with plain-text formatting.
+    if (allowDeterministicInfoReplies && this.shouldUseEarliestImageDeliveryReply(userMessage)) {
+      const deliveryReply = await this.getEarliestImageDeliveryReply(customerId);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: deliveryReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return deliveryReply;
+    }
+
     // Deterministic post-shoot process response for consistent expectations
     // and delivery-preference capture CTA.
-    if (this.shouldUsePostShootProcessReply(userMessage)) {
+    if (allowDeterministicInfoReplies && this.shouldUsePostShootProcessReply(userMessage)) {
       const postShootReply = this.getPostShootProcessReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -873,7 +1487,7 @@ ${contextString}`;
     }
 
     // Deterministic booking process response for consistent policy wording.
-    if (this.shouldUseBookingProcessReply(userMessage)) {
+    if (allowDeterministicInfoReplies && this.shouldUseBookingProcessReply(userMessage)) {
       const processReply = await this.getBookingProcessReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -890,7 +1504,92 @@ ${contextString}`;
 
     // Deterministic catalog response to avoid unreadable markdown tables and
     // keep package replies consistent across chat channels.
-    if (this.shouldUsePackageCatalogReply(userMessage)) {
+    if (this.conversationFlows.isTimeOnlyRescheduleSelection(userMessage, history)) {
+      const rescheduleProposalReply = await this.getRescheduleTimeProposalReply(customerId, userMessage);
+      if (rescheduleProposalReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: rescheduleProposalReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return rescheduleProposalReply;
+      }
+    }
+
+    if (this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage)) {
+      const rescheduleTimeReply = await this.getRescheduleTimeReply(customerId);
+      if (rescheduleTimeReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: rescheduleTimeReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return rescheduleTimeReply;
+      }
+    }
+
+    if (this.conversationFlows.isSameBookingSlotRequest(userMessage)) {
+      const sameSlotReply = await this.getSameBookingSlotReply(customerId, history);
+      if (sameSlotReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: sameSlotReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return sameSlotReply;
+      }
+    }
+
+    if (this.conversationFlows.isPackageSelection(userMessage)) {
+      const selectionReply = await this.getPackageSelectionReply(customerId, userMessage);
+      if (selectionReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: selectionReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return selectionReply;
+      }
+    }
+
+    if (this.conversationFlows.isPackageAdviceRequest(userMessage)) {
+      const adviceReply = await this.getPackageAdviceReply(userMessage);
+      if (adviceReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: adviceReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return adviceReply;
+      }
+    }
+
+    if (this.conversationFlows.isPackageCatalogRequest(userMessage)) {
       const catalogReply = await this.getPackageCatalogReply();
       if (catalogReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -907,10 +1606,14 @@ ${contextString}`;
       }
     }
 
-    // Deterministic confirm fast-path: short explicit confirmations like
-    // "yes" / "confirm" should finalize an already pending draft instead of
-    // relying on the model to pick the right tool every time.
-    if ((platform === 'whatsapp' || platform === 'web') && this.isExplicitConfirmation(userMessage)) {
+    // A short "yes" only confirms a proposal that the customer saw in the
+    // immediately preceding assistant message. This prevents stale drafts
+    // from being applied when the assistant was actually asking for details.
+    if (
+      (platform === 'whatsapp' || platform === 'web') &&
+      this.isExplicitConfirmation(userMessage) &&
+      this.previousMessageRequestsConfirmation(history)
+    ) {
       const immediate = await this.tryImmediateConfirmation(customerId);
       if (immediate) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -993,7 +1696,7 @@ ${contextString}`;
       'yes', 'y', 'yep', 'yeah', 'yess', 'yesss',
       'ok', 'okay', 'confirm', 'confirmed',
       'go ahead', 'go-ahead', 'proceed', 'continue',
-      'that works', 'works for me', 'that one', 'same one',
+      'that works', 'works for me', 'that one', 'same one', 'lets do that', "let's do that", 'let us do that',
       'sawa', 'ndio'
     ]);
 
@@ -1011,8 +1714,15 @@ ${contextString}`;
       /^that works\b/,
       /^works for me\b/,
       /^that one\b/,
-      /^same one\b/
+      /^same one\b/,
+      /^let'?s do that\b/,
+      /^let us do that\b/
     ].some((pattern) => pattern.test(normalized));
+  }
+
+  private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
+    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
+    return /(reply\s+(yes|confirm)|would you like me to confirm|confirm that change|confirm the change|shall i confirm)/.test(previousAssistantMessage);
   }
 
   private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
@@ -1021,7 +1731,7 @@ ${contextString}`;
 
     if (draft.step === 'awaiting_confirmation') {
       const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation');
-      return `Great - I've sent an M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Please enter your PIN to complete payment. Once successful, your booking for ${result.service} on ${result.date} at ${result.time} will be confirmed.`;
+      return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
 
     if (draft.step === 'reschedule_confirm') {
@@ -1033,7 +1743,61 @@ ${contextString}`;
         oldDateTime: result.oldDateTime,
         newDateTime: result.newDateTime,
       });
-      return `Perfect - your ${result.service} session has been rescheduled to ${dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+      return customerReplyTemplates.rescheduleConfirmed(result.service, dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A'));
+    }
+
+    return null;
+  }
+
+  private async tryHandlePaymentResend(customerId: string): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+
+    // Valid resend path: customer has a pending payment draft.
+    if (draft?.step === 'payment_pending') {
+      const payment = await prisma.payment.findFirst({
+        where: { bookingDraftId: draft.id, status: { in: ['pending', 'failed'] } },
+        orderBy: { updatedAt: 'desc' },
+      });
+
+      if (!payment) {
+        return 'I cannot find an active payment request to resend right now. Please say "book" and I will re-open the booking payment step for you.';
+      }
+
+      try {
+        const mpesaResponse = await mpesaService.initiateStkPush(customerId, payment.amount, draft.id);
+        await prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'pending',
+            checkoutRequestId: mpesaResponse.CheckoutRequestID,
+            updatedAt: new Date(),
+          }
+        });
+
+        return `Done - I've resent the M-Pesa deposit prompt of KSH ${payment.amount} to your phone. Please enter your PIN to complete payment.`;
+      } catch (error: any) {
+        console.error('Failed to resend M-Pesa STK push:', error);
+        return `I couldn't resend the payment prompt right now. Please try again in a minute, or I can have the team assist immediately.`;
+      }
+    }
+
+    // If a successful payment already exists for an upcoming confirmed booking,
+    // never offer to resend payment.
+    const confirmedPaidBooking = await prisma.payment.findFirst({
+      where: {
+        status: 'success',
+        booking: {
+          customerId,
+          status: 'confirmed',
+          dateTime: { gte: new Date() },
+        }
+      },
+      include: { booking: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+
+    if (confirmedPaidBooking?.booking) {
+      return `Your payment is already successful and your booking is confirmed for ${confirmedPaidBooking.booking.service} on ${dayjs(confirmedPaidBooking.booking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. No resend is needed.`;
     }
 
     return null;
@@ -1265,25 +2029,11 @@ ${contextString}`;
     });
     const depositAmount = pkg?.deposit || 2000;
 
-    await prisma.bookingDraft.upsert({
-      where: { customerId: customer.id },
-      update: {
-        service: service,
-        date: dayjs(date).format('YYYY-MM-DD'),
-        time: dayjs(date).format('HH:mm'),
-        dateTimeIso: date,
-        name: name,
-        step: 'awaiting_confirmation'
-      },
-      create: {
-        customerId: customer.id,
-        service: service,
-        date: dayjs(date).format('YYYY-MM-DD'),
-        time: dayjs(date).format('HH:mm'),
-        dateTimeIso: date,
-        name: name,
-        step: 'awaiting_confirmation'
-      }
+    await bookingDraftService.saveBookingProposal({
+      customerId: customer.id,
+      service,
+      dateTime: date,
+      customerName: name,
     });
 
     return { depositAmount };
@@ -1301,7 +2051,7 @@ ${contextString}`;
       throw new Error('No pending booking proposal from a prior message. Call propose_booking first and wait for the customer to explicitly confirm on their own next message before calling confirm_booking.');
     }
 
-    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    const draft = await bookingDraftService.get(customerId);
     if (!draft || draft.step !== 'awaiting_confirmation') {
       throw new Error('No pending booking proposal found. Call propose_booking first.');
     }
@@ -1312,10 +2062,7 @@ ${contextString}`;
     });
     const depositAmount = pkg?.deposit || 2000;
 
-    await prisma.bookingDraft.update({
-      where: { customerId },
-      data: { step: 'payment_pending' }
-    });
+    await bookingDraftService.markPaymentPending(customerId);
 
     // Initiate M-Pesa STK Push using draft ID as reference
     try {

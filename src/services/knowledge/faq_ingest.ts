@@ -23,7 +23,7 @@ export async function loadFaqChunks(embedder: any, chunkText: (text: string) => 
       // only the answer text creates a systematic mismatch between query and
       // stored vector that no amount of paraphrase entries can fully patch.
       const output = await embedder(`${q}\n${chunk}`, { pooling: 'mean', normalize: true });
-      const vector = Array.from(output.data);
+      const vector = Array.from(output.data) as number[];
       faqChunks.push({
         id: `faq_${chunkId++}`,
         content: `${q}\n${chunk}`,

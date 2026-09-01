@@ -2,6 +2,7 @@ import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
+import { businessDay, nowInBusinessTimezone } from '../../utils/time';
 
 export class BookingService {
   
@@ -12,8 +13,8 @@ export class BookingService {
    * applied) falsely counting as a conflict against itself.
    */
   async getAvailableSlots(date: string, durationMinutes: number, excludeBookingId?: string) {
-    const startOfDay = dayjs(date).startOf('day');
-    const endOfDay = dayjs(date).endOf('day');
+    const startOfDay = businessDay(date).startOf('day');
+    const endOfDay = businessDay(date).endOf('day');
 
     console.log(`Checking slots for ${date}, duration: ${durationMinutes} mins`);
 
@@ -32,7 +33,7 @@ export class BookingService {
     });
 
     // 1b. Fetch active booking drafts (pending payment) from last 15 minutes
-    const fifteenMinutesAgo = dayjs().subtract(15, 'minute').toDate();
+    const fifteenMinutesAgo = nowInBusinessTimezone().subtract(15, 'minute').toDate();
     const activeDrafts = await prisma.bookingDraft.findMany({
       where: {
         step: 'payment_pending',
@@ -51,7 +52,7 @@ export class BookingService {
     console.log(`Found ${existingBookings.length} local bookings, ${activeDrafts.length} active drafts, and ${googleEvents.length} Google Calendar events for ${date}`);
 
     // 3. Check if it's a Monday
-    if (dayjs(date).day() === 1) {
+    if (businessDay(date).day() === 1) {
       console.log(`Date ${date} is a Monday. Returning closed status.`);
       return { status: 'closed', reason: 'Closed on Mondays' };
     }
@@ -65,7 +66,7 @@ export class BookingService {
     // Check every 30 minutes
     for (let hour = businessStart; hour < businessEnd; hour++) {
       for (let minute of [0, 30]) {
-        const slotStart = dayjs(date).hour(hour).minute(minute).second(0).millisecond(0);
+        const slotStart = businessDay(date).hour(hour).minute(minute).second(0).millisecond(0);
         const slotEnd = slotStart.add(durationMinutes, 'minute');
 
         // Check if this slot exceeds business hours
@@ -75,7 +76,7 @@ export class BookingService {
 
         // Check for overlap with local bookings
         const overlapsLocal = existingBookings.some(booking => {
-          const bStart = dayjs(booking.dateTime);
+          const bStart = businessDay(booking.dateTime);
           const bDuration = booking.durationMinutes || DEFAULT_DURATION;
           const bEnd = bStart.add(bDuration, 'minute');
           return slotStart.isBefore(bEnd) && slotEnd.isAfter(bStart);
@@ -86,7 +87,7 @@ export class BookingService {
         // Check for overlap with pending drafts
         const overlapsDraft = activeDrafts.some(draft => {
           if (!draft.dateTimeIso) return false;
-          const dStart = dayjs(draft.dateTimeIso);
+          const dStart = businessDay(draft.dateTimeIso);
           const dServiceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
           const dDuration = SERVICE_DURATIONS[dServiceKey] || DEFAULT_DURATION;
           const dEnd = dStart.add(dDuration, 'minute');
@@ -98,8 +99,8 @@ export class BookingService {
         // Check for overlap with Google Calendar events
         const overlapsGoogle = googleEvents.some(event => {
           if (!event.start?.dateTime || !event.end?.dateTime) return false;
-          const eStart = dayjs(event.start.dateTime);
-          const eEnd = dayjs(event.end.dateTime);
+          const eStart = businessDay(event.start.dateTime);
+          const eEnd = businessDay(event.end.dateTime);
           return slotStart.isBefore(eEnd) && slotEnd.isAfter(eStart);
         });
 

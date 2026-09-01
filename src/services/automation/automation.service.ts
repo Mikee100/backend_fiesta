@@ -1,6 +1,8 @@
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
 import { whatsappService } from '../messaging/whatsapp.service';
+import { inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
+import { customerReplyTemplates } from '../messaging/customer-reply.templates';
 
 export class AutomationService {
   
@@ -11,8 +13,8 @@ export class AutomationService {
     console.log('Running Automation: processReminders');
     
     // Find bookings happening in the next 24-25 hours
-    const tomorrowStart = dayjs().add(24, 'hour').startOf('hour').toDate();
-    const tomorrowEnd = dayjs().add(25, 'hour').endOf('hour').toDate();
+    const tomorrowStart = nowInBusinessTimezone().add(1, 'day').startOf('day').toDate();
+    const tomorrowEnd = nowInBusinessTimezone().add(1, 'day').endOf('day').toDate();
 
     const upcomingBookings = await prisma.booking.findMany({
       where: {
@@ -36,8 +38,8 @@ export class AutomationService {
 
     for (const booking of upcomingBookings) {
       try {
-        const timeStr = dayjs(booking.dateTime).format('h:mm A');
-        const message = `Hi ${booking.customer.name}! 📸 This is a friendly reminder from Fiesta AI for your ${booking.service} appointment tomorrow at ${timeStr}. We're excited to see you!`;
+        const timeStr = inBusinessTimezone(booking.dateTime).format('h:mm A');
+        const message = customerReplyTemplates.appointmentReminder(booking.customer.name, booking.service, timeStr);
 
         await whatsappService.sendMessage(booking.customer.id, message);
 
@@ -67,8 +69,8 @@ export class AutomationService {
     console.log('Running Automation: processFollowups');
 
     // Find bookings that happened exactly 5 days ago (give or take an hour)
-    const fiveDaysAgoStart = dayjs().subtract(5, 'day').startOf('hour').toDate();
-    const fiveDaysAgoEnd = dayjs().subtract(5, 'day').endOf('hour').toDate();
+    const fiveDaysAgoStart = nowInBusinessTimezone().subtract(5, 'day').startOf('day').toDate();
+    const fiveDaysAgoEnd = nowInBusinessTimezone().subtract(5, 'day').endOf('day').toDate();
 
     const pastBookings = await prisma.booking.findMany({
       where: {
@@ -92,7 +94,7 @@ export class AutomationService {
 
     for (const booking of pastBookings) {
       try {
-        const message = `Hi ${booking.customer.name}! 👋 It's been 5 days since your shoot. We hope you're loving your photos! How was your experience with us? We'd love to hear your feedback!`;
+        const message = customerReplyTemplates.feedbackFollowUp(booking.customer.name);
 
         await whatsappService.sendMessage(booking.customer.id, message);
 

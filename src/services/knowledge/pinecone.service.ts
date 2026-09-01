@@ -29,6 +29,11 @@ export class PineconeService {
     console.log('Upsert successful.');
   }
 
+  async deleteAllVectors() {
+    console.log(`Deleting existing vectors from Pinecone index: ${indexName}...`);
+    await index.deleteAll();
+  }
+
   /**
    * Queries Pinecone for the top K most relevant vectors
    */

@@ -8,7 +8,7 @@ import dayjs from 'dayjs';
 export class GoogleCalendarService {
   private auth;
   private calendar;
-  private calendarId: string;
+  private calendarId = 'primary';
 
   constructor() {
     try {
