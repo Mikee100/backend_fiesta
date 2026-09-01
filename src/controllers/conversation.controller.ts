@@ -79,7 +79,7 @@ export class ConversationController {
    */
   async getById(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const customer = await prisma.customer.findUnique({
         where: { id }
       });
@@ -95,7 +95,7 @@ export class ConversationController {
    */
   async getConversationMessages(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const { platform } = req.query;
 
       const platformFilter = platform ? { equals: String(platform) } : undefined;
@@ -119,7 +119,7 @@ export class ConversationController {
    */
   async sendReply(req: Request, res: Response) {
     try {
-      const { id } = req.params; // Customer ID
+      const id = String(req.params.id); // Customer ID
       const { message, platform } = req.body;
 
       if (!message || !platform) {
@@ -138,7 +138,7 @@ export class ConversationController {
         const to = customer.whatsappId || customer.phone;
         if (!to) return res.status(400).json({ error: 'Customer has no WhatsApp ID or Phone' });
         
-        await whatsappService.sendTextMessage(to, message);
+        await whatsappService.sendMessage(to, message);
       } 
       else if (platform === 'instagram') {
         const to = customer.instagramId;

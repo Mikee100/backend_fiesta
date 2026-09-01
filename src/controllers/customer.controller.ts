@@ -163,11 +163,27 @@ export class CustomerController {
    */
   async getCustomer(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const customer = await prisma.customer.findUnique({
         where: { id },
         include: {
-          bookings: { orderBy: { dateTime: 'desc' } },
+          bookings: {
+            orderBy: { dateTime: 'desc' },
+            include: {
+              payments: {
+                orderBy: { createdAt: 'desc' },
+                select: {
+                  id: true,
+                  amount: true,
+                  status: true,
+                  mpesaReceipt: true,
+                  checkoutRequestId: true,
+                  createdAt: true,
+                  updatedAt: true,
+                }
+              }
+            }
+          },
           messages: { orderBy: { createdAt: 'desc' }, take: 50 },
           _count: {
             select: { bookings: true, messages: true }
@@ -176,8 +192,9 @@ export class CustomerController {
       });
       if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-      const inferredPlatform = this.inferPlatform(customer as any, customer.messages?.[0]?.platform || null);
-      const displayPhone = this.inferDisplayPhone(customer as any, inferredPlatform);
+      const customerWithMessages = customer as any;
+      const inferredPlatform = this.inferPlatform(customerWithMessages, customerWithMessages.messages?.[0]?.platform || null);
+      const displayPhone = this.inferDisplayPhone(customerWithMessages, inferredPlatform);
 
       return res.json({
         ...customer,
@@ -195,7 +212,7 @@ export class CustomerController {
    */
   async getMessages(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const messages = await prisma.message.findMany({
         where: { customerId: id },
         orderBy: { createdAt: 'asc' }
@@ -211,7 +228,7 @@ export class CustomerController {
    */
   async getSessionNotes(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const notes = await prisma.customerSessionNote.findMany({
         where: { customerId: id },
         include: { booking: true },
@@ -228,7 +245,7 @@ export class CustomerController {
    */
   async updateSessionNote(req: Request, res: Response) {
     try {
-      const { noteId } = req.params;
+      const noteId = String(req.params.noteId);
       const { status, adminNotes, reviewedBy } = req.body;
       const note = await prisma.customerSessionNote.update({
         where: { id: noteId },
@@ -250,7 +267,7 @@ export class CustomerController {
    */
   async getSentiment(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const scores = await prisma.sentimentScore.findMany({
         where: { customerId: id },
         orderBy: { createdAt: 'desc' },
@@ -291,7 +308,7 @@ export class CustomerController {
    */
   async toggleAi(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const { enabled } = req.body;
 
       const customer = await prisma.customer.update({

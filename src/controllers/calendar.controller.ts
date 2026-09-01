@@ -1,3 +1,4 @@
+import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import { googleCalendarService } from '../services/calendar/calendar.service';
 

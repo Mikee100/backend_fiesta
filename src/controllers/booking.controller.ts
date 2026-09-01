@@ -4,6 +4,8 @@ import { googleCalendarService } from '../services/calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
 import { notifyAdmin } from '../services/notifications/notification.service';
 import dayjs from 'dayjs';
+import { bookingService } from '../services/booking/booking.service';
+import { businessDay } from '../utils/time';
 
 export class BookingController {
   
@@ -14,7 +16,19 @@ export class BookingController {
     try {
       const bookings = await prisma.booking.findMany({
         include: {
-          customer: true
+          customer: true,
+          payments: {
+            orderBy: { createdAt: 'desc' },
+            select: {
+              id: true,
+              amount: true,
+              status: true,
+              mpesaReceipt: true,
+              checkoutRequestId: true,
+              createdAt: true,
+              updatedAt: true,
+            }
+          }
         },
         orderBy: {
           dateTime: 'desc'
@@ -63,7 +77,7 @@ export class BookingController {
    */
   async updatePackage(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const pkg = await prisma.package.update({ where: { id }, data: this.pickPackageFields(req.body) });
       return res.json(pkg);
     } catch (error: any) {
@@ -76,7 +90,7 @@ export class BookingController {
    */
   async deletePackage(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       await prisma.package.delete({ where: { id } });
       return res.status(204).send();
     } catch (error: any) {
@@ -105,44 +119,20 @@ export class BookingController {
    */
   async getAvailableHours(req: Request, res: Response) {
     try {
-      const { date } = req.params;
-      const startOfDay = new Date(date);
-      startOfDay.setHours(0,0,0,0);
-      const endOfDay = new Date(date);
-      endOfDay.setHours(23,59,59,999);
+      const date = Array.isArray(req.params.date) ? req.params.date[0] : req.params.date;
+      const service = typeof req.query.service === 'string' ? req.query.service : 'Standard Package';
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => service.toLowerCase().includes(key)) || 'standard';
+      const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+      const availableSlots = await bookingService.getAvailableSlots(date, duration);
 
-      const existingBookings = await prisma.booking.findMany({
-        where: {
-          dateTime: {
-            gte: startOfDay,
-            lte: endOfDay
-          },
-          status: {
-            not: 'cancelled'
-          }
-        }
-      });
-
-      // Generate slots from 9 AM to 5 PM
-      const slots = [];
-      for (let h = 9; h < 17; h++) {
-        for (let m of [0, 30]) {
-          const slotTime = new Date(date);
-          slotTime.setHours(h, m, 0, 0);
-          
-          const isTaken = existingBookings.some(b => 
-            new Date(b.dateTime).getHours() === h && 
-            new Date(b.dateTime).getMinutes() === m
-          );
-
-          slots.push({
-            time: slotTime.toISOString(),
-            available: !isTaken
-          });
-        }
+      if (!Array.isArray(availableSlots)) {
+        return res.json([]);
       }
 
-      return res.json(slots);
+      return res.json(availableSlots.map((time) => ({
+        time: businessDay(date).hour(Number(time.slice(0, 2))).minute(Number(time.slice(3))).second(0).millisecond(0).toISOString(),
+        available: true,
+      })));
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }
@@ -153,7 +143,7 @@ export class BookingController {
    */
   async confirmBooking(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const booking = await prisma.booking.update({
         where: { id },
         data: { status: 'confirmed' }
@@ -229,7 +219,7 @@ export class BookingController {
    */
   async cancelBooking(req: Request, res: Response) {
     try {
-      const { id } = req.params;
+      const id = String(req.params.id);
       const existing = await prisma.booking.findUnique({ where: { id } });
       if (!existing) {
         return res.status(404).json({ error: 'Booking not found' });
@@ -264,6 +254,77 @@ export class BookingController {
       );
 
       return res.json(booking);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Get one booking by ID
+   */
+  async getBookingById(req: Request, res: Response) {
+    try {
+      const id = String(req.params.id);
+      const booking = await prisma.booking.findUnique({
+        where: { id },
+        include: {
+          customer: {
+            select: { id: true, name: true, email: true, phone: true }
+          },
+          payments: {
+            orderBy: { createdAt: 'desc' },
+            select: {
+              id: true,
+              amount: true,
+              status: true,
+              mpesaReceipt: true,
+              checkoutRequestId: true,
+              createdAt: true,
+              updatedAt: true,
+            }
+          }
+        }
+      });
+
+      if (!booking) {
+        return res.status(404).json({ error: 'Booking not found' });
+      }
+
+      return res.json(booking);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Get all bookings for a specific customer
+   */
+  async getCustomerBookings(req: Request, res: Response) {
+    try {
+      const customerId = String(req.params.customerId);
+      const bookings = await prisma.booking.findMany({
+        where: { customerId },
+        include: {
+          customer: {
+            select: { id: true, name: true, email: true, phone: true }
+          },
+          payments: {
+            orderBy: { createdAt: 'desc' },
+            select: {
+              id: true,
+              amount: true,
+              status: true,
+              mpesaReceipt: true,
+              checkoutRequestId: true,
+              createdAt: true,
+              updatedAt: true,
+            }
+          }
+        },
+        orderBy: { dateTime: 'desc' }
+      });
+
+      return res.json(bookings);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

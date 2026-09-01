@@ -3,8 +3,70 @@ import prisma from '../config/prisma';
 import { googleCalendarService } from '../services/calendar/calendar.service';
 import { whatsappService } from '../services/messaging/whatsapp.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
+import { notifyAdmin } from '../services/notifications/notification.service';
+import { invoiceService } from '../services/invoice/invoice.service';
+import { customerReplyTemplates } from '../services/messaging/customer-reply.templates';
 
 export class PaymentController {
+  /**
+   * Creates an invoice for a confirmed booking if one doesn't exist yet.
+   * Safe to call multiple times (idempotent by unique bookingId).
+   */
+  private async ensureInvoiceForBooking(bookingId: string): Promise<void> {
+    const existing = await prisma.invoice.findUnique({ where: { bookingId }, select: { id: true } });
+    if (existing) return;
+
+    const booking = await prisma.booking.findUnique({ where: { id: bookingId }, include: { customer: true } });
+    if (!booking) return;
+
+    const pkg = await prisma.package.findFirst({ where: { name: { contains: booking.service, mode: 'insensitive' } } });
+    const subtotal = pkg?.price || 0;
+    const tax = 0;
+    const discount = 0;
+    const total = subtotal + tax - discount;
+
+    const payments = await prisma.payment.findMany({ where: { bookingId, status: 'success' } });
+    const depositPaid = payments.reduce((sum, p) => sum + p.amount, 0);
+    const depositReceipts = payments.map((p) => p.mpesaReceipt).filter((r): r is string => !!r);
+    const balanceDue = Math.max(total - depositPaid, 0);
+
+    const year = new Date().getFullYear();
+    const invoiceCountThisYear = await prisma.invoice.count({ where: { invoiceNumber: { startsWith: `INV-${year}-` } } });
+    const invoiceNumber = invoiceService.buildInvoiceNumber(year, invoiceCountThisYear + 1);
+
+    const pdfBuffer = await invoiceService.generatePdf({
+      invoiceNumber,
+      customerName: booking.customer.name,
+      customerPhone: booking.customer.phone,
+      service: booking.service,
+      bookingDateTime: booking.dateTime,
+      subtotal,
+      tax,
+      discount,
+      total,
+      depositPaid,
+      depositReceipts,
+      balanceDue,
+      createdAt: new Date(),
+    });
+
+    await prisma.invoice.create({
+      data: {
+        invoiceNumber,
+        bookingId,
+        customerId: booking.customerId,
+        subtotal,
+        tax,
+        discount,
+        total,
+        depositPaid,
+        balanceDue,
+        status: 'pending',
+        pdfData: pdfBuffer,
+      }
+    });
+  }
+
   /**
    * Handles M-Pesa Callback
    */
@@ -103,8 +165,46 @@ export class PaymentController {
           }
 
           // Notify customer via WhatsApp
-          const message = `🌟 *Payment Received!* 🌟\n\nYour booking for *${targetBooking.service}* on *${targetBooking.dateTime.toLocaleDateString()}* at *${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}* has been officially *CONFIRMED*.\n\nWe look forward to seeing you at Fiesta House Attire & Maternity! ✨`;
+          const appointmentDate = targetBooking.dateTime.toLocaleDateString('en-KE', {
+            weekday: 'long',
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+          });
+          const appointmentTime = targetBooking.dateTime.toLocaleTimeString('en-KE', {
+            hour: 'numeric',
+            minute: '2-digit',
+          });
+          const message = `Payment received. Your ${targetBooking.service} session is confirmed.\n\n${appointmentDate} at ${appointmentTime}\n\nWe'll send you a reminder before your session. We look forward to welcoming you.`;
           await whatsappService.sendMessage(targetBooking.customer.id, message);
+
+          // Best-effort auto invoice generation right after successful payment.
+          // Do not break the payment flow if invoice creation fails.
+          try {
+            await this.ensureInvoiceForBooking(targetBooking.id);
+          } catch (invoiceErr: any) {
+            console.error(`Failed to auto-generate invoice for booking ${targetBooking.id}:`, invoiceErr?.message || invoiceErr);
+          }
+
+          await notifyAdmin(
+            'booking',
+            `New booking confirmed: ${targetBooking.customer.name || targetBooking.customer.id}`,
+            `${targetBooking.service} on ${targetBooking.dateTime.toLocaleDateString()} at ${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Deposit KSH ${payment.amount}${mpesaReceipt ? `, M-Pesa code ${mpesaReceipt}` : ''}.`,
+            {
+              event: 'new_booking_confirmed',
+              customerId: targetBooking.customerId,
+              bookingId: targetBooking.id,
+              paymentId: payment.id,
+              service: targetBooking.service,
+              bookingDateTime: targetBooking.dateTime.toISOString(),
+              amount: payment.amount,
+              paymentAmount: payment.amount,
+              paymentStatus: 'success',
+              mpesaReceipt: mpesaReceipt || null,
+              checkoutRequestId: payment.checkoutRequestId || null,
+              paidAt: new Date().toISOString(),
+            }
+          );
 
           console.log(`Booking ${targetBooking.id} confirmed after successful payment.`);
 
@@ -143,7 +243,7 @@ export class PaymentController {
 
         const customerId = payment.bookingDraft?.customerId || payment.booking?.customerId;
         if (customerId) {
-           const message = `❌ *Payment Failed* ❌\n\nWe couldn't process your deposit payment: *${ResultDesc}*.\n\nYour booking request is still on hold for 15 minutes. Please try the payment again or contact us for assistance.`;
+           const message = customerReplyTemplates.paymentFailed(ResultDesc);
            await whatsappService.sendMessage(customerId, message);
         }
         

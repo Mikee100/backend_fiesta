@@ -75,6 +75,7 @@ export class KnowledgeIngestionService {
         }
       }));
 
+      await pineconeService.deleteAllVectors();
       await pineconeService.upsertVectors(pineconeVectors);
       console.log('Successfully upserted vectors to Pinecone.');
     } catch (error) {
