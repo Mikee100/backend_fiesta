@@ -83,7 +83,9 @@ export function scoreSentiment(text: string): { score: number; sentiment: string
 
 // Daily per-customer token budget, protects the shared free-tier quota from
 // one runaway conversation (or loop bug) burning through the whole day's limit.
-export const DAILY_TOKEN_CAP = 20000;
+// Increased to give normal customer conversations enough room while still guarding
+// against runaway loops or abusive usage.
+export const DAILY_TOKEN_CAP = 50000;
 
 // The Groq account has its own account-wide daily token cap, shared across
 // every customer on every channel. When it's hit, EVERY customer gets the
@@ -111,4 +113,4 @@ export function isProviderRateLimitError(error: any): boolean {
 }
 
 export const FALLBACK_MESSAGE =
-  "Sorry for the delay! We're experiencing high demand right now — one of our team members will follow up with you shortly.";
+  "We’ve reached today’s AI conversation limit for this chat. A team member will follow up with you shortly, and we’ll continue as soon as the daily limit resets.";
