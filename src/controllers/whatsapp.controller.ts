@@ -37,6 +37,12 @@ export class WhatsAppController {
 
       // Check if it's a WhatsApp message event
       if (body.object === 'whatsapp_business_account') {
+        console.log('[WHATSAPP_WEBHOOK] Received business account event:', JSON.stringify({
+          entryCount: Array.isArray(body.entry) ? body.entry.length : 0,
+          hasChanges: !!(body.entry && body.entry[0] && body.entry[0].changes),
+          hasMessages: !!(body.entry && body.entry[0] && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value && body.entry[0].changes[0].value.messages),
+          rawBodyKeys: Object.keys(body || {})
+        }));
         if (
           body.entry &&
           body.entry[0].changes &&
@@ -48,6 +54,14 @@ export class WhatsAppController {
           const msgId = message.id;
           const msgType = message.type; // 'text', 'image', 'audio', 'video', 'document', 'sticker', 'location', 'contacts', etc.
 
+          console.log('[WHATSAPP_WEBHOOK] Message payload parsed:', JSON.stringify({
+            from,
+            msgId,
+            msgType,
+            textPreview: msgType === 'text' ? (message.text?.body || '').slice(0, 200) : '(non-text)',
+            metadataKeys: Object.keys(message || {})
+          }));
+
           // 1. Check for Duplicate Message (Deduplication) - before anything else,
           // so retried webhook deliveries for non-text messages don't re-trigger a reply.
           const existingMessage = await prisma.message.findFirst({
@@ -55,7 +69,7 @@ export class WhatsAppController {
           });
 
           if (existingMessage) {
-            console.log(`Duplicate message received (${msgId}), skipping.`);
+            console.log(`[WHATSAPP_WEBHOOK] Duplicate message received (${msgId}), skipping.`);
             return res.sendStatus(200);
           }
 
@@ -81,7 +95,7 @@ export class WhatsAppController {
             return res.sendStatus(200);
           }
 
-          console.log(`WhatsApp message from ${from} (${msgType}): ${msgBody}`);
+          console.log(`[WHATSAPP_WEBHOOK] About to process message from ${from} (${msgType}): ${msgBody}`);
 
           // 2. Ensure Customer exists and Save Inbound Message
           let customer = await prisma.customer.findUnique({ where: { id: from } });
@@ -108,6 +122,7 @@ export class WhatsAppController {
           }
 
           try {
+            console.log(`[WHATSAPP_WEBHOOK] Saving inbound message ${msgId} to DB for customer ${from}`);
             await prisma.message.create({
               data: {
                 content: msgBody,
@@ -130,6 +145,7 @@ export class WhatsAppController {
             throw e;
           }
 
+          console.log(`[WHATSAPP_WEBHOOK] Marking message ${msgId} as read`);
           await whatsappService.markAsRead(msgId);
 
           if (isNonText) {
@@ -145,6 +161,7 @@ export class WhatsAppController {
             // Debounce: if the customer sends several messages in quick succession,
             // wait for them to pause before running the AI once on the whole burst,
             // instead of firing a separate disjointed reply per message.
+            console.log(`[WHATSAPP_WEBHOOK] Scheduling debounced AI turn for ${from}`);
             messageDebouncer.scheduleTurn(from, () => this.processPendingTurn(from));
           }
         }
@@ -169,6 +186,7 @@ export class WhatsAppController {
    */
   private async processPendingTurn(customerId: string): Promise<void> {
     try {
+      console.log(`[WHATSAPP_TURN] Starting turn processing for customer ${customerId}`);
       const lastOutbound = await prisma.message.findFirst({
         where: { customerId, platform: 'whatsapp', direction: 'outbound' },
         orderBy: { createdAt: 'desc' }
@@ -184,9 +202,17 @@ export class WhatsAppController {
         orderBy: { createdAt: 'asc' }
       });
 
-      if (pendingInbound.length === 0) return; // nothing unresponded - shouldn't normally happen
+      if (pendingInbound.length === 0) {
+        console.log(`[WHATSAPP_TURN] No pending inbound messages for ${customerId}`);
+        return; // nothing unresponded - shouldn't normally happen
+      }
 
       const combinedMessage = pendingInbound.map(m => m.content).join('\n');
+      console.log(`[WHATSAPP_TURN] Pending inbound batch for ${customerId}:`, JSON.stringify({
+        count: pendingInbound.length,
+        preview: combinedMessage.slice(0, 300),
+        messageIds: pendingInbound.map(m => m.id)
+      }));
 
       const recentMessages = await prisma.message.findMany({
         where: { customerId, createdAt: { lt: pendingInbound[0].createdAt } },
@@ -201,7 +227,12 @@ export class WhatsAppController {
       // handleMessage never throws - on any internal failure (provider error,
       // circuit open, rate limited) it resolves to a safe fallback string,
       // logged distinctly in AiJobMetric.
+      console.log(`[WHATSAPP_TURN] Calling agentService.handleMessage for ${customerId}`);
       const aiReply = await agentService.handleMessage(customerId, combinedMessage, history, 'whatsapp');
+      console.log(`[WHATSAPP_TURN] Agent response for ${customerId}:`, JSON.stringify({
+        replyPreview: aiReply.slice(0, 200),
+        isFallback: aiReply.includes("we're experiencing high demand") || aiReply.includes("we are experiencing high demand")
+      }));
 
       await prisma.message.create({
         data: { content: aiReply, platform: 'whatsapp', direction: 'outbound', customerId, handledBy: 'ai' }

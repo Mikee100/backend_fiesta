@@ -1214,10 +1214,19 @@ ${contextString}`;
     const startedAt = Date.now();
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
 
+    console.log('[AGENT_FLOW] handleMessage start:', JSON.stringify({
+      customerId,
+      platform,
+      messagePreview: userMessage.slice(0, 200),
+      historyLength: history.length,
+      naturalAssistantMode
+    }));
+
     // Best-effort frustration flagging - keyword heuristic, no extra AI call/cost.
     this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
 
     if (circuitBreaker.isOpen()) {
+      console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
       const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
@@ -1244,7 +1253,9 @@ ${contextString}`;
     }
 
     const withinBudget = await this.checkTokenBudget(customerId);
+    console.log('[AGENT_FLOW] Budget check result:', { customerId, withinBudget });
     if (!withinBudget) {
+      console.log('[AGENT_FLOW] Daily token budget exceeded; returning fallback reply.');
       const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
@@ -1265,7 +1276,9 @@ ${contextString}`;
 
     // Deterministic status reply to prevent contradictions after booking or
     // reschedule confirmations when the customer asks if it's done.
-    if (this.shouldUseBookingStatusReply(userMessage)) {
+    const bookingStatusReply = this.shouldUseBookingStatusReply(userMessage);
+    console.log('[AGENT_FLOW] Booking status route check:', { customerId, bookingStatusReply, naturalAssistantMode });
+    if (bookingStatusReply) {
       const statusReply = await this.getBookingStatusReply(customerId);
       if (statusReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -1631,7 +1644,13 @@ ${contextString}`;
     }
 
     try {
+      console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
       const { content, tokensUsed } = await this.runAgent(customerId, userMessage, history, platform);
+      console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
+        customerId,
+        tokensUsed,
+        replyPreview: content.slice(0, 200)
+      }));
       circuitBreaker.recordSuccess();
       await this.recordTokenUsage(customerId, tokensUsed);
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -1647,7 +1666,15 @@ ${contextString}`;
       this.touchCustomerMemory(customerId, userMessage, platform).catch(err => console.error('Customer memory update failed:', err));
       return content;
     } catch (error: any) {
-      console.error('Agent reply pipeline failed:', error);
+      console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
+      console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({
+        customerId,
+        errorName: error?.name,
+        errorMessage: error?.message,
+        status: error?.status,
+        code: error?.code,
+        isRateLimit: isProviderRateLimitError(error)
+      }));
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
       const fallbackReply = FALLBACK_MESSAGE;
