@@ -47,7 +47,7 @@ export class InvoiceService {
         .text('Fiesta House Attire & Maternity', MARGIN, 40);
       doc.fillColor(MUTED).font('Helvetica').fontSize(9)
         .text('4th Avenue Parklands, Diamond Plaza Annex, Nairobi, Kenya', MARGIN, 64)
-        .text('+254 720 111928  ·  info@fiestahouseattire.com  ·  fiestahouseattire.com', MARGIN, 78);
+        .text('+254 720 111928  ·  info@fiestahouseattire.com  ·  www.fiestahousematernity.com', MARGIN, 78);
 
       doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(22)
         .text('INVOICE', MARGIN, 40, { width: CONTENT_WIDTH, align: 'right' });

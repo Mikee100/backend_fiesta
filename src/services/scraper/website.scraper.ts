@@ -2,8 +2,8 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 
 const TARGET_URLS = [
-  'https://fiestahouseattire.com/',
-  'https://fiestahouseattire.com/new/'
+  'https://www.fiestahousematernity.com/',
+  'https://www.fiestahousematernity.com/new/'
 ];
 
 export class WebsiteScraperService {
