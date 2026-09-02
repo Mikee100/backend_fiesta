@@ -1255,7 +1255,11 @@ ${contextString}`;
     const withinBudget = await this.checkTokenBudget(customerId);
     console.log('[AGENT_FLOW] Budget check result:', { customerId, withinBudget });
     if (!withinBudget) {
-      console.log('[AGENT_FLOW] Daily token budget exceeded; returning fallback reply.');
+      console.log('[AGENT_FLOW] Daily token budget exceeded; returning fallback reply.', {
+        customerId,
+        dailyTokenCap: DAILY_TOKEN_CAP,
+        platform
+      });
       const fallbackReply = FALLBACK_MESSAGE;
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
@@ -1270,7 +1274,11 @@ ${contextString}`;
         wasSuccessful: false,
         isFallback: true,
       });
-      await this.escalate(customerId, 'quota', 'Customer exceeded their daily AI token budget - customer got the canned fallback message.');
+      await this.escalate(
+        customerId,
+        'quota',
+        `Customer hit the daily AI token budget (cap: ${DAILY_TOKEN_CAP}). The bot sent the quota fallback instead of continuing the conversation.`
+      );
       return fallbackReply;
     }
 
