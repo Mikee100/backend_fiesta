@@ -299,6 +299,27 @@ export class AgentService {
     return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed)/.test(text);
   }
 
+  private shouldUseUpcomingAppointmentTimeReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /\b(when does|what time does|when is|what time is|what time will)\b.*\b(start|begin|session|appointment|booking)\b|\b(start|begin)\b.*\b(when|what time)\b/.test(text);
+  }
+
+  private async getUpcomingAppointmentTimeReply(customerId: string): Promise<string | null> {
+    const upcomingBooking = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: 'confirmed',
+        dateTime: { gte: new Date() },
+      },
+      orderBy: { dateTime: 'asc' },
+      select: { service: true, dateTime: true },
+    });
+
+    if (!upcomingBooking) return null;
+
+    return `Your ${upcomingBooking.service} session starts on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY')} at ${inBusinessTimezone(upcomingBooking.dateTime).format('h:mm A')}. Please arrive about 30 minutes early.`;
+  }
+
     private shouldUsePastAppointmentReply(userMessage: string): boolean {
       const text = userMessage.toLowerCase();
       return /(that|the|my)\s+(date|day|appointment|booking|session).*(already\s+)?(passed|past)|already\s+passed|that\s+was\s+in\s+the\s+past/.test(text);
@@ -506,7 +527,7 @@ export class AgentService {
     });
     if (!booking) return null;
 
-    return `Of course. Your ${booking.service} session is currently on ${dayjs(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
+    return `Of course. Your ${booking.service} session is currently on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${inBusinessTimezone(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
   }
 
   private async getRescheduleTimeProposalReply(customerId: string, userMessage: string): Promise<string | null> {
@@ -521,28 +542,29 @@ export class AgentService {
     if (!booking) return null;
 
     const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key)) || 'standard';
+    const bookingDay = inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD');
     const slotsResult = await bookingService.getAvailableSlots(
-      dayjs(booking.dateTime).format('YYYY-MM-DD'),
+      bookingDay,
       SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION,
       booking.id
     );
     const availableSlots = Array.isArray(slotsResult) ? slotsResult : [];
     if (!availableSlots.includes(newTime)) {
       const alternatives = availableSlots.slice(0, 3).map((time) => dayjs(`2000-01-01T${time}`).format('h:mm A')).join(', ');
-      return `${dayjs(`2000-01-01T${newTime}`).format('h:mm A')} is not free on ${dayjs(booking.dateTime).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would work for you?`;
+      return `${dayjs(`2000-01-01T${newTime}`).format('h:mm A')} is not free on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would work for you?`;
     }
 
-    const result = await this.executeProposeRescheduleTool(customerId, dayjs(booking.dateTime).format('YYYY-MM-DD'), newTime);
+    const result = await this.executeProposeRescheduleTool(customerId, bookingDay, newTime);
     await this.notifyRescheduleAdmin({
       customerId,
       event: 'proposed',
       service: result.service,
       oldDateTime: result.oldDateTime,
-      newDate: dayjs(booking.dateTime).format('YYYY-MM-DD'),
+      newDate: bookingDay,
       newTime,
     });
 
-    return `I can move your ${result.service} session to ${dayjs(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(`2000-01-01T${newTime}`).format('h:mm A')}. Would you like me to confirm that change?`;
+    return `I can move your ${result.service} session to ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(`2000-01-01T${newTime}`).format('h:mm A')}. Would you like me to confirm that change?`;
   }
 
   private async getBookingProcessReply(): Promise<string> {
@@ -632,7 +654,7 @@ export class AgentService {
       ].join('\n');
     }
 
-    const shootDate = dayjs(upcomingConfirmed.dateTime);
+    const shootDate = inBusinessTimezone(upcomingConfirmed.dateTime);
     const earliest = this.addWorkingDays(shootDate, 10);
 
     return [
@@ -741,7 +763,7 @@ export class AgentService {
     });
 
     if (upcomingConfirmed) {
-      return `Yes, it's done. Your ${upcomingConfirmed.service} session is confirmed for ${dayjs(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+      return `Yes, it's done. Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
     }
 
     return null;
@@ -760,7 +782,7 @@ export class AgentService {
 
     if (!pastBooking) return null;
 
-    return `You're right - that ${pastBooking.service} appointment was on ${dayjs(pastBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. Did the session happen, or did you miss it? We can't change or cancel a past appointment, but I can help arrange a new session.`;
+    return `You're right - that ${pastBooking.service} appointment was on ${inBusinessTimezone(pastBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. Did the session happen, or did you miss it? We can't change or cancel a past appointment, but I can help arrange a new session.`;
   }
 
   private async logConversationLearning(params: {
@@ -805,7 +827,7 @@ export class AgentService {
   }
 
   private getSystemPrompt(businessContext: string, platform: string): string {
-    const now = dayjs().format('dddd, MMMM D, YYYY h:mm A');
+    const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     return `Current Date/Time: ${now}
 You are the official AI assistant for Fiesta House Attire & Maternity.
 Your goal is to answer customer questions accurately and help them make bookings.
@@ -837,6 +859,7 @@ Instructions:
 18. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
 19. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.
 20. When confirming a saved delivery email, use plain text (no markdown asterisks around the email). Say clearly that the email has been saved and remind them edited photos are delivered within 10 working days.
+20a. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead. Keep the conversation focused on their booking and questions - media sharing happens on those platforms only.
 21. VOICE: You are a thoughtful, capable studio assistant having a real conversation, not a chatbot reading a script. Many customers are expectant mothers planning an important photo session: be warm, calm, and personally attentive without being overly familiar or assuming anything they have not said. Start by responding directly to what the customer just said. Use plain, everyday language and contractions. Prefer one or two short sentences; ask one clear question only when you genuinely need an answer. Do not use canned openers such as "Sure thing", "Absolutely", "No worries", or "I understand" unless they add genuine meaning. Do not restate the customer's message, narrate obvious steps, or repeat options they have already seen.
 22. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context.
 23. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
@@ -860,10 +883,10 @@ Instructions:
     const now2 = dayjs();
     const upcomingBooking = customer?.bookings.find(b => dayjs(b.dateTime).isAfter(now2) && b.status !== 'cancelled');
     const upcomingBookingSummary = upcomingBooking
-      ? `${upcomingBooking.service} on ${dayjs(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status})`
+      ? `${upcomingBooking.service} on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status})`
       : 'None';
     const pastBookings = customer?.bookings.map(b =>
-      `${b.service} on ${dayjs(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
+      `${b.service} on ${inBusinessTimezone(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
     ).join(', ') || 'No past bookings';
 
     // Snapshot the booking draft's step as it stood BEFORE this turn's tool calls
@@ -1300,6 +1323,23 @@ ${contextString}`;
           isFallback: false,
         });
         return statusReply;
+      }
+    }
+
+    if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) {
+      const appointmentTimeReply = await this.getUpcomingAppointmentTimeReply(customerId);
+      if (appointmentTimeReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: appointmentTimeReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return appointmentTimeReply;
       }
     }
 

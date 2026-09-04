@@ -56,3 +56,9 @@ test('does not repeat an invalid past-appointment menu', () => {
   assert.equal(agent.isPastAppointmentFollowUp('Do number 2', history), true);
   assert.equal(agent.isPastAppointmentFollowUp('Say that again', history), true);
 });
+
+test('recognizes upcoming appointment start-time questions', () => {
+  assert.equal(agent.shouldUseUpcomingAppointmentTimeReply('When does it start?'), true);
+  assert.equal(agent.shouldUseUpcomingAppointmentTimeReply('When does my session start?'), true);
+  assert.equal(agent.shouldUseUpcomingAppointmentTimeReply('What time is my appointment?'), true);
+});

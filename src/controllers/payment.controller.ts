@@ -170,10 +170,12 @@ export class PaymentController {
             day: 'numeric',
             month: 'long',
             year: 'numeric',
+            timeZone: 'Africa/Nairobi',
           });
           const appointmentTime = targetBooking.dateTime.toLocaleTimeString('en-KE', {
             hour: 'numeric',
             minute: '2-digit',
+            timeZone: 'Africa/Nairobi',
           });
           const message = `Payment received. Your ${targetBooking.service} session is confirmed.\n\n${appointmentDate} at ${appointmentTime}\n\nWe'll send you a reminder before your session. We look forward to welcoming you.`;
           await whatsappService.sendMessage(targetBooking.customer.id, message);
