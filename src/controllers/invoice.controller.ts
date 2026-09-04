@@ -141,7 +141,7 @@ export class InvoiceController {
 
       const summary = `*Invoice ${invoice.invoiceNumber}*\n\n`
         + `Service: ${invoice.booking.service}\n`
-        + `Date: ${invoice.booking.dateTime.toLocaleDateString()}\n\n`
+        + `Date: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}\n\n`
         + `Total: KSh ${invoice.total.toLocaleString()}\n`
         + `Deposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\n`
         + `Balance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\n`
