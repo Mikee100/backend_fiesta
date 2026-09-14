@@ -10,6 +10,8 @@ router.get('/:id', customerController.getCustomer.bind(customerController));
 router.get('/:id/messages', customerController.getMessages.bind(customerController));
 router.get('/:id/session-notes', customerController.getSessionNotes.bind(customerController));
 router.get('/:id/sentiment', customerController.getSentiment.bind(customerController));
+router.get('/:id/photo-links', customerController.getPhotoLinks.bind(customerController));
+router.post('/:id/send-photo-link', customerController.sendPhotoLink.bind(customerController));
 router.patch('/session-notes/:noteId', customerController.updateSessionNote.bind(customerController));
 router.post('/:id/toggle-ai', customerController.toggleAi.bind(customerController));
 

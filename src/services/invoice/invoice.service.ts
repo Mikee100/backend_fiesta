@@ -8,6 +8,7 @@ interface InvoicePdfData {
   service: string;
   bookingDateTime: Date;
   subtotal: number;
+  addonLines?: { name: string; quantity: number; unitPrice: number; totalPrice: number }[];
   tax: number;
   discount: number;
   total: number;
@@ -83,6 +84,10 @@ export class InvoiceService {
 
       const rows: [string, string, boolean?][] = [
         [data.service, `KSh ${data.subtotal.toLocaleString()}`],
+        ...(data.addonLines || []).map((line) => [
+          line.name,
+          line.totalPrice > 0 ? `KSh ${line.totalPrice.toLocaleString()}` : 'Quoted',
+        ] as [string, string]),
         ...(data.discount > 0 ? [['Discount', `- KSh ${data.discount.toLocaleString()}`] as [string, string]] : []),
         ...(data.tax > 0 ? [['Tax', `KSh ${data.tax.toLocaleString()}`] as [string, string]] : []),
       ];

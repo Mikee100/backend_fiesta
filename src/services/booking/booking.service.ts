@@ -57,9 +57,9 @@ export class BookingService {
       return { status: 'closed', reason: 'Closed on Mondays' };
     }
 
-    // Business Hours: 9 AM to 5 PM
+    // Business Hours: 9 AM to 7 PM (aligned with published FAQ / RAG hours)
     const businessStart = 9;
-    const businessEnd = 17;
+    const businessEnd = 19;
     
     const availableSlots: string[] = [];
     

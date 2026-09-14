@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { pipeline as hfPipeline } from '@xenova/transformers';
 import fs from 'fs';
 import path from 'path';
@@ -8,6 +9,11 @@ import { loadFaqChunks } from './faq_ingest';
 import { pineconeService } from './pinecone.service';
 
 const EMBEDDINGS_FILE = path.resolve(__dirname, '../../../docs/business_knowledge_embeddings.json');
+
+function stableVectorId(source: string, content: string, prefix: string): string {
+  const hash = createHash('sha256').update(`${source}\n${content}`).digest('hex').slice(0, 24);
+  return `${prefix}_${hash}`;
+}
 
 export class KnowledgeIngestionService {
   private embedder: any = null;
@@ -22,7 +28,7 @@ export class KnowledgeIngestionService {
 
   /**
    * Scrapes sources, chunks the text, creates embeddings, and saves them locally.
-   * Can be hooked up to a cron job or manual trigger.
+   * Pinecone is updated with upsert-then-delete-orphans (no empty-index gap).
    */
   async runIngestion() {
     await this.initEmbedder();
@@ -30,23 +36,39 @@ export class KnowledgeIngestionService {
     console.log('Step 1/3: Scraping Content...');
     const webData = await websiteScraper.scrapeAll();
     const socialData = await socialScraper.scrapeRecentPosts();
+    // Guard: never embed synthetic placeholder social text into RAG
+    const usableSocial = socialData.filter(
+      (s) => s.content?.trim() && !/placeholder content for/i.test(s.content)
+    );
+    if (usableSocial.length < socialData.length) {
+      console.warn(
+        `[ingestion] Dropped ${socialData.length - usableSocial.length} placeholder/empty social chunk(s).`
+      );
+    }
 
-    const allSources = [...webData, ...socialData];
+    const allSources = [
+      ...webData.map((d) => ({ url: d.url, content: d.content })),
+      ...usableSocial.map((d) => ({ url: d.url, content: d.content })),
+    ];
     const embeddingsDB: { id: string, content: string, embedding: number[], source: string }[] = [];
+    const seenIds = new Set<string>();
 
     console.log('Step 2/3: Chunking Text and Generating Embeddings...');
-    let chunkId = 0;
     for (const data of allSources) {
       const chunks = chunkText(data.content);
-      
+
       for (const chunk of chunks) {
         if (!chunk.trim()) continue;
+
+        const id = stableVectorId(data.url, chunk, 'chunk');
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
 
         const output = await this.embedder(chunk, { pooling: 'mean', normalize: true });
         const vector = Array.from(output.data) as number[];
 
         embeddingsDB.push({
-          id: `chunk_${chunkId++}`,
+          id,
           content: chunk,
           embedding: vector,
           source: data.url
@@ -54,17 +76,18 @@ export class KnowledgeIngestionService {
       }
     }
 
-    // Load FAQ chunks
-    const faqChunks = await loadFaqChunks(this.embedder, chunkText, chunkId);
-    if (faqChunks.length > 0) {
-      embeddingsDB.push(...faqChunks);
-      chunkId += faqChunks.length;
-      console.log(`Loaded ${faqChunks.length} FAQ chunks.`);
+    // Load FAQ chunks (stable hashed IDs from faq_ingest)
+    const faqChunks = await loadFaqChunks(this.embedder, chunkText);
+    for (const faq of faqChunks) {
+      if (seenIds.has(faq.id)) continue;
+      seenIds.add(faq.id);
+      embeddingsDB.push(faq);
     }
+    console.log(`Loaded ${faqChunks.length} FAQ chunks.`);
 
     console.log('Step 3/3: Saving to Vector Databases...');
-    
-    // --- Pinecone Upsert ---
+
+    // --- Pinecone: upsert first, then delete orphans (non-destructive) ---
     try {
       const pineconeVectors = embeddingsDB.map(item => ({
         id: item.id,
@@ -75,11 +98,11 @@ export class KnowledgeIngestionService {
         }
       }));
 
-      await pineconeService.deleteAllVectors();
-      await pineconeService.upsertVectors(pineconeVectors);
-      console.log('Successfully upserted vectors to Pinecone.');
+      await pineconeService.replaceVectors(pineconeVectors);
+      console.log('Successfully replaced vectors in Pinecone (zero-downtime).');
     } catch (error) {
       console.error('Failed to upsert to Pinecone:', error);
+      throw error;
     }
 
     // --- Local JSON Backup ---

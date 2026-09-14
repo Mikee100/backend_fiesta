@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../config/prisma';
+import { whatsappService } from '../services/messaging/whatsapp.service';
+import { notifyAdmin } from '../services/notifications/notification.service';
 
 export class CustomerController {
   private inferPlatform(customer: {
@@ -317,6 +319,77 @@ export class CustomerController {
       });
 
       return res.json({ aiEnabled: customer.aiEnabled });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * List photo delivery links previously sent to this customer.
+   */
+  async getPhotoLinks(req: Request, res: Response) {
+    try {
+      const id = String(req.params.id);
+      const links = await prisma.photoLink.findMany({
+        where: { customerId: id },
+        orderBy: { sentAt: 'desc' },
+      });
+      return res.json(links);
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  /**
+   * Persist a secure download link and send it to the customer on WhatsApp.
+   */
+  async sendPhotoLink(req: Request, res: Response) {
+    try {
+      const id = String(req.params.id);
+      const link = String(req.body?.link || '').trim();
+      if (!link) {
+        return res.status(400).json({ error: 'link is required' });
+      }
+      try {
+        // Basic URL validation — reject obviously bad values
+        new URL(link);
+      } catch {
+        return res.status(400).json({ error: 'link must be a valid URL' });
+      }
+
+      const customer = await prisma.customer.findUnique({ where: { id } });
+      if (!customer) {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+
+      const recipient =
+        customer.whatsappId ||
+        customer.phone ||
+        (this.inferPlatform(customer as any) === 'whatsapp' ? customer.id : null);
+
+      if (!recipient) {
+        return res.status(400).json({ error: 'Customer has no WhatsApp destination to send the link to' });
+      }
+
+      const photoLink = await prisma.photoLink.create({
+        data: { customerId: id, link },
+      });
+
+      const message =
+        `Hello${customer.name && customer.name !== 'Unknown' ? ` ${customer.name}` : ''}! ` +
+        `Here is the secure download link for your edited photos: ${link}. ` +
+        `We hope you love them!`;
+
+      await whatsappService.sendMessage(recipient, message);
+
+      await notifyAdmin(
+        'booking',
+        `Photo link sent to ${customer.name || id}`,
+        link,
+        { customerId: id, event: 'photo_link_sent', photoLinkId: photoLink.id }
+      );
+
+      return res.status(201).json(photoLink);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

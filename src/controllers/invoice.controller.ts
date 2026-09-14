@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import { invoiceService } from '../services/invoice/invoice.service';
 import { whatsappService } from '../services/messaging/whatsapp.service';
+import { bookingAddonService } from '../services/booking/booking-addon.service';
 
 // Fields safe to send to the frontend - excludes the binary pdfData blob,
 // which is only ever served directly via the download endpoint.
@@ -75,7 +76,9 @@ export class InvoiceController {
       }
 
       const pkg = await prisma.package.findFirst({ where: { name: { contains: booking.service, mode: 'insensitive' } } });
-      const subtotal = pkg?.price || 0;
+      const packagePrice = pkg?.price || 0;
+      const { addonsTotal, lineItems: addonLines } = await bookingAddonService.sumForBooking(bookingId);
+      const subtotal = packagePrice + addonsTotal;
       const tax = 0;
       const discount = 0;
       const total = subtotal + tax - discount;
@@ -95,7 +98,8 @@ export class InvoiceController {
         customerPhone: booking.customer.phone,
         service: booking.service,
         bookingDateTime: booking.dateTime,
-        subtotal,
+        subtotal: packagePrice,
+        addonLines,
         tax,
         discount,
         total,
@@ -121,6 +125,8 @@ export class InvoiceController {
         },
         select: INVOICE_LIST_SELECT,
       });
+
+      await bookingAddonService.markInvoiced(bookingId);
 
       return res.status(201).json(invoice);
     } catch (error: any) {

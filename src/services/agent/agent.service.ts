@@ -6,7 +6,7 @@ import dayjs from 'dayjs';
 import { bookingService } from '../booking/booking.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
-import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../../config/constants';
+import { SERVICE_DURATIONS, DEFAULT_DURATION, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
@@ -14,6 +14,7 @@ import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../ut
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
+import { bookingAddonService } from '../booking/booking-addon.service';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
 // Ensure you have GROQ_API_KEY in your .env
@@ -54,7 +55,9 @@ export class BookingExtractor {
                       cleanText.match(/this is ([a-z]{2,})/i) ||
                       cleanText.match(/i am ([a-z]{2,})/i);
     
-    const serviceMatch = cleanText.match(/(standard|economy|executive|gold|platinum|vip|vvip)\s+package/i);
+    const serviceMatch = cleanText.match(
+      new RegExp(`(?:the\\s+)?(${PACKAGE_NAME_PATTERN})(?:\\s+(?:package|edition))?`, 'i')
+    );
     const dateMatch = cleanText.match(/(\d{1,2})(st|nd|rd|th)?/i);
     const timeMatch = cleanText.match(/(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i);
 
@@ -89,7 +92,8 @@ export class BookingExtractor {
         {
           role: 'system',
           content: `Current Date/Time: ${now}\n\nExtract booking details from the user message.\n\nReturn ONLY valid JSON. No text.\n\nFormat:\n{\n  "name": string | null,\n  "service": string | null,\n  "date": string | null,\n  "time": string | null\n}\n\nRules:\n- Name must be full name if possible
-- Service must be one of: standard, economy, executive, gold, platinum, vip, vvip
+- Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names)
+- Prefer Edition names like "THE EMPRESS" over legacy names
 - Convert date into YYYY-MM-DD
 - Convert time into 24h format (HH:mm)
 - If missing, return null
@@ -732,22 +736,20 @@ export class AgentService {
   }
 
   private getAdditionsReply(): string {
+    const lines = ADDON_CATALOG.map((item) => {
+      const price = item.unitPrice > 0
+        ? `KSH ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`
+        : 'Quoted by package tier';
+      return `• *${item.name}:* ${price}`;
+    });
     return [
       '✨ *Fiesta House Maternity — Additions & Extra Services* ✨',
       '',
-      '• *Extra edited photo:* KSH 1,000 per photo',
-      '• *Extra digital art edit:* KSH 3,000 per photo',
-      '• *Extra outfit beyond package:* KSH 4,000 per outfit',
-      '• *Extra professional makeup:* KSH 3,500 per session',
-      '• *Fiesta House Power Suit* (where not included): KSH 10,000',
-      '• *Fiesta House styled wig hire:* KSH 4,000 per wig (book in advance)',
-      '• *Wig styling only:* KSH 3,000 per wig (book in advance)',
-      '• *Suspending Concept:* KSH 7,000',
-      '• *Goddess Sculpture Set* (where not included): KSH 15,000',
-      '• *Professional Reel:* Quoted by package tier (book in advance)',
-      '• *Raw files:* Quoted by package tier',
+      ...lines,
       '',
-      'Would you like to include any of these with your session? 🌸'
+      '_Add-ons are optional and settle with your balance after the shoot (not included in the KSH 2,000 deposit)._',
+      '',
+      'Would you like to include any of these with your session?'
     ].join('\n');
   }
 
@@ -1950,12 +1952,16 @@ ${contextString}`;
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
     const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-    return /(reply\s+(yes|confirm)|would you like me to confirm|confirm that change|confirm the change|shall i confirm)/.test(previousAssistantMessage);
+    return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm)/.test(previousAssistantMessage);
   }
 
   private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (!draft?.step) return null;
+
+    if (draft.step === 'payment_pending') {
+      return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
+    }
 
     if (draft.step === 'awaiting_confirmation') {
       const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation');
@@ -2667,6 +2673,14 @@ ${contextString}`;
         type: normalizedType,
         status: 'pending',
       }
+    });
+
+    // Persist matched add-ons as priced line items (not only free-text notes)
+    await bookingAddonService.createFromNote({
+      customerId,
+      bookingId: booking?.id,
+      note: rawNote,
+      sessionNoteId: createdNote.id,
     });
 
     if (normalizedType === 'action_request' || normalizedType === 'special_request') {

@@ -83,9 +83,8 @@ export function scoreSentiment(text: string): { score: number; sentiment: string
 
 // Daily per-customer token budget, protects the shared free-tier quota from
 // one runaway conversation (or loop bug) burning through the whole day's limit.
-// Increased to give normal customer conversations enough room while still guarding
-// against runaway loops or abusive usage.
-export const DAILY_TOKEN_CAP = 50000;
+// Temporary test override: raised to 13k for local QA/debugging only.
+export const DAILY_TOKEN_CAP = 13_000;
 
 // The Groq account has its own account-wide daily token cap, shared across
 // every customer on every channel. When it's hit, EVERY customer gets the
