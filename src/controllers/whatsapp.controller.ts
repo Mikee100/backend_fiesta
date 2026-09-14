@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { agentService } from '../services/agent/agent.service';
 import { whatsappService } from '../services/messaging/whatsapp.service';
+import { whatsappTemplatesService } from '../services/messaging/whatsapp-templates.service';
 import * as messageDebouncer from '../services/messaging/debounce.service';
 import prisma from '../config/prisma';
 import dotenv from 'dotenv';
@@ -342,6 +343,124 @@ export class WhatsAppController {
       verifyToken: process.env.WHATSAPP_VERIFY_TOKEN,
       webhookUrl: `${process.env.BASE_URL || ''}/webhooks/whatsapp`
     });
+  }
+
+  // ============================================================
+  // MESSAGE TEMPLATE MANAGEMENT
+  // ============================================================
+
+  /**
+   * Returns connected WhatsApp Business Account info.
+   * Used by the frontend to verify the Meta connection is live.
+   */
+  async getAccountInfo(req: Request, res: Response) {
+    try {
+      const info = await whatsappTemplatesService.getAccountInfo();
+      return res.json({ connected: true, ...info });
+    } catch (error: any) {
+      console.error('[WA_TEMPLATES] getAccountInfo error:', error.response?.data || error.message);
+      const metaError = error.response?.data?.error;
+      return res.status(503).json({
+        connected: false,
+        error: metaError?.message || 'Unable to verify WhatsApp Business Account connection.',
+      });
+    }
+  }
+
+  /**
+   * Retrieves all message templates from Meta for the connected WABA.
+   */
+  async getTemplates(req: Request, res: Response) {
+    try {
+      const templates = await whatsappTemplatesService.getTemplates();
+      return res.json({ templates });
+    } catch (error: any) {
+      console.error('[WA_TEMPLATES] getTemplates error:', error.response?.data || error.message);
+      const metaError = error.response?.data?.error;
+      return res.status(502).json({
+        error: metaError?.message || 'Failed to retrieve templates from Meta.',
+        code: metaError?.code,
+      });
+    }
+  }
+
+  /**
+   * Creates a new WhatsApp message template via Meta Graph API.
+   */
+  async createTemplate(req: Request, res: Response) {
+    try {
+      const { name, category, language, body, examples } = req.body;
+
+      // --- Validation ---
+      if (!name || !category || !language || !body) {
+        return res.status(400).json({ error: 'name, category, language, and body are required.' });
+      }
+
+      const nameRegex = /^[a-z0-9_]+$/;
+      if (!nameRegex.test(name)) {
+        return res.status(400).json({
+          error: 'Template name must be lowercase letters, numbers, and underscores only (e.g. order_confirmation).'
+        });
+      }
+
+      const validCategories = ['UTILITY', 'MARKETING', 'AUTHENTICATION'];
+      if (!validCategories.includes(category)) {
+        return res.status(400).json({ error: `category must be one of: ${validCategories.join(', ')}.` });
+      }
+
+      const normalizedLanguage = language === 'en' ? 'en_US' : language;
+      if (!/^[a-z]{2,3}(?:_[A-Z]{2,3})?$/.test(normalizedLanguage)) {
+        return res.status(400).json({ error: 'language must be a valid locale code such as en_US.' });
+      }
+
+      const variableMatches = body.match(/{{(\d+)}}/g) || [];
+      const variableNumbers = variableMatches.map((match: string) => Number(match.slice(2, -2)));
+      const expectedVariables = variableNumbers.length === 0
+        ? []
+        : Array.from({ length: Math.max(...variableNumbers) }, (_, index) => index + 1);
+      const uniqueVariables = Array.from(new Set<number>(variableNumbers)).sort((a, b) => a - b);
+
+      if (uniqueVariables.some((value, index) => value !== expectedVariables[index])) {
+        return res.status(400).json({ error: 'Body variables must be sequential placeholders starting at {{1}}.' });
+      }
+
+      const exampleValues = Array.isArray(examples)
+        ? examples.map((value: unknown) => String(value).trim())
+        : [];
+      if (expectedVariables.length > 0 && (
+        exampleValues.length !== expectedVariables.length || exampleValues.some((value: string) => !value)
+      )) {
+        return res.status(400).json({
+          error: `Provide one example value for each body variable (${expectedVariables.map((value) => `{{${value}}}`).join(', ')}).`,
+        });
+      }
+
+      // --- Build Meta payload ---
+      const payload = {
+        name,
+        category,
+        language: normalizedLanguage,
+        ...(expectedVariables.length > 0 ? { parameter_format: 'POSITIONAL' as const } : {}),
+        components: [
+          {
+            type: 'BODY' as const,
+            text: body,
+            ...(expectedVariables.length > 0 ? { example: { body_text: [exampleValues] } } : {}),
+          },
+        ],
+      };
+
+      const result = await whatsappTemplatesService.createTemplate(payload);
+      return res.status(201).json({ success: true, template: result });
+    } catch (error: any) {
+      console.error('[WA_TEMPLATES] createTemplate error:', error.response?.data || error.message);
+      const metaError = error.response?.data?.error;
+      return res.status(502).json({
+        error: metaError?.message || 'Failed to create template via Meta API.',
+        code: metaError?.code,
+        error_data: metaError?.error_data,
+      });
+    }
   }
 }
 

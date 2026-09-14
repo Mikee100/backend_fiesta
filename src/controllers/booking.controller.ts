@@ -103,13 +103,13 @@ export class BookingController {
    */
   async getServices(req: Request, res: Response) {
     const services = [
-      { name: 'Standard Package', duration: 90 },
-      { name: 'Economy Package', duration: 120 },
-      { name: 'Executive Package', duration: 150 },
-      { name: 'Gold Package', duration: 150 },
-      { name: 'Platinum Package', duration: 150 },
-      { name: 'VIP Package', duration: 210 },
-      { name: 'VVIP Package', duration: 210 },
+      { name: 'THE BLOOM', duration: 90 },
+      { name: 'THE MUSE', duration: 120 },
+      { name: 'THE ICON', duration: 150 },
+      { name: 'THE LEGEND', duration: 150 },
+      { name: 'THE QUEEN', duration: 180 },
+      { name: 'THE EMPRESS', duration: 210 },
+      { name: 'THE GODDESS', duration: 300 },
     ];
     return res.json(services);
   }
@@ -120,8 +120,8 @@ export class BookingController {
   async getAvailableHours(req: Request, res: Response) {
     try {
       const date = Array.isArray(req.params.date) ? req.params.date[0] : req.params.date;
-      const service = typeof req.query.service === 'string' ? req.query.service : 'Standard Package';
-      const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => service.toLowerCase().includes(key)) || 'standard';
+      const service = typeof req.query.service === 'string' ? req.query.service : 'THE BLOOM';
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => service.toLowerCase().includes(key)) || 'bloom';
       const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
       const availableSlots = await bookingService.getAvailableSlots(date, duration);
 
