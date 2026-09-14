@@ -1,7 +1,13 @@
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-export async function loadFaqChunks(embedder: any, chunkText: (text: string) => string[], startChunkId: number = 10000) {
+function stableFaqId(question: string, chunk: string): string {
+  const hash = createHash('sha256').update(`${question}\n${chunk}`).digest('hex').slice(0, 24);
+  return `faq_${hash}`;
+}
+
+export async function loadFaqChunks(embedder: any, chunkText: (text: string) => string[], _startChunkId: number = 10000) {
   const faqPath = path.resolve(__dirname, '../../../knowledge_base_rows.json');
   if (!fs.existsSync(faqPath)) {
     console.log('No FAQ JSON found, skipping FAQ ingestion.');
@@ -9,7 +15,6 @@ export async function loadFaqChunks(embedder: any, chunkText: (text: string) => 
   }
   const faqData = JSON.parse(fs.readFileSync(faqPath, 'utf-8'));
   const faqChunks = [];
-  let chunkId = startChunkId;
   for (const row of faqData) {
     const q = row.question?.trim();
     const a = row.answer?.trim();
@@ -25,7 +30,7 @@ export async function loadFaqChunks(embedder: any, chunkText: (text: string) => 
       const output = await embedder(`${q}\n${chunk}`, { pooling: 'mean', normalize: true });
       const vector = Array.from(output.data) as number[];
       faqChunks.push({
-        id: `faq_${chunkId++}`,
+        id: stableFaqId(q, chunk),
         content: `${q}\n${chunk}`,
         embedding: vector,
         source: 'faq'

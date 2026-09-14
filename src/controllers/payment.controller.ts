@@ -6,6 +6,7 @@ import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
 import { notifyAdmin } from '../services/notifications/notification.service';
 import { invoiceService } from '../services/invoice/invoice.service';
 import { customerReplyTemplates } from '../services/messaging/customer-reply.templates';
+import { bookingAddonService } from '../services/booking/booking-addon.service';
 
 export class PaymentController {
   /**
@@ -20,7 +21,9 @@ export class PaymentController {
     if (!booking) return;
 
     const pkg = await prisma.package.findFirst({ where: { name: { contains: booking.service, mode: 'insensitive' } } });
-    const subtotal = pkg?.price || 0;
+    const packagePrice = pkg?.price || 0;
+    const { addonsTotal, lineItems: addonLines } = await bookingAddonService.sumForBooking(bookingId);
+    const subtotal = packagePrice + addonsTotal;
     const tax = 0;
     const discount = 0;
     const total = subtotal + tax - discount;
@@ -40,7 +43,8 @@ export class PaymentController {
       customerPhone: booking.customer.phone,
       service: booking.service,
       bookingDateTime: booking.dateTime,
-      subtotal,
+      subtotal: packagePrice,
+      addonLines,
       tax,
       discount,
       total,
@@ -65,6 +69,8 @@ export class PaymentController {
         pdfData: pdfBuffer,
       }
     });
+
+    await bookingAddonService.markInvoiced(bookingId);
   }
 
   /**
@@ -123,6 +129,9 @@ export class PaymentController {
             },
             include: { customer: true }
           });
+
+          // Attach any pending add-on line items captured during the draft flow
+          await bookingAddonService.attachPendingToBooking(draft.customerId, targetBooking.id);
 
           // Delete the draft
           await prisma.bookingDraft.delete({ where: { id: draft.id } });

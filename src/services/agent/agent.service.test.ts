@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import prisma from '../../config/prisma';
 import { AgentService } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 
@@ -20,8 +21,30 @@ test('only applies confirmation after the assistant presented a proposal', () =>
   }]), true);
   assert.equal(agent.previousMessageRequestsConfirmation([{
     role: 'assistant',
+    content: 'If that works for you, just reply “yes” and I’ll send the M-Pesa prompt.'
+  }]), true);
+  assert.equal(agent.previousMessageRequestsConfirmation([{
+    role: 'assistant',
     content: 'What time on Sunday, September 11 would you like to schedule the session?'
   }]), false);
+});
+
+test('ignores duplicate yes replies after a payment prompt has already been sent', async () => {
+  const originalFindUnique = prisma.bookingDraft.findUnique;
+  prisma.bookingDraft.findUnique = async () => ({
+    customerId: 'customer-123',
+    service: 'THE ICON',
+    step: 'payment_pending',
+    date: '2026-09-19',
+    time: '15:00'
+  } as any);
+
+  try {
+    const result = await agent.tryImmediateConfirmation('customer-123');
+    assert.match(result || '', /already sent the M-Pesa.*prompt|already sent the M-Pesa/i);
+  } finally {
+    prisma.bookingDraft.findUnique = originalFindUnique;
+  }
 });
 
 test('recognizes conversational package selections', () => {

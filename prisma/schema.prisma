@@ -39,6 +39,7 @@ model Customer {
   customerMemory CustomerMemory?
   conversationLearnings ConversationLearning[]
   sessionNotes CustomerSessionNote[]
+  bookingAddons BookingAddon[]
   
   // Advanced AI Relations
   proactiveOutreaches ProactiveOutreach[]
@@ -110,6 +111,7 @@ model Booking {
   followups   PostShootFollowup[]
   reminders   BookingReminder[]
   sessionNotes CustomerSessionNote[]
+  bookingAddons BookingAddon[]
 
   @@map("bookings")
   @@index([customerId, dateTime])
@@ -325,6 +327,30 @@ model PhotoLink {
   customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@map("photo_links")
+  @@index([customerId, sentAt])
+}
+
+model BookingAddon {
+  id            String   @id @default(cuid())
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  bookingId     String?
+  booking       Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  name          String   // Display name e.g. "Extra edited photo"
+  sku           String   // Stable key e.g. "extra_edited_photo"
+  quantity      Int      @default(1)
+  unitPrice     Int      // KSH; 0 = quoted / TBD
+  totalPrice    Int      // quantity * unitPrice
+  status        String   @default("pending") // pending, confirmed, cancelled, invoiced
+  note          String?  // Original customer wording
+  sessionNoteId String?  // Optional link back to CustomerSessionNote
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("booking_addons")
+  @@index([customerId, status])
+  @@index([bookingId, status])
+  @@index([sku])
 }
 
 model Invoice {

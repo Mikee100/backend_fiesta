@@ -724,17 +724,6 @@ app.get('/api/bookings', async (req, res) => {
   }
 });
 
-app.get('/api/bookings/available-hours/:date', async (req, res) => {
-  try {
-    const { date } = req.params;
-    // Standard slots
-    return res.json(["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30"]);
-  } catch (e: any) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/customers/:id/photo-links', (req, res) => res.json([]));
 app.get('/api/statistics/:type', (req, res) => res.json({}));
 
 app.get('/api/system/status', async (req, res) => {

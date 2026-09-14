@@ -3,7 +3,6 @@ import * as cheerio from 'cheerio';
 
 const TARGET_URLS = [
   'https://www.fiestahousematernity.com/',
-  'https://www.fiestahousematernity.com/new/'
 ];
 
 export class WebsiteScraperService {
