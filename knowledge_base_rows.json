@@ -552,82 +552,82 @@
   {
     "id": "packages1",
     "question": "What packages do you offer? List all packages.",
-    "answer": "Here are our maternity photography packages:\n\n**Standard Package**\nKsh.10,000\n1hr 30mins\n6 soft copy images\nProfessional makeup\n2 of our own outfits & Styling\n\n**Economy Package**\nKsh.15,000\n2hrs\n12 soft copy images\nProfessional makeup\n3 of our own outfits & Styling\n\n**Executive Package**\nKsh.20,000\n2hrs 30mins\n15 soft copy images\nProfessional makeup\n4 of our own outfits & Styling\n1 A3 Mount\n\n**Gold Package**\nKsh.30,000\n2hrs 30mins\n20 soft copy Images\nProfessional makeup\nFour of our own outfits & styling\n8x8\" Photobook (hardpages)\n\n**Platinum Package**\nKsh.35,000\n2hrs 30mins\n25 soft copy Images\nProfessional makeup\n4 of our own outfits & Styling\n1 A3 Mount\nCustomized Balloon Backdrop with flowers\n\n**VIP Package**\nKsh.45,000\n3hrs 30 mins\n25 soft copy images\nProfessional makeup\nCustomized Balloon Backdrop with flowers\n4 of our own outfits & Styling\n8x8\" Photobook (hardpages)\n\n**VVIP Package**\nKsh.50,000\n3hrs 30 mins\n30 soft copy images\nProfessional Makeup\nCustomized Balloon Backdrop with flowers\n5 of our own outfits & Styling\n1 A3 mount\n8x8\" Photobook (hardpages)\n1 Styled Wig\n\nFor more details, visit our website: https://fiestahouseattire.com/.",
+    "answer": "Here are our Fiesta House Maternity Rate Card 2026 — THE EDITIONS:\n\n**THE BLOOM** — Ksh.15,000\n1.5 hours studio time | 6 final edited photos | Professional makeup | 2 studio outfits + styling\n\n**THE MUSE** — Ksh.25,000\n2 hours studio time | 12 final edited photos | Professional makeup | 3 studio outfits + styling\n\n**THE ICON** — Ksh.35,000\n2.5 hours studio time | 15 final edited photos | Professional makeup | 4 studio outfits + styling | 1 A3 fine art mount\n\n**THE LEGEND** — Ksh.45,000\n2.5 hours studio time | 15 final edited photos | Professional makeup | 4 studio outfits + styling | 1 styled wig | 8x8 Photobook (hardcover)\n\n**THE QUEEN** — Ksh.55,000\n3 hours studio time | 20 final edited photos | Professional makeup | 4 studio outfits + styling | Custom balloon backdrop with flowers | 1 styled wig | 1 A3 fine art mount\n\n**THE EMPRESS** (MOST LOVED / Signature Edition) — Ksh.70,000\n3.5 hours studio time | 25 final edited photos | Professional makeup | 4 studio outfits + styling (including the signature Fiesta House Power Suit) | 2 styled wigs | Custom balloon backdrop with flowers | 8x8 Photobook (hardcover) | 1 A3 fine art mount\n\n**THE GODDESS** (Flagship Edition) — Ksh.120,000\n5 hours studio time | 30 final edited photos | Professional makeup | 5 studio outfits + styling (including the signature Fiesta House Power Suit) | 2 styled wigs | Custom balloon backdrop with flowers or Goddess Sculpture Set | 1 professionally produced Reel | 8x8 Photobook (hardcover) | 1 A2 fine art mount\n\nFor more details, visit our website: https://www.fiestahousematernity.com/.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-21 12:35:00.000",
-    "updatedAt": "2026-04-21 12:35:00.000"
+    "createdAt": "2026-09-14 12:35:00.000",
+    "updatedAt": "2026-09-14 12:35:00.000"
   },
   {
-    "id": "pkg_standard",
-    "question": "What is included in the Standard Package?",
-    "answer": "Standard Package:\n- Price: Ksh.10,000\n- Deposit: Ksh.2,000\n- Duration: 1 hr 30 mins\n- 6 soft copy images\n- Professional makeup\n- 2 of our own outfits & Styling\n- Indoor studio maternity package\n- No photobook, mount, balloon backdrop, or wig included.",
+    "id": "pkg_bloom",
+    "question": "What is included in THE BLOOM package?",
+    "answer": "THE BLOOM (Ksh. 15,000):\n- Deposit: Ksh. 2,000\n- Duration: 1.5 hours studio time\n- 6 final edited photos\n- Professional makeup\n- 2 studio outfits + styling\n- For the mother in her becoming. An intimate introduction to Fiesta House.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_economy",
-    "question": "What is included in the Economy Package?",
-    "answer": "Economy Package:\n- Price: Ksh.15,000\n- Deposit: Ksh.2,000\n- Duration: 2 hrs\n- 12 soft copy images\n- Professional makeup\n- 3 of our own outfits & Styling\n- Indoor studio maternity package\n- No photobook, mount, balloon backdrop, or wig included.",
+    "id": "pkg_muse",
+    "question": "What is included in THE MUSE package?",
+    "answer": "THE MUSE (Ksh. 25,000):\n- Deposit: Ksh. 2,000\n- Duration: 2 hours studio time\n- 12 final edited photos\n- Professional makeup\n- 3 studio outfits + styling\n- For the mother stepping into her glow.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_executive",
-    "question": "What is included in the Executive Package?",
-    "answer": "Executive Package:\n- Price: Ksh.20,000\n- Deposit: Ksh.2,000\n- Duration: 2 hrs 30 mins\n- 15 soft copy images\n- Professional makeup\n- 4 of our own outfits & Styling\n- Includes A3 mount\n- Indoor studio maternity package\n- No photobook, balloon backdrop, or wig included.",
+    "id": "pkg_icon",
+    "question": "What is included in THE ICON package?",
+    "answer": "THE ICON (Ksh. 35,000):\n- Deposit: Ksh. 2,000\n- Duration: 2.5 hours studio time\n- 15 final edited photos\n- Professional makeup\n- 4 studio outfits + styling\n- 1 A3 fine art mount\n- For the mother who knows she is unforgettable.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_gold",
-    "question": "What is included in the Gold Package?",
-    "answer": "Gold Package:\n- Price: Ksh.30,000\n- Deposit: Ksh.2,000\n- Duration: 2 hrs 30 mins\n- 20 soft copy images\n- Professional makeup\n- 4 of our own outfits & Styling\n- Includes 8x8\" Photobook (hardpages)\n- Indoor studio maternity package\n- No mount, balloon backdrop, or wig included.",
+    "id": "pkg_legend",
+    "question": "What is included in THE LEGEND package?",
+    "answer": "THE LEGEND (Ksh. 45,000):\n- Deposit: Ksh. 2,000\n- Duration: 2.5 hours studio time\n- 15 final edited photos\n- Professional makeup\n- 4 studio outfits + styling\n- 1 styled wig\n- 8x8 Photobook (hardcover)\n- For the mother writing her own story.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_platinum",
-    "question": "What is included in the Platinum Package?",
-    "answer": "Platinum Package:\n- Price: Ksh.35,000\n- Deposit: Ksh.2,000\n- Duration: 2 hrs 30 mins\n- 25 soft copy images\n- Professional makeup\n- 4 of our own outfits & Styling\n- Includes A3 mount and customized balloon backdrop with flowers\n- Indoor studio maternity package\n- No photobook or wig included.",
+    "id": "pkg_queen",
+    "question": "What is included in THE QUEEN package?",
+    "answer": "THE QUEEN (Ksh. 55,000):\n- Deposit: Ksh. 2,000\n- Duration: 3 hours studio time\n- 20 final edited photos\n- Professional makeup\n- 4 studio outfits + styling\n- Custom balloon backdrop with flowers\n- 1 styled wig\n- 1 A3 fine art mount\n- For the mother of her own kingdom.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_vip",
-    "question": "What is included in the VIP Package?",
-    "answer": "VIP Package:\n- Price: Ksh.45,000\n- Deposit: Ksh.2,000\n- Duration: 3 hrs 30 mins\n- 25 soft copy images\n- Professional makeup\n- 4 of our own outfits & Styling\n- Includes customized balloon backdrop with flowers and 8x8\" Photobook (hardpages)\n- Indoor studio maternity package\n- No mount or wig included.",
+    "id": "pkg_empress",
+    "question": "What is included in THE EMPRESS package?",
+    "answer": "THE EMPRESS (Ksh. 70,000) — Signature Edition (MOST LOVED):\n- Deposit: Ksh. 2,000\n- Duration: 3.5 hours studio time\n- 25 final edited photos\n- Professional makeup\n- 4 studio outfits + styling (including signature Fiesta House Power Suit)\n- 2 styled wigs\n- Custom balloon backdrop with flowers\n- 8x8 Photobook (hardcover)\n- 1 A3 fine art mount\n- For the mother claiming her throne.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
-    "id": "pkg_vvip",
-    "question": "What is included in the VVIP Package?",
-    "answer": "VVIP Package:\n- Price: Ksh.50,000\n- Deposit: Ksh.2,000\n- Duration: 3 hrs 30 mins\n- 30 soft copy images\n- Professional makeup\n- 5 of our own outfits & Styling\n- Includes customized balloon backdrop with flowers, 1 A3 mount, 8x8\" Photobook (hardpages), and 1 styled wig\n- Indoor studio maternity package.",
+    "id": "pkg_goddess",
+    "question": "What is included in THE GODDESS package?",
+    "answer": "THE GODDESS (Ksh. 120,000) — Flagship Edition:\n- Deposit: Ksh. 2,000\n- Duration: 5 hours studio time\n- 30 final edited photos\n- Professional makeup\n- 5 studio outfits + styling (including signature Fiesta House Power Suit)\n- 2 styled wigs\n- Custom balloon backdrop with flowers or Goddess Sculpture Set\n- 1 professionally produced Reel\n- 8x8 Photobook (hardcover)\n- 1 A2 fine art mount\n- Reserved for the mother who understands that some chapters of life deserve to be carved in stone.",
     "category": "Packages",
     "embedding": "[]",
     "mediaUrls": "[]",
-    "createdAt": "2026-04-22 12:40:00.000",
-    "updatedAt": "2026-04-22 12:40:00.000"
+    "createdAt": "2026-09-14 12:40:00.000",
+    "updatedAt": "2026-09-14 12:40:00.000"
   },
   {
     "id": "faq_manual_location_1",
@@ -668,5 +668,45 @@
     "mediaUrls": "[]",
     "createdAt": "2026-07-23 11:55:37.437",
     "updatedAt": "2026-07-23 11:55:37.437"
+  },
+  {
+    "id": "additions_all",
+    "question": "What additions, extra services, or add-ons do you offer?",
+    "answer": "Here are our Additions & Extra Services (Rate Card 2026):\n- Extra edited photo: KSH 1,000 per photo\n- Extra digital art edit: KSH 3,000 per photo\n- Extra outfit beyond package: KSH 4,000 per outfit\n- Extra professional makeup: KSH 3,500 per session\n- Fiesta House Power Suit (where not included): KSH 10,000\n- Fiesta House styled wig hire: KSH 4,000 per wig (book in advance)\n- Wig styling only: KSH 3,000 per wig (book in advance)\n- Suspending Concept: KSH 7,000\n- Goddess Sculpture Set (where not included): KSH 15,000\n- Professional Reel: quoted by package tier (book in advance)\n- Raw files: quoted by package tier",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-09-14 14:00:00.000",
+    "updatedAt": "2026-09-14 14:00:00.000"
+  },
+  {
+    "id": "additions_items",
+    "question": "How much are extra photos, outfits, makeup, power suit, wigs, or concepts?",
+    "answer": "Individual Additions Pricing:\n• Extra edited photo: KSH 1,000 per photo\n• Extra digital art edit: KSH 3,000 per photo\n• Extra outfit beyond package: KSH 4,000 per outfit\n• Extra professional makeup: KSH 3,500 per session\n• Fiesta House Power Suit: KSH 10,000\n• Styled wig hire: KSH 4,000 per wig\n• Wig styling only: KSH 3,000 per wig\n• Suspending Concept: KSH 7,000\n• Goddess Sculpture Set: KSH 15,000\n• Professional Reel: quoted by package tier\n• Raw files: quoted by package tier",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-09-14 14:00:00.000",
+    "updatedAt": "2026-09-14 14:00:00.000"
+  },
+  {
+    "id": "bespoke_custom",
+    "question": "Do you offer bespoke or custom shoot experiences?",
+    "answer": "Bespoke Experiences: For the mother whose vision does not fit inside a package, we design custom experiences by consultation. Reach out to our team to begin the conversation.",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-09-14 14:00:00.000",
+    "updatedAt": "2026-09-14 14:00:00.000"
+  },
+  {
+    "id": "travelling_mothers",
+    "question": "What services do you offer for travelling mothers coming from outside Nairobi?",
+    "answer": "For Our Travelling Mothers: For mothers journeying to us from beyond Nairobi, we curate the full arrival. Airport transfers, hotel bookings, and a soft landing arranged by our concierge — so all you carry with you is your presence. Available on request.",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-09-14 14:00:00.000",
+    "updatedAt": "2026-09-14 14:00:00.000"
   }
 ]

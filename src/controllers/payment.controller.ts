@@ -109,13 +109,13 @@ export class PaymentController {
         // 1. If it's a draft, promote it to a real booking
         if (payment.bookingDraft) {
           const draft = payment.bookingDraft;
-          const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
+          const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'bloom';
           const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
 
           targetBooking = await prisma.booking.create({
             data: {
               customerId: draft.customerId,
-              service: draft.service || 'Standard Package',
+              service: draft.service || 'THE BLOOM',
               dateTime: draft.dateTimeIso ? new Date(draft.dateTimeIso) : new Date(),
               status: 'confirmed',
               durationMinutes: duration,

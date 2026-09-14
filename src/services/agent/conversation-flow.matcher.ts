@@ -10,13 +10,13 @@ export class ConversationFlowMatcher {
 
   isPackageAdviceRequest(message: string): boolean {
     const text = message.toLowerCase();
-    const namesPackage = /(standard|economy|executive|gold|platinum|vvip|vip)\s+(package)?/.test(text);
-    const asksForAdvice = /(recommend|which\s+(one|package)|best\s+package|should\s+i\s+(get|choose)|why.*over|compare|difference\s+between)/.test(text);
-    return namesPackage && asksForAdvice || /(recommend|which\s+one|best\s+package|should\s+i\s+(get|choose))/.test(text);
+    const namesPackage = /(bloom|muse|icon|legend|queen|empress|goddess|standard|economy|executive|gold|platinum|vvip|vip)\s+(package|edition)?/.test(text);
+    const asksForAdvice = /(recommend|which\s+(one|package|edition)|best\s+(package|edition)|should\s+i\s+(get|choose)|why.*over|compare|difference\s+between)/.test(text);
+    return namesPackage && asksForAdvice || /(recommend|which\s+one|best\s+(package|edition)|should\s+i\s+(get|choose))/.test(text);
   }
 
   isPackageSelection(message: string): boolean {
-    return /(i\s+(like|want|choose|will take|would like)|i(?:'ll|\s+will)\s+(go with|take)|let'?s\s+(go with|do))\s+(the\s+)?(standard|economy|executive|gold|platinum|vip|vvip)(\s+package)?\b/.test(message.toLowerCase());
+    return /(i\s+(like|want|choose|will take|would like)|i(?:'ll|\s+will)\s+(go with|take)|let'?s\s+(go with|do))\s+(the\s+)?(bloom|muse|icon|legend|queen|empress|goddess|standard|economy|executive|gold|platinum|vip|vvip)(\s+(package|edition))?\b/.test(message.toLowerCase());
   }
 
   isSameBookingSlotRequest(message: string): boolean {

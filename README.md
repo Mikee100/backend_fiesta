@@ -5,6 +5,9 @@ This document describes the current AI system in backend 2.0 as implemented toda
 Product positioning:
 - Fiesta AI — Conversational Booking and Business Assistant
 
+Detailed Operational Guidelines:
+- See comprehensive rules specification: [docs/AI_SYSTEM_RULES_AND_POLICIES.md](docs/AI_SYSTEM_RULES_AND_POLICIES.md)
+
 Scope of this README:
 - AI request lifecycle for WhatsApp, Instagram, and web chat.
 - RAG retrieval and tool-calling behavior.

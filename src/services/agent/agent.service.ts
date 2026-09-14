@@ -277,6 +277,21 @@ export class AgentService {
     return /(raw\s+file|raw\s+files|unedited\s+photos|original\s+files|can\s+i\s+get\s+raw)/.test(text);
   }
 
+  private shouldUseAdditionsReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(additions|add-ons|add-on|extras|extra\s+services|extra\s+photo|extra\s+outfit|extra\s+makeup|digital\s+art|power\s+suit|wig\s+hire|suspending\s+concept|sculpture\s+set|reel\s+pricing|what\s+extras)/.test(text);
+  }
+
+  private shouldUseBespokeReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(bespoke|custom\s+experience|custom\s+shoot|custom\s+package|tailored\s+session|tailored\s+experience|vision\s+does\s+not\s+fit)/.test(text);
+  }
+
+  private shouldUseTravellingMothersReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(travelling\s+mother|traveling\s+mother|from\s+outside\s+nairobi|from\s+abroad|airport\s+transfer|hotel\s+booking|concierge|soft\s+landing|journeying\s+to\s+us)/.test(text);
+  }
+
   private shouldUseSocialMediaReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     return /(social\s+media|instagram|facebook|website|where\s+can\s+i\s+find\s+you\s+online)/.test(text);
@@ -343,7 +358,7 @@ export class AgentService {
         return isFollowUp && invalidPastAppointmentMenu;
       }
 
-  private buildPackageLine(pkg: {
+  private buildPackageCard(pkg: {
     name: string;
     price: number;
     duration: string;
@@ -357,20 +372,62 @@ export class AgentService {
     wig: boolean;
     notes: string | null;
   }): string {
-    const features: string[] = [];
-    features.push(`${pkg.images} soft-copy images`);
-    if (pkg.makeup) features.push('makeup');
-    if (pkg.outfits > 0) features.push(`${pkg.outfits} outfit${pkg.outfits > 1 ? 's' : ''}`);
+    const lowerName = pkg.name.toLowerCase();
 
-    const extras: string[] = [];
-    if (pkg.mount) extras.push('A3 mount');
-    if (pkg.balloonBackdrop) extras.push('balloon backdrop');
-    if (pkg.photobook) extras.push(pkg.photobookSize ? `${pkg.photobookSize} photobook` : 'photobook');
-    if (pkg.wig) extras.push('styled wig');
-    if (pkg.notes?.trim()) extras.push(pkg.notes.trim());
+    let badge = '';
+    if (lowerName.includes('empress')) {
+      badge = ' ✨ *(Signature Edition — Most Loved)*';
+    } else if (lowerName.includes('goddess')) {
+      badge = ' 👑 *(Flagship Edition)*';
+    }
 
-    const extrasPart = extras.length > 0 ? ` | Extras: ${extras.join(', ')}` : '';
-    return `${pkg.name}: Ksh ${pkg.price.toLocaleString()} (${pkg.duration}) - ${features.join(', ')}${extrasPart}`;
+    const items: string[] = [];
+    if (pkg.duration) items.push(`⏱️ ${pkg.duration}`);
+    if (pkg.images > 0) items.push(`📸 ${pkg.images} final edited photos`);
+    if (pkg.makeup) items.push('💄 Professional makeup');
+
+    if (pkg.outfits > 0) {
+      if (lowerName.includes('empress') || lowerName.includes('goddess')) {
+        items.push(`👗 ${pkg.outfits} studio outfits + styling (incl. Power Suit)`);
+      } else {
+        items.push(`👗 ${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} + styling`);
+      }
+    }
+
+    if (pkg.wig) {
+      if (lowerName.includes('empress') || lowerName.includes('goddess')) {
+        items.push('💇‍♀️ 2 styled wigs');
+      } else {
+        items.push('💇‍♀️ 1 styled wig');
+      }
+    }
+
+    if (pkg.balloonBackdrop) {
+      if (lowerName.includes('goddess')) {
+        items.push('🎈 Custom balloon backdrop or Goddess Sculpture Set');
+      } else {
+        items.push('🎈 Custom balloon backdrop with flowers');
+      }
+    }
+
+    if (lowerName.includes('goddess')) {
+      items.push('🎬 1 professionally produced Reel');
+    }
+
+    if (pkg.photobook) {
+      const size = pkg.photobookSize ? ` (${pkg.photobookSize})` : '';
+      items.push(`📚 Photobook hardcover${size}`);
+    }
+
+    if (pkg.mount) {
+      if (lowerName.includes('goddess')) {
+        items.push('🖼️ 1 A2 fine art mount');
+      } else {
+        items.push('🖼️ 1 A3 fine art mount');
+      }
+    }
+
+    return `🌸 *${pkg.name}* — *Ksh ${pkg.price.toLocaleString()}*${badge}\n${items.map((item) => `  • ${item}`).join('\n')}`;
   }
 
   private async getPackageCatalogReply(): Promise<string | null> {
@@ -395,8 +452,8 @@ export class AgentService {
 
       if (!packages.length) return null;
 
-      const lines = packages.map((pkg) => this.buildPackageLine(pkg));
-      return `Here are the maternity packages we currently offer:\n\n${lines.join('\n')}\n\nIf one catches your eye, I can tell you more about it or help you find one that suits the kind of shoot you have in mind.`;
+      const cards = packages.map((pkg) => this.buildPackageCard(pkg));
+      return `✨ *Fiesta House Maternity — Rate Card 2026* ✨\n\nHere are our maternity packages:\n\n${cards.join('\n\n')}\n\nIf one catches your eye, let me know! I can share more details or help check available shoot dates for you. 💖`;
     } catch (err) {
       console.error('Failed to build package catalog reply:', err);
       return null;
@@ -438,11 +495,12 @@ export class AgentService {
       return `${differences.join('. ')}. ${higherValuePackage.name} makes sense if its extra inclusions matter to you; ${lowerCostPackage.name} is the lower-cost option. Will your older child be joining you in the shoot?`;
     }
 
-    const gold = packages.find((pkg) => pkg.name.toLowerCase() === 'gold package');
-    const executive = packages.find((pkg) => pkg.name.toLowerCase() === 'executive package');
-    if (!gold || !executive) return null;
+    const higherValue = packages.find((pkg) => ['the empress', 'the goddess', 'the queen', 'the legend'].includes(pkg.name.toLowerCase())) || packages[packages.length - 1];
+    const lowerCost = packages.find((pkg) => ['the icon', 'the muse', 'the bloom'].includes(pkg.name.toLowerCase())) || packages[0];
+    if (!higherValue || !lowerCost) return null;
 
-    return `Congratulations on your second baby. I would lean toward the Gold Package if you would enjoy more variety: it includes ${gold.images} edited images and an ${gold.photobookSize || ''} photobook for Ksh ${gold.price.toLocaleString()}. Executive is Ksh ${executive.price.toLocaleString()} and includes ${executive.images} images with an A3 mount, so it is a lovely lower-cost option. Will your older child be joining you in the shoot?`;
+    const higherPhotobookInfo = higherValue.photobook ? ` and a photobook` : '';
+    return `Congratulations on your pregnancy! I would lean toward ${higherValue.name} if you would enjoy more variety: it includes ${higherValue.images} edited images${higherPhotobookInfo} for Ksh ${higherValue.price.toLocaleString()}. ${lowerCost.name} is Ksh ${lowerCost.price.toLocaleString()} and includes ${lowerCost.images} edited images, so it is a lovely option as well. Will your partner or family be joining you in the shoot?`;
   }
 
   private async getPackageSelectionReply(customerId: string, userMessage: string): Promise<string | null> {
@@ -597,10 +655,11 @@ export class AgentService {
       'Great question. Booking is simple:',
       '1) Choose your package.',
       '2) Share your preferred date and time (we are closed on Mondays).',
-      `3) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
-      '4) Once deposit is received, your booking is confirmed and reminders are scheduled.',
-      `5) Come for your session at ${location}.`,
-      '6) Pay the remaining balance after the shoot (M-Pesa or cash).',
+      '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. — completely optional!).',
+      `4) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
+      '5) Once deposit is received, your booking is confirmed and reminders are scheduled.',
+      `6) Come for your session at ${location}.`,
+      '7) Pay the remaining balance after the shoot (M-Pesa or cash).',
       '',
       "If you're ready, tell me your package and preferred date/time and I'll check slots now."
     ].join('\n');
@@ -666,9 +725,51 @@ export class AgentService {
 
   private getRawFilesReply(): string {
     return [
-      'Yes, raw files are available at an extra fee.',
-      'They are shared as a secure download link (not sent directly as attachments).',
-      'If you want, I can have the team confirm the raw-file fee for your specific package/session.'
+      'Raw files are quoted by package tier.',
+      'They are shared as a secure download link.',
+      'If you let me know which package tier you are interested in, our team can confirm the exact quote for raw files.'
+    ].join('\n');
+  }
+
+  private getAdditionsReply(): string {
+    return [
+      '✨ *Fiesta House Maternity — Additions & Extra Services* ✨',
+      '',
+      '• *Extra edited photo:* KSH 1,000 per photo',
+      '• *Extra digital art edit:* KSH 3,000 per photo',
+      '• *Extra outfit beyond package:* KSH 4,000 per outfit',
+      '• *Extra professional makeup:* KSH 3,500 per session',
+      '• *Fiesta House Power Suit* (where not included): KSH 10,000',
+      '• *Fiesta House styled wig hire:* KSH 4,000 per wig (book in advance)',
+      '• *Wig styling only:* KSH 3,000 per wig (book in advance)',
+      '• *Suspending Concept:* KSH 7,000',
+      '• *Goddess Sculpture Set* (where not included): KSH 15,000',
+      '• *Professional Reel:* Quoted by package tier (book in advance)',
+      '• *Raw files:* Quoted by package tier',
+      '',
+      'Would you like to include any of these with your session? 🌸'
+    ].join('\n');
+  }
+
+  private getBespokeReply(): string {
+    return [
+      '✨ *Bespoke Experiences* ✨',
+      '',
+      'For the mother whose vision does not fit inside a package, we design custom experiences by consultation.',
+      '',
+      'Reach out to our team to begin the conversation, and we will craft a session around your unique story. 💖'
+    ].join('\n');
+  }
+
+  private getTravellingMothersReply(): string {
+    return [
+      '✈️ *For Our Travelling Mothers* 🌸',
+      '',
+      'For mothers journeying to us from beyond Nairobi, we curate the full arrival.',
+      '',
+      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge — so all you carry with you is your presence.',
+      '',
+      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you. 💖'
     ].join('\n');
   }
 
@@ -849,6 +950,7 @@ Instructions:
 11. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
 12. Before proposing, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
 13. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
+13b. OPTIONAL ADD-ONS DURING BOOKING: During the booking process (when gathering or confirming their package, date, and time, or right before proposing the booking), ask the customer if they would like to include any optional add-ons or extra services (e.g. "Would you like to include any optional add-ons with your shoot, such as an extra outfit, styled wig hire, or extra edited photos? It's completely optional!"). Emphasize that add-ons are strictly optional and not mandatory. If the customer requests or accepts an add-on, save it using the 'add_session_note' tool. If the customer declines ("no", "none", "skip") or has already decided, proceed directly with the booking.
 14. BOOKING IS TWO STEPS, NEVER SKIP OR COMBINE THEM:
     a) Once you have their real Name, Service, Date, and a confirmed-free Time, call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt.
     b) STOP THERE and wait. Only after the customer explicitly replies yes/confirm/go ahead in their OWN next message do you call 'confirm_booking', which is what actually sends the M-Pesa payment prompt.
@@ -864,7 +966,8 @@ Instructions:
 22. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context.
 23. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
 24. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
-25. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.`;
+25. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.
+26. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup.`;
   }
 
   /**
@@ -1170,12 +1273,14 @@ ${contextString}`;
               } else {
                 const duration = SERVICE_DURATIONS[serviceKey];
                 const result: any = await bookingService.getAvailableSlots(args.date, duration);
+                // Spell out the weekday so the model never has to infer it from the raw ISO date.
+                const dateLabel = `${dayjs(args.date).format('dddd, MMMM D, YYYY')} (${args.date})`;
 
                 if (result.status === 'closed') {
-                  toolResponse = `The business is CLOSED on ${args.date} because: ${result.reason}.`;
+                  toolResponse = `The business is CLOSED on ${dateLabel} because: ${result.reason}.`;
                 } else {
                   const slots = Array.isArray(result) ? result : [];
-                  toolResponse = `Available slots for ${args.service} on ${args.date}: ${slots.length > 0 ? slots.join(', ') : 'None'}.`;
+                  toolResponse = `Available slots for ${args.service} on ${dateLabel}: ${slots.length > 0 ? slots.join(', ') : 'None'}. When referring to this date with the customer, use exactly this weekday - do not guess it.`;
                 }
               }
             } else {
@@ -1512,6 +1617,54 @@ ${contextString}`;
         isFallback: false,
       });
       return rawFilesReply;
+    }
+
+    // Deterministic additions & extra services response.
+    if (allowDeterministicInfoReplies && this.shouldUseAdditionsReply(userMessage)) {
+      const additionsReply = this.getAdditionsReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: additionsReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return additionsReply;
+    }
+
+    // Deterministic bespoke experiences response.
+    if (allowDeterministicInfoReplies && this.shouldUseBespokeReply(userMessage)) {
+      const bespokeReply = this.getBespokeReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: bespokeReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return bespokeReply;
+    }
+
+    // Deterministic travelling mothers response.
+    if (allowDeterministicInfoReplies && this.shouldUseTravellingMothersReply(userMessage)) {
+      const travellingReply = this.getTravellingMothersReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: travellingReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return travellingReply;
     }
 
     // Deterministic earliest-delivery-date response with plain-text formatting.
@@ -2197,12 +2350,15 @@ ${contextString}`;
     const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
     const slotsResult: any = await bookingService.getAvailableSlots(newDate, duration, upcomingBooking.id);
 
+    // Spell out the weekday so the model never has to infer it from the raw ISO date.
+    const newDateLabel = `${dayjs(newDate).format('dddd, MMMM D, YYYY')} (${newDate})`;
+
     if (slotsResult.status === 'closed') {
-      throw new Error(`We're closed on ${newDate} (${slotsResult.reason}). Ask the customer to pick a different date.`);
+      throw new Error(`We're closed on ${newDateLabel} (${slotsResult.reason}). Ask the customer to pick a different date. Always refer to the date using this exact weekday.`);
     }
     const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
     if (!availableSlots.includes(newTime)) {
-      throw new Error(`${newTime} on ${newDate} isn't available. Available times that day: ${availableSlots.length > 0 ? availableSlots.join(', ') : 'none'}. Ask the customer to pick one of these instead.`);
+      throw new Error(`${newTime} on ${newDateLabel} isn't available. Available times that day: ${availableSlots.length > 0 ? availableSlots.join(', ') : 'none'}. Ask the customer to pick one of these instead. Always refer to the date using this exact weekday - do not guess it.`);
     }
 
     const newDateTimeIso = `${newDate}T${newTime}`;
