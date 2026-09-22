@@ -2197,6 +2197,16 @@ ${contextString}`;
   private async checkTokenBudget(customerId: string): Promise<boolean> {
     if (process.env.NODE_ENV !== 'production') return true;
 
+    // Optional: allow exempting tester or admin phone numbers via comma-separated list
+    const exemptNumbers = (process.env.EXEMPT_TOKEN_CAP_NUMBERS || '')
+      .split(',')
+      .map(n => n.trim().replace(/\D/g, ''))
+      .filter(Boolean);
+    const cleanId = customerId.replace(/\D/g, '');
+    if (cleanId && exemptNumbers.includes(cleanId)) {
+      return true;
+    }
+
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
       select: { dailyTokenUsage: true, tokenResetDate: true }
