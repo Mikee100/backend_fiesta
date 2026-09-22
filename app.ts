@@ -19,6 +19,7 @@ import { cronService } from './src/services/automation/cron.service';
 import { notificationEvents } from './src/services/notifications/notification.service';
 import dotenv from 'dotenv';
 import { validateStartupEnv } from './src/config/env-validation';
+import { knowledgeRetrieval } from './src/services/knowledge/retrieval.service';
 
 // Load .env only if it exists (for local dev)
 dotenv.config();
@@ -1027,4 +1028,9 @@ httpServer.listen(PORT, async () => {
   
   // Initialize automation cron jobs
   cronService.init();
+
+  // Pre-warm local RAG embedding model asynchronously in background
+  knowledgeRetrieval.initEmbedder().catch((err: any) => {
+    console.warn('⚠️ Failed to pre-warm RAG embedder on boot:', err?.message || err);
+  });
 });

@@ -89,183 +89,200 @@ export class PaymentController {
     console.log(`M-Pesa Callback received for CheckoutRequestID: ${CheckoutRequestID}, ResultCode: ${ResultCode}`);
     console.log('Full Callback Body:', JSON.stringify(req.body, null, 2));
 
-    try {
-      // Find the payment record with potential booking or draft
-      const payment = await prisma.payment.findFirst({
-        where: { checkoutRequestId: CheckoutRequestID },
-        include: { 
-          booking: { include: { customer: true } },
-          bookingDraft: { include: { customer: true } }
-        }
-      });
+    // Immediate 200 OK fast-ack to Safaricom Daraja to prevent webhook timeouts
+    res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
-      if (!payment) {
-        console.error(`❌ Payment record not found for CheckoutRequestID: ${CheckoutRequestID}`);
-        return res.status(404).json({ status: 'error', message: 'Payment record not found' });
-      }
-
-      console.log(`✅ Found payment record for ${payment.phone}. Linked to draft: ${!!payment.bookingDraft}, booking: ${!!payment.booking}`);
-
-      if (ResultCode === 0) {
-        // Success
-        const mpesaReceipt = CallbackMetadata.Item.find((item: any) => item.Name === 'MpesaReceiptNumber')?.Value;
-        
-        let targetBooking;
-
-        // 1. If it's a draft, promote it to a real booking
-        if (payment.bookingDraft) {
-          const draft = payment.bookingDraft;
-          const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'bloom';
-          const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
-
-          targetBooking = await prisma.booking.create({
-            data: {
-              customerId: draft.customerId,
-              service: draft.service || 'THE BLOOM',
-              dateTime: draft.dateTimeIso ? new Date(draft.dateTimeIso) : new Date(),
-              status: 'confirmed',
-              durationMinutes: duration,
-              recipientName: draft.name
-            },
-            include: { customer: true }
-          });
-
-          // Attach any pending add-on line items captured during the draft flow
-          await bookingAddonService.attachPendingToBooking(draft.customerId, targetBooking.id);
-
-          // Delete the draft
-          await prisma.bookingDraft.delete({ where: { id: draft.id } });
-        } else if (payment.booking) {
-          // 2. If it's an existing provisional booking, confirm it
-          targetBooking = await prisma.booking.update({
-            where: { id: payment.booking.id },
-            data: { status: 'confirmed' },
-            include: { customer: true }
-          });
-        }
-
-        // Update payment record
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: 'success',
-            mpesaReceipt: mpesaReceipt,
-            bookingId: targetBooking?.id // Ensure it's linked to the new booking
+    // Process payment verification, booking creation, calendar sync, and WhatsApp dispatch asynchronously
+    setImmediate(async () => {
+      try {
+        // Find the payment record with potential booking or draft
+        const payment = await prisma.payment.findFirst({
+          where: { checkoutRequestId: CheckoutRequestID },
+          include: { 
+            booking: { include: { customer: true } },
+            bookingDraft: { include: { customer: true } }
           }
         });
 
-        if (targetBooking) {
-          // Sync with Google Calendar
-          const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => targetBooking.service.toLowerCase().includes(k)) || 'standard';
-          const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+        if (!payment) {
+          console.error(`❌ Payment record not found for CheckoutRequestID: ${CheckoutRequestID}`);
+          return;
+        }
 
-          const googleEventId = await googleCalendarService.createEvent({
-            service: targetBooking.service,
-            dateTime: targetBooking.dateTime,
-            customerName: targetBooking.customer.name,
-            durationMinutes: duration
-          });
+        console.log(`✅ Found payment record for ${payment.phone}. Linked to draft: ${!!payment.bookingDraft}, booking: ${!!payment.booking}`);
 
-          if (googleEventId) {
-            await prisma.booking.update({
-              where: { id: targetBooking.id },
-              data: { googleEventId }
-            });
-          }
+        if (ResultCode === 0) {
+          // Success
+          const mpesaReceipt = CallbackMetadata?.Item?.find((item: any) => item.Name === 'MpesaReceiptNumber')?.Value;
+          
+          let targetBooking;
 
-          // Notify customer via WhatsApp
-          const appointmentDate = targetBooking.dateTime.toLocaleDateString('en-KE', {
-            weekday: 'long',
-            day: 'numeric',
-            month: 'long',
-            year: 'numeric',
-            timeZone: 'Africa/Nairobi',
-          });
-          const appointmentTime = targetBooking.dateTime.toLocaleTimeString('en-KE', {
-            hour: 'numeric',
-            minute: '2-digit',
-            timeZone: 'Africa/Nairobi',
-          });
-          const message = `Payment received. Your ${targetBooking.service} session is confirmed.\n\n${appointmentDate} at ${appointmentTime}\n\nWe'll send you a reminder before your session. We look forward to welcoming you.`;
-          await whatsappService.sendMessage(targetBooking.customer.id, message);
+          // 1. If it's a draft, promote it to a real booking
+          if (payment.bookingDraft) {
+            const draft = payment.bookingDraft;
+            const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'bloom';
+            const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
 
-          // Best-effort auto invoice generation right after successful payment.
-          // Do not break the payment flow if invoice creation fails.
-          try {
-            await this.ensureInvoiceForBooking(targetBooking.id);
-          } catch (invoiceErr: any) {
-            console.error(`Failed to auto-generate invoice for booking ${targetBooking.id}:`, invoiceErr?.message || invoiceErr);
-          }
-
-          await notifyAdmin(
-            'booking',
-            `New booking confirmed: ${targetBooking.customer.name || targetBooking.customer.id}`,
-            `${targetBooking.service} on ${targetBooking.dateTime.toLocaleDateString()} at ${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Deposit KSH ${payment.amount}${mpesaReceipt ? `, M-Pesa code ${mpesaReceipt}` : ''}.`,
-            {
-              event: 'new_booking_confirmed',
-              customerId: targetBooking.customerId,
-              bookingId: targetBooking.id,
-              paymentId: payment.id,
-              service: targetBooking.service,
-              bookingDateTime: targetBooking.dateTime.toISOString(),
-              amount: payment.amount,
-              paymentAmount: payment.amount,
-              paymentStatus: 'success',
-              mpesaReceipt: mpesaReceipt || null,
-              checkoutRequestId: payment.checkoutRequestId || null,
-              paidAt: new Date().toISOString(),
-            }
-          );
-
-          console.log(`Booking ${targetBooking.id} confirmed after successful payment.`);
-
-          // Best-effort: keep CustomerMemory current with this confirmed booking.
-          // Never let a memory-update failure break the payment confirmation flow.
-          try {
-            const existingMemory = await prisma.customerMemory.findUnique({ where: { customerId: targetBooking.customerId } });
-            const newTotal = (existingMemory?.totalBookings || 0) + 1;
-            const preferredPackages = existingMemory?.preferredPackages || [];
-            if (!preferredPackages.includes(targetBooking.service)) preferredPackages.push(targetBooking.service);
-
-            await prisma.customerMemory.upsert({
-              where: { customerId: targetBooking.customerId },
-              update: {
-                totalBookings: { increment: 1 },
-                relationshipStage: newTotal > 1 ? 'returning' : 'booked',
-                preferredPackages
+            targetBooking = await prisma.booking.create({
+              data: {
+                customerId: draft.customerId,
+                service: draft.service || 'THE BLOOM',
+                dateTime: draft.dateTimeIso ? new Date(draft.dateTimeIso) : new Date(),
+                status: 'confirmed',
+                durationMinutes: duration,
+                recipientName: draft.name
               },
-              create: {
-                customerId: targetBooking.customerId,
-                totalBookings: 1,
-                relationshipStage: 'booked',
-                preferredPackages: [targetBooking.service]
-              }
+              include: { customer: true }
             });
-          } catch (memErr) {
-            console.error('Failed to update customer memory after booking:', memErr);
+
+            // Attach any pending add-on line items captured during the draft flow
+            await bookingAddonService.attachPendingToBooking(draft.customerId, targetBooking.id);
+
+            // Delete the draft
+            await prisma.bookingDraft.delete({ where: { id: draft.id } });
+          } else if (payment.booking) {
+            // 2. If it's an existing provisional booking, confirm it
+            targetBooking = await prisma.booking.update({
+              where: { id: payment.booking.id },
+              data: { status: 'confirmed' },
+              include: { customer: true }
+            });
           }
-        }
-      } else {
-        // Failed
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: { status: 'failed' }
-        });
 
-        const customerId = payment.bookingDraft?.customerId || payment.booking?.customerId;
-        if (customerId) {
-           const message = customerReplyTemplates.paymentFailed(ResultDesc);
-           await whatsappService.sendMessage(customerId, message);
+          // Update payment record
+          await prisma.payment.update({
+            where: { id: payment.id },
+            data: {
+              status: 'success',
+              mpesaReceipt: mpesaReceipt,
+              bookingId: targetBooking?.id // Ensure it's linked to the new booking
+            }
+          });
+
+          if (targetBooking) {
+            // Sync with Google Calendar (best-effort)
+            try {
+              const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => targetBooking.service.toLowerCase().includes(k)) || 'standard';
+              const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+
+              const googleEventId = await googleCalendarService.createEvent({
+                service: targetBooking.service,
+                dateTime: targetBooking.dateTime,
+                customerName: targetBooking.customer.name,
+                durationMinutes: duration
+              });
+
+              if (googleEventId) {
+                await prisma.booking.update({
+                  where: { id: targetBooking.id },
+                  data: { googleEventId }
+                });
+              }
+            } catch (calErr: any) {
+              console.error('Failed to sync booking to Google Calendar:', calErr?.message || calErr);
+            }
+
+            // Notify customer via WhatsApp
+            try {
+              const appointmentDate = targetBooking.dateTime.toLocaleDateString('en-KE', {
+                weekday: 'long',
+                day: 'numeric',
+                month: 'long',
+                year: 'numeric',
+                timeZone: 'Africa/Nairobi',
+              });
+              const appointmentTime = targetBooking.dateTime.toLocaleTimeString('en-KE', {
+                hour: 'numeric',
+                minute: '2-digit',
+                timeZone: 'Africa/Nairobi',
+              });
+              const message = `Payment received. Your ${targetBooking.service} session is confirmed.\n\n${appointmentDate} at ${appointmentTime}\n\nWe'll send you a reminder before your session. We look forward to welcoming you.`;
+              await whatsappService.sendMessage(targetBooking.customer.id, message);
+            } catch (waErr: any) {
+              console.error('Failed to send WhatsApp booking confirmation:', waErr?.message || waErr);
+            }
+
+            // Best-effort auto invoice generation right after successful payment.
+            try {
+              await this.ensureInvoiceForBooking(targetBooking.id);
+            } catch (invoiceErr: any) {
+              console.error(`Failed to auto-generate invoice for booking ${targetBooking.id}:`, invoiceErr?.message || invoiceErr);
+            }
+
+            try {
+              await notifyAdmin(
+                'booking',
+                `New booking confirmed: ${targetBooking.customer.name || targetBooking.customer.id}`,
+                `${targetBooking.service} on ${targetBooking.dateTime.toLocaleDateString()} at ${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Deposit KSH ${payment.amount}${mpesaReceipt ? `, M-Pesa code ${mpesaReceipt}` : ''}.`,
+                {
+                  event: 'new_booking_confirmed',
+                  customerId: targetBooking.customerId,
+                  bookingId: targetBooking.id,
+                  paymentId: payment.id,
+                  service: targetBooking.service,
+                  bookingDateTime: targetBooking.dateTime.toISOString(),
+                  amount: payment.amount,
+                  paymentAmount: payment.amount,
+                  paymentStatus: 'success',
+                  mpesaReceipt: mpesaReceipt || null,
+                  checkoutRequestId: payment.checkoutRequestId || null,
+                  paidAt: new Date().toISOString(),
+                }
+              );
+            } catch (adminErr: any) {
+              console.error('Failed to notify admin of confirmed booking:', adminErr?.message || adminErr);
+            }
+
+            console.log(`Booking ${targetBooking.id} confirmed after successful payment.`);
+
+            // Best-effort: keep CustomerMemory current with this confirmed booking.
+            try {
+              const existingMemory = await prisma.customerMemory.findUnique({ where: { customerId: targetBooking.customerId } });
+              const newTotal = (existingMemory?.totalBookings || 0) + 1;
+              const preferredPackages = existingMemory?.preferredPackages || [];
+              if (!preferredPackages.includes(targetBooking.service)) preferredPackages.push(targetBooking.service);
+
+              await prisma.customerMemory.upsert({
+                where: { customerId: targetBooking.customerId },
+                update: {
+                  totalBookings: { increment: 1 },
+                  relationshipStage: newTotal > 1 ? 'returning' : 'booked',
+                  preferredPackages
+                },
+                create: {
+                  customerId: targetBooking.customerId,
+                  totalBookings: 1,
+                  relationshipStage: 'booked',
+                  preferredPackages: [targetBooking.service]
+                }
+              });
+            } catch (memErr) {
+              console.error('Failed to update customer memory after booking:', memErr);
+            }
+          }
+        } else {
+          // Failed
+          await prisma.payment.update({
+            where: { id: payment.id },
+            data: { status: 'failed' }
+          });
+
+          const customerId = payment.bookingDraft?.customerId || payment.booking?.customerId;
+          if (customerId) {
+            try {
+              const message = customerReplyTemplates.paymentFailed(ResultDesc);
+              await whatsappService.sendMessage(customerId, message);
+            } catch (waErr: any) {
+              console.error('Failed to send payment failure WhatsApp message:', waErr?.message || waErr);
+            }
+          }
+          
+          console.log(`Payment failed for CheckoutRequestID: ${CheckoutRequestID}. Reason: ${ResultDesc}`);
         }
-        
-        console.log(`Payment failed for CheckoutRequestID: ${CheckoutRequestID}. Reason: ${ResultDesc}`);
+      } catch (asyncErr: any) {
+        console.error('Error in asynchronous M-Pesa callback handling:', asyncErr);
       }
-
-      return res.status(200).json({ status: 'success' });
-    } catch (error: any) {
-      console.error('Error processing M-Pesa callback:', error);
-      return res.status(500).json({ status: 'error', message: error.message });
-    }
+    });
   }
 }
 
