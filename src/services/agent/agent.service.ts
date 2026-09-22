@@ -315,7 +315,7 @@ export class AgentService {
 
   private shouldUseBookingStatusReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
-    return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed)/.test(text);
+    return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed|have i paid|did i pay|is it paid|is my payment (received|confirmed|done|through)|has (my|the) payment been received|did (my|the) payment go through|did you receive (my|the) payment|did you get (my|the) (money|payment)|have you received (my|the) (money|payment))/i.test(text);
   }
 
   private shouldUseUpcomingAppointmentTimeReply(userMessage: string): boolean {
@@ -834,6 +834,26 @@ export class AgentService {
   }
 
   private async getBookingStatusReply(customerId: string): Promise<string | null> {
+    // If the customer already has an upcoming confirmed booking, that takes highest precedence
+    const upcomingConfirmed = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: 'confirmed',
+        dateTime: { gte: new Date() },
+      },
+      orderBy: { dateTime: 'asc' },
+      select: { id: true, service: true, dateTime: true },
+    });
+
+    if (upcomingConfirmed) {
+      const successfulPayment = await prisma.payment.findFirst({
+        where: { bookingId: upcomingConfirmed.id, status: 'success' },
+        orderBy: { updatedAt: 'desc' },
+      });
+      const receiptNote = successfulPayment?.mpesaReceipt ? ` (M-Pesa receipt: ${successfulPayment.mpesaReceipt})` : '';
+      return `Yes, your payment is received and confirmed${receiptNote}! Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+    }
+
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
 
     if (draft?.step === 'reschedule_confirm') {
@@ -853,20 +873,6 @@ export class AgentService {
       if (pendingPayment) {
         return customerReplyTemplates.paymentPending();
       }
-    }
-
-    const upcomingConfirmed = await prisma.booking.findFirst({
-      where: {
-        customerId,
-        status: 'confirmed',
-        dateTime: { gte: new Date() },
-      },
-      orderBy: { dateTime: 'asc' },
-      select: { service: true, dateTime: true },
-    });
-
-    if (upcomingConfirmed) {
-      return `Yes, it's done. Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
     }
 
     return null;
@@ -959,6 +965,7 @@ Instructions:
     NEVER call propose_booking and confirm_booking in the same turn, even if the customer's message sounds enthusiastic - the deposit prompt must never appear without the customer explicitly agreeing to it first, in its own message.
 15. PAYMENT: Once 'confirm_booking' runs, the system sends an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
 16. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
+16b. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. If the customer already has a confirmed booking or Payment Status indicates their deposit was paid, NEVER tell the customer that their payment is pending, and never ask them to enter their PIN again. Confirm warmly that their payment has been received and their session is confirmed.
 17. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
 18. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
 19. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.
@@ -1001,6 +1008,18 @@ Instructions:
     const draftBeforeThisTurn = await prisma.bookingDraft.findUnique({ where: { customerId } });
     const initialDraftStep = draftBeforeThisTurn?.step;
 
+    // Fetch latest payment status for upcoming booking or active draft
+    let paymentSummary = 'No active payment on file.';
+    if (upcomingBooking && upcomingBooking.status === 'confirmed') {
+      const paidPayment = await prisma.payment.findFirst({
+        where: { bookingId: upcomingBooking.id, status: 'success' },
+        orderBy: { updatedAt: 'desc' },
+      });
+      paymentSummary = `PAID & CONFIRMED via M-Pesa${paidPayment?.mpesaReceipt ? ` (Receipt: ${paidPayment.mpesaReceipt})` : ''}. The booking is fully secured. Do NOT claim the payment is pending.`;
+    } else if (draftBeforeThisTurn?.step === 'payment_pending') {
+      paymentSummary = 'Payment pending user M-Pesa PIN entry for booking draft.';
+    }
+
     // 1b. Long-term memory beyond the last 10 messages of raw history
     const memory = await prisma.customerMemory.findUnique({ where: { customerId } });
     const memorySummary = memory
@@ -1016,6 +1035,7 @@ Instructions:
     const fullContext = `Customer Phone: ${customerId}
 Customer Name: ${customerName}
 Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
+Payment Status: ${paymentSummary}
 Past Bookings: ${pastBookings}
 Customer Memory: ${memorySummary}
 
