@@ -31,13 +31,13 @@ test('only applies confirmation after the assistant presented a proposal', () =>
 
 test('ignores duplicate yes replies after a payment prompt has already been sent', async () => {
   const originalFindUnique = prisma.bookingDraft.findUnique;
-  prisma.bookingDraft.findUnique = async () => ({
+  (prisma.bookingDraft.findUnique as any) = async () => ({
     customerId: 'customer-123',
     service: 'THE ICON',
     step: 'payment_pending',
     date: '2026-09-19',
     time: '15:00'
-  } as any);
+  });
 
   try {
     const result = await agent.tryImmediateConfirmation('customer-123');

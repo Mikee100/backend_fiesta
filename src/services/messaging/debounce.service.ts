@@ -5,7 +5,7 @@
 // processing per-customer until they've paused for DEBOUNCE_MS, then lets the
 // caller handle the whole burst as one turn.
 
-const DEBOUNCE_MS = 6000;
+const DEBOUNCE_MS = 2500;
 
 const pendingTimers = new Map<string, NodeJS.Timeout>();
 
