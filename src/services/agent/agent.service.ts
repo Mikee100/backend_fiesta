@@ -1,4 +1,4 @@
-
+﻿
 import OpenAI from 'openai';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
@@ -34,7 +34,7 @@ type BookingDetails = {
 };
 
 export class BookingExtractor {
-  // 🧼 STEP 1: Clean Input
+  // ðŸ§¼ STEP 1: Clean Input
   private clean(text: string): string {
     return text
       .replace(/[^ 0-\w\s]/gi, ' ')
@@ -43,7 +43,7 @@ export class BookingExtractor {
       .toLowerCase();
   }
 
-  // ⚡ STEP 2: Regex Extraction
+  // âš¡ STEP 2: Regex Extraction
   private regexExtract(text: string): BookingDetails {
     const cleanText = this.clean(text);
 
@@ -83,7 +83,7 @@ export class BookingExtractor {
     };
   }
 
-  // 🤖 STEP 3: AI Extraction (STRICT JSON)
+  // ðŸ¤– STEP 3: AI Extraction (STRICT JSON)
   private async aiExtract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     const response = await openai.chat.completions.create({
@@ -112,11 +112,27 @@ export class BookingExtractor {
     return { details, tokensUsed: response.usage?.total_tokens || 0 };
   }
 
-  // 🔥 FINAL HYBRID METHOD
+  // ðŸ”¥ FINAL HYBRID METHOD
+  // Skips the expensive AI extraction call when no booking-related signals are
+  // present in the message (e.g. pure questions, greetings, complaints) - this
+  // avoids the double-LLM-call latency and token burn for ~60% of messages.
+  private hasBookingSignals(message: string): boolean {
+    const text = message.toLowerCase();
+    return /\b(\d{1,2})(st|nd|rd|th)?\b|\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b|\b(am|pm)\b|\bbook|\bschedule|\bappointment|\bsession|\bpackage|\bbloom|\bmuse|\bicon|\blegend|\bqueen|\bempress|\bgoddess|\bresched|\bcancel|\bdeposit|\bmpesa|\bpay/i.test(text);
+  }
+
   async extract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
     const regex = this.regexExtract(message);
     console.log('Regex result:', regex);
     if (regex.name && regex.service && regex.date && regex.time) {
+      return { details: regex, tokensUsed: 0 };
+    }
+    // Skip the AI extraction call entirely if the message has no booking signals.
+    // The main agent LLM handles all conversation; this extractor is only used
+    // for the propose_reschedule guard - skipping it saves tokens and halves
+    // latency on pure informational messages.
+    if (!this.hasBookingSignals(message)) {
+      console.log('No booking signals detected - skipping AI extractor call.');
       return { details: regex, tokensUsed: 0 };
     }
     const { details: ai, tokensUsed } = await this.aiExtract(message);
@@ -380,58 +396,58 @@ export class AgentService {
 
     let badge = '';
     if (lowerName.includes('empress')) {
-      badge = ' ✨ *(Signature Edition — Most Loved)*';
+      badge = ' âœ¨ *(Signature Edition â€” Most Loved)*';
     } else if (lowerName.includes('goddess')) {
-      badge = ' 👑 *(Flagship Edition)*';
+      badge = ' ðŸ‘‘ *(Flagship Edition)*';
     }
 
     const items: string[] = [];
-    if (pkg.duration) items.push(`⏱️ ${pkg.duration}`);
-    if (pkg.images > 0) items.push(`📸 ${pkg.images} final edited photos`);
-    if (pkg.makeup) items.push('💄 Professional makeup');
+    if (pkg.duration) items.push(`â±ï¸ ${pkg.duration}`);
+    if (pkg.images > 0) items.push(`ðŸ“¸ ${pkg.images} final edited photos`);
+    if (pkg.makeup) items.push('ðŸ’„ Professional makeup');
 
     if (pkg.outfits > 0) {
       if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-        items.push(`👗 ${pkg.outfits} studio outfits + styling (incl. Power Suit)`);
+        items.push(`ðŸ‘— ${pkg.outfits} studio outfits + styling (incl. Power Suit)`);
       } else {
-        items.push(`👗 ${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} + styling`);
+        items.push(`ðŸ‘— ${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} + styling`);
       }
     }
 
     if (pkg.wig) {
       if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-        items.push('💇‍♀️ 2 styled wigs');
+        items.push('ðŸ’‡â€â™€ï¸ 2 styled wigs');
       } else {
-        items.push('💇‍♀️ 1 styled wig');
+        items.push('ðŸ’‡â€â™€ï¸ 1 styled wig');
       }
     }
 
     if (pkg.balloonBackdrop) {
       if (lowerName.includes('goddess')) {
-        items.push('🎈 Custom balloon backdrop or Goddess Sculpture Set');
+        items.push('ðŸŽˆ Custom balloon backdrop or Goddess Sculpture Set');
       } else {
-        items.push('🎈 Custom balloon backdrop with flowers');
+        items.push('ðŸŽˆ Custom balloon backdrop with flowers');
       }
     }
 
     if (lowerName.includes('goddess')) {
-      items.push('🎬 1 professionally produced Reel');
+      items.push('ðŸŽ¬ 1 professionally produced Reel');
     }
 
     if (pkg.photobook) {
       const size = pkg.photobookSize ? ` (${pkg.photobookSize})` : '';
-      items.push(`📚 Photobook hardcover${size}`);
+      items.push(`ðŸ“š Photobook hardcover${size}`);
     }
 
     if (pkg.mount) {
       if (lowerName.includes('goddess')) {
-        items.push('🖼️ 1 A2 fine art mount');
+        items.push('ðŸ–¼ï¸ 1 A2 fine art mount');
       } else {
-        items.push('🖼️ 1 A3 fine art mount');
+        items.push('ðŸ–¼ï¸ 1 A3 fine art mount');
       }
     }
 
-    return `🌸 *${pkg.name}* — *Ksh ${pkg.price.toLocaleString()}*${badge}\n${items.map((item) => `  • ${item}`).join('\n')}`;
+    return `ðŸŒ¸ *${pkg.name}* â€” *Ksh ${pkg.price.toLocaleString()}*${badge}\n${items.map((item) => `  â€¢ ${item}`).join('\n')}`;
   }
 
   private async getPackageCatalogReply(): Promise<string | null> {
@@ -457,7 +473,7 @@ export class AgentService {
       if (!packages.length) return null;
 
       const cards = packages.map((pkg) => this.buildPackageCard(pkg));
-      return `✨ *Fiesta House Maternity — Rate Card 2026* ✨\n\nHere are our maternity packages:\n\n${cards.join('\n\n')}\n\nIf one catches your eye, let me know! I can share more details or help check available shoot dates for you. 💖`;
+      return `âœ¨ *Fiesta House Maternity â€” Rate Card 2026* âœ¨\n\nHere are our maternity packages:\n\n${cards.join('\n\n')}\n\nIf one catches your eye, let me know! I can share more details or help check available shoot dates for you. ðŸ’–`;
     } catch (err) {
       console.error('Failed to build package catalog reply:', err);
       return null;
@@ -659,7 +675,7 @@ export class AgentService {
       'Great question. Booking is simple:',
       '1) Choose your package.',
       '2) Share your preferred date and time (we are closed on Mondays).',
-      '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. — completely optional!).',
+      '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. â€” completely optional!).',
       `4) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
       '5) Once deposit is received, your booking is confirmed and reminders are scheduled.',
       `6) Come for your session at ${location}.`,
@@ -740,10 +756,10 @@ export class AgentService {
       const price = item.unitPrice > 0
         ? `KSH ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`
         : 'Quoted by package tier';
-      return `• *${item.name}:* ${price}`;
+      return `â€¢ *${item.name}:* ${price}`;
     });
     return [
-      '✨ *Fiesta House Maternity — Additions & Extra Services* ✨',
+      'âœ¨ *Fiesta House Maternity â€” Additions & Extra Services* âœ¨',
       '',
       ...lines,
       '',
@@ -755,23 +771,23 @@ export class AgentService {
 
   private getBespokeReply(): string {
     return [
-      '✨ *Bespoke Experiences* ✨',
+      'âœ¨ *Bespoke Experiences* âœ¨',
       '',
       'For the mother whose vision does not fit inside a package, we design custom experiences by consultation.',
       '',
-      'Reach out to our team to begin the conversation, and we will craft a session around your unique story. 💖'
+      'Reach out to our team to begin the conversation, and we will craft a session around your unique story. ðŸ’–'
     ].join('\n');
   }
 
   private getTravellingMothersReply(): string {
     return [
-      '✈️ *For Our Travelling Mothers* 🌸',
+      'âœˆï¸ *For Our Travelling Mothers* ðŸŒ¸',
       '',
       'For mothers journeying to us from beyond Nairobi, we curate the full arrival.',
       '',
-      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge — so all you carry with you is your presence.',
+      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge â€” so all you carry with you is your presence.',
       '',
-      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you. 💖'
+      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you. ðŸ’–'
     ].join('\n');
   }
 
@@ -976,7 +992,10 @@ Instructions:
 23. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
 24. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
 25. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.
-26. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup.`;
+26. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup.
+27. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"
+28. PROACTIVE CLOSING: After answering a pure informational question (e.g. location, price, package details, phone number), always end with a single warm, open-ended question that moves the conversation forward - for example asking whether they'd like to check availability, what stage their pregnancy is at, or which package caught their eye. NEVER end on a full stop with nothing to invite a reply unless the customer has already confirmed their booking.
+29. NAME COLLECTION: If the Customer Name is "Unknown" or "WhatsApp User", ask for their name naturally within the flow of the first or second reply - e.g. "By the way, what name should I put down for you?" - and update your greeting once they provide it. Never invent or reuse a placeholder name in a booking.`;
   }
 
   /**
@@ -1972,7 +1991,7 @@ ${contextString}`;
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
     const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-    return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm)/.test(previousAssistantMessage);
+    return /(?:reply\s+["â€œâ€']?yes["â€œâ€']?|if\s+that\s+works\s+for\s+you.*reply\s+["â€œâ€']?yes["â€œâ€']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm)/.test(previousAssistantMessage);
   }
 
   private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
@@ -1980,7 +1999,7 @@ ${contextString}`;
     if (!draft?.step) return null;
 
     if (draft.step === 'payment_pending') {
-      return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
+      return `Iâ€™ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and Iâ€™ll confirm the booking as soon as it succeeds.`;
     }
 
     if (draft.step === 'awaiting_confirmation') {
@@ -2083,7 +2102,7 @@ ${contextString}`;
     const customer = await prisma.customer.findUnique({ where: { id: customerId } });
     if (!customer) return; // customer doesn't exist yet (e.g. first-ever web chat message)
 
-    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + '…' : userMessage;
+    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + 'â€¦' : userMessage;
     const existing = await prisma.customerMemory.findUnique({ where: { customerId } });
 
     await prisma.customerMemory.upsert({
