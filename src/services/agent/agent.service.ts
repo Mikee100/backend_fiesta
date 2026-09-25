@@ -6,15 +6,16 @@ import dayjs from 'dayjs';
 import { bookingService } from '../booking/booking.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
-import { SERVICE_DURATIONS, DEFAULT_DURATION, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG } from '../../config/constants';
+import { SERVICE_DURATIONS, DEFAULT_DURATION, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
-import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
+import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { whatsappService } from '../messaging/whatsapp.service';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
 // Ensure you have GROQ_API_KEY in your .env
@@ -220,6 +221,50 @@ export class AgentService {
     }
   }
 
+  // Hard, non-LLM gate for propose_reschedule: the customer's OWN message text
+  // must actually contain a date or time signal. Neither the tool-calling
+  // model's own arguments nor the separate BookingExtractor's AI pass can be
+  // trusted alone here - both can echo back or hallucinate a date (e.g. the
+  // customer's existing upcoming-booking date from context) even when the
+  // customer only asked an info question and stated no new date/time at all.
+  private messageContainsExplicitDateTimeSignal(message: string): boolean {
+    const text = message.toLowerCase();
+    const hasDateSignal = /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(st|nd|rd|th)?\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
+    const hasTimeSignal = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
+    return hasDateSignal && hasTimeSignal;
+  }
+
+  private getAuthoritativeRequestedDate(userMessage: string, proposedDate: string, extractedDate?: string | null): string {
+    const hasDayOfMonth = /\b\d{1,2}(st|nd|rd|th)?\b/.test(userMessage.toLowerCase());
+    return hasDayOfMonth && extractedDate ? extractedDate : proposedDate;
+  }
+
+  private shouldUseRescheduleRequestReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(reschedule|change|move|postpone)/.test(text)
+      && !this.messageContainsExplicitDateTimeSignal(userMessage)
+      && !this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage);
+  }
+
+  private shouldUseRescheduleWithdrawalReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const text = userMessage.toLowerCase().trim();
+    const withdrawal = /\b(let'?s|we should)\s+(not|don't|do not)\s+(reschedule|change|move|postpone)\b|\b(no|never mind|nevermind|forget it)\b.*\b(reschedule|change|move|postpone)\b|\bkeep\s+(the|my|this)\s+(original|current)\s+(date|time|booking|session)\b/.test(text);
+    if (!withdrawal) return false;
+
+    return history.slice(-6).some((message) =>
+      message.role === 'assistant' && /reschedul|move|forfeit.*deposit|within 72 hours/i.test(message.content)
+    );
+  }
+
+  private async withdrawPendingReschedule(customerId: string): Promise<void> {
+    await prisma.bookingDraft.deleteMany({
+      where: { customerId, step: 'reschedule_confirm' },
+    });
+  }
+
   private inferIntent(userMessage: string): { intent: string; confidence: number; rule: string } {
     const text = userMessage.toLowerCase();
 
@@ -297,9 +342,206 @@ export class AgentService {
     return /(raw\s+file|raw\s+files|unedited\s+photos|original\s+files|can\s+i\s+get\s+raw)/.test(text);
   }
 
+  private extractInvoiceNumber(userMessage: string): string | null {
+    const match = userMessage.match(/\bINV-\d{4}-\d{3}\b/i);
+    return match ? match[0].toUpperCase() : null;
+  }
+
+  private shouldUseInvoiceRequestReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    const invoiceKeywords = /(invoice|receipt|payment summary)/.test(text);
+    const actionKeywords = /(send|sent|share|download|get|view|need|can you|could you)/.test(text);
+    return invoiceKeywords && actionKeywords;
+  }
+
+  private async sendStoredInvoiceToCustomer(customerId: string, requestedInvoiceNumber?: string): Promise<string> {
+    const invoice = requestedInvoiceNumber
+      ? await prisma.invoice.findFirst({
+          where: { customerId, invoiceNumber: requestedInvoiceNumber },
+          include: { booking: true },
+        })
+      : await prisma.invoice.findFirst({
+          where: { customerId },
+          orderBy: { createdAt: 'desc' },
+          include: { booking: true },
+        });
+
+    if (!invoice) {
+      if (requestedInvoiceNumber) {
+        return `I could not find invoice ${requestedInvoiceNumber} under your account. Please confirm the invoice number or ask the team to resend it.`;
+      }
+      return 'I could not find a saved invoice for your account yet. Please confirm the booking or ask the team to generate one.';
+    }
+
+    const summary = `Invoice ${invoice.invoiceNumber}\n\nService: ${invoice.booking.service}\nDate: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}\nTotal: KSh ${invoice.total.toLocaleString()}\nDeposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\nBalance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\nYour invoice is attached here as a PDF.`;
+
+    try {
+      if (!invoice.pdfData) {
+        throw new Error('No PDF stored for this invoice');
+      }
+
+      await whatsappService.sendDocument(customerId, Buffer.from(invoice.pdfData), `${invoice.invoiceNumber}.pdf`, summary);
+      await prisma.invoice.update({
+        where: { id: invoice.id },
+        data: { status: 'sent', sentAt: new Date() },
+      });
+      return 'I’ve sent your invoice as a PDF to WhatsApp.';
+    } catch (error: any) {
+      console.error('Failed to send stored PDF invoice to WhatsApp:', error?.message || error);
+      const downloadUrl = `${process.env.BASE_URL || ''}/api/invoices/download/${invoice.id}`;
+      try {
+        await whatsappService.sendMessage(customerId, `${summary}\n\nDownload your invoice: ${downloadUrl}`);
+        await prisma.invoice.update({
+          where: { id: invoice.id },
+          data: { status: 'sent', sentAt: new Date() },
+        });
+        return 'I’ve sent the invoice details and a download link to WhatsApp.';
+      } catch (fallbackError: any) {
+        console.error('Fallback invoice message failed:', fallbackError?.message || fallbackError);
+        return 'I found your invoice, but I could not send it right now. Please ask the team to resend it or use the invoice download link from the dashboard.';
+      }
+    }
+  }
+
+  private shouldUsePackageBudgetReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /(cheapest|most affordable|lowest cost|budget friendly|budget-friendly|cheap|affordable|same as last time|like last time|same as before|same package as last time)/.test(text);
+  }
+
+  private getPackageBudgetReply(): string {
+    return 'I can help with that. The most affordable option is usually THE BLOOM, while THE ICON is the most popular mid-range package. If you want to keep it simple, tell me which package you prefer: THE BLOOM, THE ICON, or a premium option like THE EMPRESS or THE ROYAL.';
+  }
+
+  private shouldClarifyMixedIntent(userMessage: string): boolean {
+    if (this.shouldUseUpcomingAppointmentDetailsReply(userMessage)) return false;
+    const text = userMessage.toLowerCase();
+    const hasInvoice = /(invoice|receipt|payment summary)/.test(text);
+    const hasPackage = /(package|session|shoot|service|edition|the bloom|the icon|the empress|the royal|gold|platinum|vip|vvip)/.test(text);
+    const hasDate = /(next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|\b\d{1,2}(?:st|nd|rd|th)?\b|tomorrow|today|weekend)/.test(text);
+    // Must be a real action verb: "session"/"shoot" already count under hasPackage.
+    const hasBookingAction = /\b(book|booking|schedule|rescheduling|reschedule|cancel|appointment)\b/.test(text);
+
+    const matchedSignals = [hasInvoice, hasPackage, hasDate, hasBookingAction].filter(Boolean).length;
+    return matchedSignals >= 3 && !(hasInvoice && !hasPackage && !hasDate && !hasBookingAction);
+  }
+
+  private getMixedIntentClarificationReply(): string {
+    return 'I can help with the package, the date, or the invoice. Which one would you like to sort out first?';
+  }
+
   private shouldUseAdditionsReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     return /(additions|add-ons|add-on|extras|extra\s+services|extra\s+photo|extra\s+outfit|extra\s+makeup|digital\s+art|power\s+suit|wig\s+hire|suspending\s+concept|sculpture\s+set|reel\s+pricing|what\s+extras)/.test(text);
+  }
+
+  private shouldClarifyNewAddon(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const text = userMessage.toLowerCase();
+    if (!/\b(add|include|put)\b.*\b(new|another|one more)\b|\b(new|another|one more)\b.*\b(add|extra)\b/.test(text)) return false;
+    return history.slice(-8).some((message) => /add-on|addon|extra outfit|styled wig|extra edited photo|extra makeup/i.test(message.content));
+  }
+
+  /** "Show me" / "yes" right after we offered or listed the extras. */
+  private isAddonListFollowUp(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const text = this.normalizeHyphens(userMessage).trim().toLowerCase().replace(/[.!?]+$/, '');
+    const affirmative = /^(show(\s+me)?(\s+the)?(\s+(full\s+)?(list|options|extras|add-?ons))?|see\s+them|list\s+them|list\s+the\s+(extras|add-?ons)|what\s+(are\s+they|else)|yes(\s+please)?|yeah|yep|sure|ok(ay)?|please)$/.test(text);
+    if (!affirmative) return false;
+
+    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistant) return false;
+    return /(available extras|add-?ons?\b|optional additions|extra services|extra outfit|styled wig)/i.test(
+      this.normalizeHyphens(lastAssistant.content)
+    );
+  }
+
+  /** Collapse unicode dashes so regexes written with "-" still match model output. */
+  private normalizeHyphens(value: string): string {
+    return value.replace(/[\u2010-\u2015\u2212]/g, '-');
+  }
+
+  /** Exact add-on pricing injected into the system prompt so the model cannot invent it. */
+  private getAddonPricingLine(): string {
+    const priced = ADDON_CATALOG.filter((item) => item.unitPrice > 0)
+      .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`)
+      .join('; ');
+    const quoted = ADDON_CATALOG.filter((item) => item.unitPrice === 0)
+      .map((item) => item.name)
+      .join(', ');
+    return `${priced}. Quoted by package tier (no fixed price): ${quoted}.`;
+  }
+
+  private shouldUsePreviousAddonReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const text = userMessage.toLowerCase();
+    if (/\b(package|edition|bloom|muse|icon|legend|queen|empress|goddess|price|cost)\b/.test(text)) return false;
+    const asksAboutPreviousChoice = /\b(which|what)\b.*\b(choose|chosen|picked|selected|add|added|extra|add-on|addon)\b|\b(choose|chosen|picked|selected|add|added)\b.*\b(previously|before|earlier|already)\b/.test(text);
+    if (!asksAboutPreviousChoice) return false;
+
+    return history.slice(-8).some((message) =>
+      /(add-on|addon|extra outfit|styled wig|extra edited photo|extra makeup)/i.test(message.content)
+    );
+  }
+
+  private async getPreviousAddonReply(customerId: string): Promise<string | null> {
+    const bookings = await prisma.booking.findMany({
+      where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' },
+      select: { id: true, service: true, dateTime: true, recipientName: true, customer: { select: { name: true } } },
+    });
+
+    if (bookings.length === 0) return null;
+
+    const bookingAddons = await prisma.bookingAddon.findMany({
+      where: {
+        bookingId: { in: bookings.map((booking) => booking.id) },
+        status: { in: ['pending', 'confirmed', 'invoiced'] },
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { bookingId: true, name: true, quantity: true, totalPrice: true },
+    });
+
+    if (bookingAddons.length === 0) {
+      return `I don't see any add-ons selected for your upcoming sessions yet.`;
+    }
+
+    const sessionSummaries = bookings
+      .map((booking) => {
+        const addons = bookingAddons.filter((addon) => addon.bookingId === booking.id);
+        if (addons.length === 0) return null;
+        const selected = addons
+          .map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}${addon.totalPrice > 0 ? ` (Ksh ${addon.totalPrice.toLocaleString()})` : ''}`)
+          .join(', ');
+        const bookerName = booking.customer?.name?.trim().toLowerCase() || '';
+        const recipientName = booking.recipientName?.trim() || '';
+        const recipient = recipientName && recipientName.toLowerCase() !== bookerName
+          ? ` for ${recipientName}`
+          : '';
+        return `${booking.service} on ${inBusinessTimezone(booking.dateTime).format('D MMMM')} ${recipient}: ${selected}`;
+      })
+      .filter((summary): summary is string => !!summary);
+
+    return `Your previously selected add-ons are: ${sessionSummaries.join('; ')}.`;
+  }
+
+  private getSelectedAddon(userMessage: string): AddonCatalogItem | null {
+    const text = userMessage.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
+    const selectionSignal = /\b(want|would like|add|include|choose|go with|take|prefer)\b/.test(text);
+    if (!selectionSignal) return null;
+    return ADDON_CATALOG.find((item) => item.match.test(text)) || null;
+  }
+
+  private getAddonSelectionReply(addon: AddonCatalogItem): string {
+    const price = addon.unitPrice > 0
+      ? `Ksh ${addon.unitPrice.toLocaleString()}${addon.quantityFromNote ? ' each' : ''}`
+      : 'quoted by package tier';
+    return `Noted: ${addon.name} (${price}). It will be added to the session balance, not the deposit. I have not changed your package or date. What would you like to confirm next?`;
   }
 
   private shouldUseBespokeReply(userMessage: string): boolean {
@@ -326,7 +568,58 @@ export class AgentService {
     const text = userMessage.toLowerCase();
     const mentionsAnotherPerson = /(my\s+sister|my\s+brother|my\s+friend|my\s+husband|my\s+wife|my\s+partner|my\s+family|also\s+coming|come\s+with\s+her|come\s+with\s+him|joining\s+the\s+shoot|join\s+the\s+shoot)/.test(text);
     const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
-    return mentionsAnotherPerson && bookingContext;
+    const jointSessionSignal = /(with|alongside|together|joining|join|coming\s+with|both\s+of\s+us|each\s+of\s+us)/.test(text);
+    return mentionsAnotherPerson && bookingContext && jointSessionSignal;
+  }
+
+  private shouldClarifyBookingForSomeoneElse(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
+    const bookingForSomeoneElse = /\b(for|on behalf of)\s+my\s+(sister|brother|friend|husband|wife|partner|mother|father|daughter|son|family)\b/.test(text);
+    return bookingContext && bookingForSomeoneElse && !this.shouldUseMultiPersonBookingReply(userMessage);
+  }
+
+  private extractStandaloneFullName(userMessage: string): string | null {
+    const candidate = userMessage.trim().replace(/[^a-zA-Z' -]/g, '').replace(/\s+/g, ' ');
+    if (!/^[A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){1,3}$/.test(candidate)) return null;
+    return candidate.split(' ').map((part) => `${part[0].toUpperCase()}${part.slice(1).toLowerCase()}`).join(' ');
+  }
+
+  private shouldCaptureRecipientName(
+    userMessage: string,
+    history: { role: 'user' | 'assistant', content: string }[]
+  ): boolean {
+    const name = this.extractStandaloneFullName(userMessage);
+    if (!name) return false;
+    const recentHistory = history.slice(-8);
+    const askedAboutBookingSubject = recentHistory
+      .filter((message) => message.role === 'assistant')
+      .some((message) => /session just for (?:your|her|his)|both (?:of )?you.*photographed together|booking.*for.*sister|booking.*for.*brother/i.test(message.content));
+    const bookingForSomeoneElse = recentHistory
+      .filter((message) => message.role === 'user')
+      .some((message) => this.shouldClarifyBookingForSomeoneElse(message.content));
+    return askedAboutBookingSubject || bookingForSomeoneElse;
+  }
+
+  private shouldClarifyAmbiguousDeposit(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /\b(10|10000|10k)\s*(sh|k|ksh|kes)?\b.*\bdeposit\b|\bdeposit\b.*\b(10|10000|10k)\s*(sh|k|ksh|kes)?\b/.test(text);
+  }
+
+  private getAmbiguousDepositReply(): string {
+    return 'Do you mean a Ksh 10,000 deposit, or an add-on or item costing Ksh 10,000? The THE BLOOM package has a Ksh 2,000 deposit, so I want to make sure I understand what you mean before recommending anything.';
+  }
+
+  private async captureRecipientName(customerId: string, userMessage: string): Promise<string | null> {
+    const recipientName = this.extractStandaloneFullName(userMessage);
+    if (!recipientName) return null;
+
+    await prisma.bookingDraft.upsert({
+      where: { customerId },
+      update: { name: recipientName, recipientName, isForSomeoneElse: true, step: 'service' },
+      create: { customerId, name: recipientName, recipientName, isForSomeoneElse: true, step: 'service' },
+    });
+    return recipientName;
   }
 
   private shouldUseBookingStatusReply(userMessage: string): boolean {
@@ -337,6 +630,61 @@ export class AgentService {
   private shouldUseUpcomingAppointmentTimeReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     return /\b(when does|what time does|when is|what time is|what time will)\b.*\b(start|begin|session|appointment|booking)\b|\b(start|begin)\b.*\b(when|what time)\b/.test(text);
+  }
+
+  private shouldUseUpcomingAppointmentDetailsReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) return false;
+    if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
+    if (/\bwhat(?:'s| is| are)?\b.*\b(included|in|on|booked for)\b.*\b(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
+    return /\b(any|what|more|tell me about)\b.*\b(details?|information|shoot|session|appointment|booking)\b|\b(details?|information)\b.*\b(session|shoot|appointment|booking)\b/.test(text);
+  }
+
+  private formatBookingDuration(durationMinutes?: number | null): string {
+    const minutes = durationMinutes || DEFAULT_DURATION;
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    if (hours === 0) return `${remainder} minutes`;
+    if (remainder === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+    return `${hours} hour${hours === 1 ? '' : 's'} ${remainder} minutes`;
+  }
+
+  private async getUpcomingAppointmentDetailsReply(customerId: string): Promise<string | null> {
+    const booking = await prisma.booking.findFirst({
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' },
+      include: {
+        customer: { select: { name: true } },
+        bookingAddons: {
+          where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
+          orderBy: { createdAt: 'asc' },
+          select: { name: true, quantity: true },
+        },
+      },
+    });
+
+    if (!booking) return null;
+
+    const payment = await prisma.payment.findFirst({
+      where: { bookingId: booking.id, status: 'success' },
+      orderBy: { updatedAt: 'desc' },
+      select: { amount: true },
+    });
+    const localDateTime = inBusinessTimezone(booking.dateTime);
+    const bookerName = booking.customer?.name?.trim() || '';
+    const recipientName = booking.recipientName?.trim() || '';
+    const isSelfBooking = !recipientName || recipientName.toLowerCase() === bookerName.toLowerCase();
+    const recipient = isSelfBooking
+      ? ''
+      : ` This session is for ${recipientName}${bookerName ? `; ${bookerName} is the booking customer.` : '.'}`;
+    const addons = booking.bookingAddons.length > 0
+      ? ` Add-ons: ${booking.bookingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`).join(', ')}.`
+      : '';
+    const paymentText = payment
+      ? ` Deposit paid: Ksh ${payment.amount.toLocaleString()} and the booking is confirmed.`
+      : ' The booking is confirmed.';
+
+    return `Your ${booking.service} session is on ${localDateTime.format('dddd, D MMMM YYYY')} at ${localDateTime.format('h:mm A')}. It is scheduled for ${this.formatBookingDuration(booking.durationMinutes)}. Location: 4th Avenue, Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi.${recipient}${addons}${paymentText}`;
   }
 
   private async getUpcomingAppointmentTimeReply(customerId: string): Promise<string | null> {
@@ -605,6 +953,10 @@ export class AgentService {
     });
     if (!booking) return null;
 
+    if (this.isRescheduleWithin72Hours(booking.dateTime)) {
+      return this.getReschedulePolicyMessage();
+    }
+
     return `Of course. Your ${booking.service} session is currently on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${inBusinessTimezone(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
   }
 
@@ -618,6 +970,10 @@ export class AgentService {
       select: { id: true, service: true, dateTime: true },
     });
     if (!booking) return null;
+
+    if (this.isRescheduleWithin72Hours(booking.dateTime)) {
+      return this.getReschedulePolicyMessage();
+    }
 
     const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key)) || 'standard';
     const bookingDay = inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD');
@@ -643,6 +999,15 @@ export class AgentService {
     });
 
     return `I can move your ${result.service} session to ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(`2000-01-01T${newTime}`).format('h:mm A')}. Would you like me to confirm that change?`;
+  }
+
+  private isRescheduleWithin72Hours(bookingDateTime: Date, now = new Date()): boolean {
+    const hoursUntilBooking = bookingDateTime.getTime() - now.getTime();
+    return hoursUntilBooking >= 0 && hoursUntilBooking < 72 * 60 * 60 * 1000;
+  }
+
+  private getReschedulePolicyMessage(): string {
+    return 'Your session is within 72 hours. According to our policy, rescheduling now will forfeit your deposit. Would you still like to proceed? If yes, please share your preferred date and time.';
   }
 
   private async getBookingProcessReply(): Promise<string> {
@@ -752,20 +1117,24 @@ export class AgentService {
   }
 
   private getAdditionsReply(): string {
-    const lines = ADDON_CATALOG.map((item) => {
-      const price = item.unitPrice > 0
-        ? `KSH ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`
-        : 'Quoted by package tier';
-      return `â€¢ *${item.name}:* ${price}`;
-    });
+    const pricedLines = ADDON_CATALOG
+      .filter((item) => item.unitPrice > 0)
+      .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`);
+    const quotedLines = ADDON_CATALOG
+      .filter((item) => item.unitPrice === 0)
+      .map((item) => `${item.name}: quoted by package tier`);
+
     return [
-      'âœ¨ *Fiesta House Maternity â€” Additions & Extra Services* âœ¨',
+      'Yes, these optional additions are available:',
       '',
-      ...lines,
+      ...pricedLines,
       '',
-      '_Add-ons are optional and settle with your balance after the shoot (not included in the KSH 2,000 deposit)._',
+      'Quoted by package tier:',
+      ...quotedLines,
       '',
-      'Would you like to include any of these with your session?'
+      'They are optional, are added to the balance, and are not included in the Ksh 2,000 deposit. Nothing has been added yet.',
+      '',
+      'Which, if any, would you like me to note for the session?'
     ].join('\n');
   }
 
@@ -827,6 +1196,10 @@ export class AgentService {
       "I've noted that another person may join.",
       "Once you confirm option 1 or 2, share your package, date, and preferred time and I'll check availability."
     ].join('\n');
+  }
+
+  private getBookingForSomeoneElseReply(): string {
+    return 'Of course. Is the session just for your sister, or would you both like to be photographed together? Once I know that, I can help with the package, date, and preferred time.';
   }
 
   private async captureMultiPersonBookingNote(customerId: string, userMessage: string): Promise<void> {
@@ -961,42 +1334,49 @@ Business Context and Customer History:
 ${businessContext}
 
 Instructions:
-1. Be friendly, empathetic, and professional.
-2. If you know the customer's name, greet them by name. If the name is "Unknown", you MUST ask for their real full name before proposing any booking - never invent or reuse a placeholder name.
-3. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
-4. If a customer asks a question, answer it using ONLY the provided Business Context.
-5. PLATFORM RESTRICTIONS: You are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS. If a user wants to book, politely tell them that bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue.
-6. If the platform IS "whatsapp" or "web", and they want to book, guide them through it. Gather their real Name, the Service they want, a Date, and a Time.
-7. RESCHEDULING IS TWO STEPS, NEVER SKIP OR COMBINE THEM: if they want to reschedule, but haven't given a specific new date/time in their message, DO NOT call any tool - ask them what date/time they want first. NEVER invent or guess a date/time yourself. Once they've stated a specific new date/time, call 'propose_reschedule' (this only tells them the proposed new date/time - it changes nothing yet), then STOP and wait. Only call 'confirm_reschedule' after they explicitly reply yes/confirm on their OWN later message - never in the same turn as propose_reschedule.
-8. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel their appointment, call 'cancel_booking' before telling them it is cancelled. Never claim a cancellation succeeded unless this tool returns success.
-9. PHOTO DELIVERY PREFERENCES MUST BE CAPTURED: if a customer asks about receiving edited photos, clarify that delivery is always via a secure download link, then capture their preferred channel (email/WhatsApp/download link) using 'save_delivery_preference'. If they requested email but have not provided the exact email address (and it isn't already known), ask for the email first before calling the tool.
-10. If the customer mentions a specific detail about their session (e.g. "I'm bringing my family", "I want a blue backdrop"), use the 'add_session_note' tool to save it.
-11. IMPORTANT: Never assume or make up a time. If the user doesn't provide a time, YOU MUST ASK for it.
-12. Before proposing, ALWAYS call 'get_available_slots' for the specific date and service to see which times are free.
-13. If the user's preferred time is taken, suggest the closest available slots from the list returned by 'get_available_slots'.
-13b. OPTIONAL ADD-ONS DURING BOOKING: During the booking process (when gathering or confirming their package, date, and time, or right before proposing the booking), ask the customer if they would like to include any optional add-ons or extra services (e.g. "Would you like to include any optional add-ons with your shoot, such as an extra outfit, styled wig hire, or extra edited photos? It's completely optional!"). Emphasize that add-ons are strictly optional and not mandatory. If the customer requests or accepts an add-on, save it using the 'add_session_note' tool. If the customer declines ("no", "none", "skip") or has already decided, proceed directly with the booking.
-14. BOOKING IS TWO STEPS, NEVER SKIP OR COMBINE THEM:
-    a) Once you have their real Name, Service, Date, and a confirmed-free Time, call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt.
-    b) STOP THERE and wait. Only after the customer explicitly replies yes/confirm/go ahead in their OWN next message do you call 'confirm_booking', which is what actually sends the M-Pesa payment prompt.
-    NEVER call propose_booking and confirm_booking in the same turn, even if the customer's message sounds enthusiastic - the deposit prompt must never appear without the customer explicitly agreeing to it first, in its own message.
-15. PAYMENT: Once 'confirm_booking' runs, the system sends an M-Pesa STK Push to the customer's phone. Inform the customer that they will receive a prompt on their phone to enter their M-Pesa PIN for the deposit.
-16. Explain that the booking is only "provisional" until the deposit is paid, and they will receive a confirmation message once the payment is successful.
-16b. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. If the customer already has a confirmed booking or Payment Status indicates their deposit was paid, NEVER tell the customer that their payment is pending, and never ask them to enter their PIN again. Confirm warmly that their payment has been received and their session is confirmed.
-17. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
-18. If the context doesn't answer their question, politely let them know you'll have a human team member follow up.
-19. KEEP RESPONSES CONCISE: Messages on some platforms have length limits. Do not send walls of text. Keep your responses under 800 characters if possible.
-20. When confirming a saved delivery email, use plain text (no markdown asterisks around the email). Say clearly that the email has been saved and remind them edited photos are delivered within 10 working days.
-20a. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead. Keep the conversation focused on their booking and questions - media sharing happens on those platforms only.
-21. VOICE: You are a thoughtful, capable studio assistant having a real conversation, not a chatbot reading a script. Many customers are expectant mothers planning an important photo session: be warm, calm, and personally attentive without being overly familiar or assuming anything they have not said. Start by responding directly to what the customer just said. Use plain, everyday language and contractions. Prefer one or two short sentences; ask one clear question only when you genuinely need an answer. Do not use canned openers such as "Sure thing", "Absolutely", "No worries", or "I understand" unless they add genuine meaning. Do not restate the customer's message, narrate obvious steps, or repeat options they have already seen.
-22. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context.
-23. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
-24. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
-25. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.
-26. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup.
-27. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"
-28. PROACTIVE CLOSING: After answering a pure informational question (e.g. location, price, package details, phone number), always end with a single warm, open-ended question that moves the conversation forward - for example asking whether they'd like to check availability, what stage their pregnancy is at, or which package caught their eye. NEVER end on a full stop with nothing to invite a reply unless the customer has already confirmed their booking.
-29. NAME COLLECTION: If the Customer Name is "Unknown" or "WhatsApp User", ask for their name naturally within the flow of the first or second reply - e.g. "By the way, what name should I put down for you?" - and update your greeting once they provide it. Never invent or reuse a placeholder name in a booking.`;
+These are grouped by category. If any two instructions ever seem to conflict, resolve it using this priority order: [A] Hard Constraints > [B] Tool-Use Workflow > [C] Business Knowledge > [D] Conversation Style. Never let a Conversation Style preference (like being warm or proactive) override a Hard Constraint or Tool-Use Workflow rule.
+
+[A] HARD CONSTRAINTS (non-negotiable, check these first, before anything else)
+A1. PLATFORM CAPABILITY GATE - CHECK THIS BEFORE STARTING ANY BOOKING FLOW: you are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS on this channel at all - do not begin gathering Name/Service/Date/Time here even if the customer offers them. As soon as it becomes clear they want to book, immediately and politely tell them bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue. If the platform IS "whatsapp" or "web", the booking flow in [B] is fully available.
+A2. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
+A3. Never assume, guess, or invent a date or time for a booking, reschedule, or anything else the customer hasn't explicitly stated.
+A4. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel their appointment, call 'cancel_booking' before telling them it is cancelled. Never claim a cancellation succeeded unless this tool returns success.
+A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. If the customer already has a confirmed booking or Payment Status indicates their deposit was paid, NEVER tell the customer that their payment is pending, and never ask them to enter their PIN again. Confirm warmly that their payment has been received and their session is confirmed.
+A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done.
+A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
+
+[B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
+B1. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
+B2. BOOKING FLOW, IN THIS EXACT ORDER - never skip or reorder a step:
+    a) Gather their real Name, the Service they want, a Date, and a Time. Track which of these are already known from earlier in this same conversation (e.g. they already agreed to a themed backdrop, or already named a package) and only ask for what's still missing - ask for it in ONE clear question, do not re-ask about something already settled, and do not pivot to an unrelated topic when they've just answered the specific question you asked. If a date/time they give looks like a typo of a real day or time (e.g. "Sundat" for "Sunday"), interpret it as they most likely meant rather than ignoring it or changing the subject; only ask them to clarify if it's genuinely ambiguous.
+    b) Call 'get_available_slots' for that specific date and service to see which times are free. If their preferred time is taken, suggest the closest available slots from the list returned.
+    c) Once the time is confirmed free, ask ONCE if they'd like any optional add-ons (e.g. "Would you like to include any optional add-ons with your shoot, such as an extra outfit, styled wig hire, or extra edited photos? It's completely optional!"). Make clear it's optional. If they accept an add-on, save it with 'add_session_note'. If they decline ("no", "none", "skip") or don't respond to it after one ask, move on immediately - never ask about add-ons more than once per booking.
+    d) Only now call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt. STOP THERE and wait.
+    e) Only after the customer explicitly replies yes/confirm/go ahead in their OWN next message do you call 'confirm_booking', which is what actually sends the M-Pesa payment prompt. NEVER call propose_booking and confirm_booking in the same turn, even if the customer's message sounds enthusiastic.
+    f) Once 'confirm_booking' runs, tell the customer they'll get an M-Pesa STK push to enter their PIN, and that the booking is only "provisional" until the deposit is paid - they'll get a confirmation message once payment succeeds.
+B3. RESCHEDULING IS TWO STEPS, NEVER SKIP OR COMBINE THEM: if they want to reschedule but haven't given a specific new date/time, DO NOT call any tool - ask them what date/time they want first. Once they've stated a specific new date/time, call 'propose_reschedule' (this only tells them the proposed new date/time - it changes nothing yet), then STOP and wait. Only call 'confirm_reschedule' after they explicitly reply yes/confirm on their OWN later message - never in the same turn as propose_reschedule.
+B4. PHOTO DELIVERY PREFERENCES: if a customer asks about receiving edited photos, clarify that delivery is always via a secure download link, then capture their preferred channel (email/WhatsApp/download link) using 'save_delivery_preference'. If they requested email but have not provided the exact email address (and it isn't already known), ask for the email first before calling the tool. When confirming a saved delivery email, use plain text (no markdown asterisks) and remind them edited photos are delivered within 10 working days.
+B5. SESSION NOTES - USE JUDGEMENT ON WHAT'S WORTH SAVING: use 'add_session_note' only for details that would actually change how the shoot day is planned or run - e.g. who else is attending, a specific backdrop/colour/theme request, a mobility or access need, or an explicit special request. Do not save incidental chit-chat or vague preferences that don't affect planning (e.g. "I like blue" said in passing). When in doubt, ask yourself whether the studio team would need to know this before the shoot - if not, don't save it.
+
+[C] BUSINESS KNOWLEDGE (answer from this, then tool results, then escalate)
+C1. INFORMATION PRIORITY ORDER: answer customer questions using, in this order: (1) the Business Context provided above, (2) the customer's own Upcoming/Past Booking or payment context provided above, (3) results actually returned by a tool call this turn. If none of these answer the question, follow C2. Never invent facts, prices, or policies that aren't present in one of these three sources.
+C2. If none of the above answers their question, politely let them know you'll have a human team member follow up.
+C3. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup. NEVER use the word "standard" as a generic stand-in for "our packages" (e.g. never say "we only have our standard packages available") - "Standard" is itself a retired legacy package name and using it this way is confusing; say "our packages" or "our Editions" instead.
+C3b. ADD-ON PRICES - THESE ARE THE ONLY CORRECT FIGURES, QUOTE THEM EXACTLY: ${this.getAddonPricingLine()} When a customer asks what add-ons are available, list every one of these with its exact price. NEVER write "price varies", "varies by package", or any other placeholder for an add-on that has a fixed price above, and never invent an add-on that is not on this list. Add-ons are settled with the balance, not the deposit.
+C4. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
+C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"
+
+[D] CONVERSATION STYLE
+D1. IDENTITY & NAME HANDLING: If you know the customer's name, greet them by name. If the Customer Name is "Unknown" or "WhatsApp User", ask for their real full name naturally within the flow of the first or second reply (e.g. "By the way, what name should I put down for you?"), and update how you address them once they provide it. You MUST have their real name before proposing any booking - never invent or reuse a placeholder name.
+D2. VOICE: You are a thoughtful, capable studio assistant having a real conversation, not a chatbot reading a script. Many customers are expectant mothers planning an important photo session: be warm, calm, and personally attentive without being overly familiar or assuming anything they have not said. Start by responding directly to what the customer just said. Use plain, everyday language and contractions. Prefer one or two short sentences; ask one clear question only when you genuinely need an answer. Do not use canned openers such as "Sure thing", "Absolutely", "No worries", or "I understand" unless they add genuine meaning. Do not restate the customer's message, narrate obvious steps, or repeat options they have already seen.
+D3. SOUND LIKE A PERSON, NOT A TEMPLATE: Vary your sentence structure, word choice, and phrasing from message to message - never reuse the exact same sentence, opener, or closing question twice in one conversation, even if the underlying situation is similar. React to the specific thing the customer said rather than falling back on a generic all-purpose reply. If you notice you are about to write something that reads like a form letter or an FAQ entry, rephrase it as something you would actually text a person.
+D4. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context. When explaining a multi-step process (e.g. how booking works, what happens after the shoot), describe it as flowing prose in one or two natural sentences instead of a numbered checklist - only use a numbered or bulleted list if the customer explicitly asks for "steps" or "a list".
+D5. LENGTH: Messages on some platforms have length limits, and walls of text feel robotic - aim to keep responses under 800 characters when possible, but never cut a booking confirmation, payment detail, or other important explanation short just to hit that number.
+D6. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
+D7. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.
+D8. PROACTIVE CLOSING, WHEN APPROPRIATE: After answering a pure informational question (e.g. location, price, package details, phone number), it's often good to end with a single warm, open-ended question that moves the conversation forward - for example asking whether they'd like to check availability, what stage their pregnancy is at, or which package caught their eye. This is a preference, not a rule to force every time: skip it for quick factual/support exchanges where it would feel like you're selling rather than helping (e.g. simply confirming opening hours), and never add it once the customer has already confirmed their booking, reschedule, or cancellation.`;
   }
+
 
   /**
    * Runs the actual RAG + tool-calling pipeline. Can throw (provider errors,
@@ -1007,14 +1387,42 @@ Instructions:
     // 1. Fetch Customer and Booking History for Memory
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
-      include: { bookings: { orderBy: { dateTime: 'desc' }, take: 5 } }
+      include: {
+        bookings: {
+          orderBy: { dateTime: 'desc' },
+          take: 5,
+          include: {
+            bookingAddons: {
+              where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
+              orderBy: { createdAt: 'asc' },
+              select: { name: true, quantity: true, totalPrice: true },
+            },
+            sessionNotes: {
+              where: { status: { in: ['pending', 'approved'] } },
+              orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+              select: { description: true, category: true, priority: true, structuredData: true },
+            },
+          },
+        },
+      }
     });
 
     const customerName = customer?.name && customer.name !== 'WhatsApp User' ? customer.name : 'Unknown';
     const now2 = dayjs();
     const upcomingBooking = customer?.bookings.find(b => dayjs(b.dateTime).isAfter(now2) && b.status !== 'cancelled');
+    const upcomingAddons = upcomingBooking?.bookingAddons || [];
+    const upcomingNotes = upcomingBooking?.sessionNotes || [];
+    const recipientSummary = upcomingBooking?.recipientName
+      ? ` Recipient: ${upcomingBooking.recipientName}.`
+      : '';
+    const addonSummary = upcomingAddons.length > 0
+      ? ` Add-ons: ${upcomingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}${addon.totalPrice > 0 ? ` (Ksh ${addon.totalPrice.toLocaleString()})` : ''}`).join(', ')}.`
+      : '';
+    const noteSummary = upcomingNotes.length > 0
+      ? ` Special session details: ${upcomingNotes.map((note) => `${note.description} [${note.category}, ${note.priority} priority]`).join('; ')}.`
+      : '';
     const upcomingBookingSummary = upcomingBooking
-      ? `${upcomingBooking.service} on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status})`
+      ? `${upcomingBooking.service} on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status}; duration: ${upcomingBooking.durationMinutes || DEFAULT_DURATION} minutes).${recipientSummary}${addonSummary}${noteSummary}`
       : 'None';
     const pastBookings = customer?.bookings.map(b =>
       `${b.service} on ${inBusinessTimezone(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
@@ -1053,6 +1461,7 @@ Instructions:
 
     const fullContext = `Customer Phone: ${customerId}
 Customer Name: ${customerName}
+  Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
 Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
 Payment Status: ${paymentSummary}
 Past Bookings: ${pastBookings}
@@ -1085,7 +1494,9 @@ ${contextString}`;
             properties: {
               bookingDate: { type: 'string', description: 'The date of the booking this note applies to (YYYY-MM-DD)' },
               note: { type: 'string', description: 'The specific detail to save' },
-              type: { type: 'string', enum: ['external_people', 'external_items', 'special_request', 'other'], description: 'Category of the note' }
+              type: { type: 'string', enum: ['external_people', 'external_items', 'special_request', 'other'], description: 'Legacy storage type for the note' },
+              category: { type: 'string', enum: ['client_wish', 'operational', 'addon', 'accessibility', 'companion', 'styling', 'delivery', 'other'], description: 'What kind of operational detail this is' },
+              priority: { type: 'string', enum: ['normal', 'high', 'urgent'], description: 'How important this detail is for preparing the session' }
             },
             required: ['bookingDate', 'note', 'type']
           }
@@ -1238,9 +1649,10 @@ ${contextString}`;
               toolResponse = `ERROR: A booking/reschedule was already confirmed earlier in this same turn. The task is done - stop calling booking tools and just tell the customer it's confirmed.`;
             }
             else if (functionName === 'propose_booking') {
-              const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${args.date}T${args.time}`);
+              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date);
+              const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${requestedDate}T${args.time}`);
               proposedThisTurn = true;
-              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${args.date} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "Great, I can hold ${args.service} for ${args.date} at ${args.time}. The deposit is KSH ${result.depositAmount}. If that works for you, just reply yes and I'll send the M-Pesa prompt." Do NOT call confirm_booking in this same turn.`;
+              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${requestedDate} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "Great, I can hold ${args.service} for ${requestedDate} at ${args.time}. The deposit is KSH ${result.depositAmount}. If that works for you, just reply yes and I'll send the M-Pesa prompt." Do NOT call confirm_booking in this same turn.`;
             }
             else if (functionName === 'confirm_booking') {
               if (proposedThisTurn) {
@@ -1252,8 +1664,8 @@ ${contextString}`;
               }
             }
             else if (functionName === 'propose_reschedule') {
-              if (!extracted.date || !extracted.time) {
-                toolResponse = `ERROR: The customer has not actually stated a specific new date and time in their message. Do NOT invent one - ask them what date and time they'd like to reschedule to.`;
+              if (!extracted.date || !extracted.time || !this.messageContainsExplicitDateTimeSignal(userMessage)) {
+                toolResponse = `ERROR: The customer has not actually stated a specific new date and time in their OWN message this turn. Do NOT invent one, and do NOT reuse the date/time from their existing upcoming booking as if it were a new request - ask them what date and time they'd like to reschedule to.`;
               } else {
                 const result = await this.executeProposeRescheduleTool(customerId, args.newDate, args.newTime);
                 await this.notifyRescheduleAdmin({
@@ -1265,7 +1677,10 @@ ${contextString}`;
                   newTime: args.newTime,
                 });
                 proposedThisTurn = true;
-                toolResponse = `PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "Great, I can move your ${result.service} session to ${args.newDate} at ${args.newTime}. If that works for you, just reply yes and I'll confirm it." Do NOT call confirm_reschedule in this same turn.`;
+                const policyNotice = this.isRescheduleWithin72Hours(result.oldDateTime)
+                  ? `${this.getReschedulePolicyMessage()} `
+                  : '';
+                toolResponse = `${policyNotice}PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "Great, I can move your ${result.service} session to ${args.newDate} at ${args.newTime}. If that works for you, just reply yes and I'll confirm it." Do NOT call confirm_reschedule in this same turn.`;
               }
             }
             else if (functionName === 'confirm_reschedule') {
@@ -1281,7 +1696,10 @@ ${contextString}`;
                   newDateTime: result.newDateTime,
                 });
                 confirmedActionThisTurn = true;
-                toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${dayjs(result.newDateTime).format('YYYY-MM-DD HH:mm')}. This is DONE - do not call any more booking tools this turn.`;
+                const policyNotice = result.depositForfeited
+                  ? ' The customer was rescheduled within 72 hours, so the deposit was forfeited according to policy.'
+                  : '';
+                toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${dayjs(result.newDateTime).format('YYYY-MM-DD HH:mm')}.${policyNotice} This is DONE - do not call any more booking tools this turn.`;
               }
             }
             else if (functionName === 'cancel_booking') {
@@ -1300,7 +1718,7 @@ ${contextString}`;
               }
             }
             else if (functionName === 'add_session_note') {
-              const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type);
+              const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type, args.category, args.priority, userMessage, platform);
               if (noteResult.created) {
                 toolResponse = `SUCCESS: Note added to session as ${noteResult.type}.`;
               } else {
@@ -1308,14 +1726,15 @@ ${contextString}`;
               }
             }
             else if (functionName === 'get_available_slots') {
+              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date);
               const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k));
               if (!serviceKey) {
                 toolResponse = `ERROR: "${args.service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these.`;
               } else {
                 const duration = SERVICE_DURATIONS[serviceKey];
-                const result: any = await bookingService.getAvailableSlots(args.date, duration);
+                const result: any = await bookingService.getAvailableSlots(requestedDate, duration);
                 // Spell out the weekday so the model never has to infer it from the raw ISO date.
-                const dateLabel = `${dayjs(args.date).format('dddd, MMMM D, YYYY')} (${args.date})`;
+                const dateLabel = `${dayjs(requestedDate).format('dddd, MMMM D, YYYY')} (${requestedDate})`;
 
                 if (result.status === 'closed') {
                   toolResponse = `The business is CLOSED on ${dateLabel} because: ${result.reason}.`;
@@ -1451,6 +1870,69 @@ ${contextString}`;
       return fallbackReply;
     }
 
+    if (this.shouldCaptureRecipientName(userMessage, history)) {
+      const recipientName = await this.captureRecipientName(customerId, userMessage);
+      if (recipientName) {
+        const recipientReply = `Thanks, I’ll set the session up for ${recipientName}. Which package would you like, and what date and time would work best?`;
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: recipientReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return recipientReply;
+      }
+    }
+
+    if (this.shouldClarifyAmbiguousDeposit(userMessage)) {
+      const ambiguousDepositReply = this.getAmbiguousDepositReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: ambiguousDepositReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return ambiguousDepositReply;
+    }
+
+    if (this.shouldConfirmRescheduleWithdrawal(userMessage, history)) {
+      const withdrawalConfirmation = 'Yes. Your original session date and time are still booked, and your deposit remains held for it.';
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: withdrawalConfirmation,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return withdrawalConfirmation;
+    }
+
+    if (this.isPostActionAcknowledgement(userMessage, history)) {
+      const acknowledgement = 'You are welcome! Let me know if you need anything else.';
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: acknowledgement,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return acknowledgement;
+    }
+
     // Deterministic status reply to prevent contradictions after booking or
     // reschedule confirmations when the customer asks if it's done.
     const bookingStatusReply = this.shouldUseBookingStatusReply(userMessage);
@@ -1489,6 +1971,54 @@ ${contextString}`;
       }
     }
 
+    if (this.shouldUseUpcomingAppointmentDetailsReply(userMessage)) {
+      const appointmentDetailsReply = await this.getUpcomingAppointmentDetailsReply(customerId);
+      if (appointmentDetailsReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: appointmentDetailsReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return appointmentDetailsReply;
+      }
+    }
+
+    if (this.shouldClarifyMixedIntent(userMessage)) {
+      const mixedIntentReply = this.getMixedIntentClarificationReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: mixedIntentReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return mixedIntentReply;
+    }
+
+    if (this.shouldUseInvoiceRequestReply(userMessage)) {
+      const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
+      const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: invoiceReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return invoiceReply;
+    }
+
       if (this.shouldUsePastAppointmentReply(userMessage) || this.isPastAppointmentFollowUp(userMessage, history)) {
         const pastAppointmentReply = await this.getPastAppointmentReply(customerId);
         if (pastAppointmentReply) {
@@ -1508,6 +2038,21 @@ ${contextString}`;
 
     // Deterministic multi-person booking clarification to avoid pricing/
     // scheduling ambiguity before booking confirmation.
+    if (this.shouldClarifyBookingForSomeoneElse(userMessage)) {
+      const bookingForSomeoneElseReply = this.getBookingForSomeoneElseReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: bookingForSomeoneElseReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return bookingForSomeoneElseReply;
+    }
+
     if (this.shouldUseMultiPersonBookingReply(userMessage)) {
       await this.captureMultiPersonBookingNote(customerId, userMessage).catch((err) => {
         console.error('Failed to capture multi-person booking note:', err);
@@ -1525,6 +2070,36 @@ ${contextString}`;
         isFallback: false,
       });
       return multiPersonReply;
+    }
+
+    if (this.shouldUsePackageBudgetReply(userMessage)) {
+      const packageBudgetReply = this.getPackageBudgetReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: packageBudgetReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return packageBudgetReply;
+    }
+
+    if (this.shouldClarifyMixedIntent(userMessage)) {
+      const mixedIntentReply = this.getMixedIntentClarificationReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: mixedIntentReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return mixedIntentReply;
     }
 
     // Deterministic resend handling: only resend payment prompts when there's
@@ -1660,6 +2235,81 @@ ${contextString}`;
       return rawFilesReply;
     }
 
+    if (this.shouldUsePreviousAddonReply(userMessage, history)) {
+      const previousAddonReply = await this.getPreviousAddonReply(customerId);
+      if (previousAddonReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: previousAddonReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return previousAddonReply;
+      }
+    }
+
+    if (this.shouldClarifyNewAddon(userMessage, history)) {
+      const addonClarification = 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.';
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: addonClarification,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return addonClarification;
+    }
+
+    if (this.isAddonListFollowUp(userMessage, history)) {
+      const additionsReply = this.getAdditionsReply();
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: additionsReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return additionsReply;
+    }
+
+    const selectedAddon = this.getSelectedAddon(userMessage);
+    if (selectedAddon) {
+      const noteResult = await this.executeAddNoteTool(
+        customerId,
+        '',
+        selectedAddon.name,
+        'special_request',
+        'addon',
+        'normal',
+        userMessage,
+        platform
+      );
+      const addonReply = noteResult.created || noteResult.reason === 'duplicate_pending_note'
+        ? this.getAddonSelectionReply(selectedAddon)
+        : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: addonReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return addonReply;
+    }
+
     // Deterministic additions & extra services response.
     if (allowDeterministicInfoReplies && this.shouldUseAdditionsReply(userMessage)) {
       const additionsReply = this.getAdditionsReply();
@@ -1776,6 +2426,22 @@ ${contextString}`;
       }
     }
 
+    if (this.shouldUseRescheduleWithdrawalReply(userMessage, history)) {
+      await this.withdrawPendingReschedule(customerId);
+      const withdrawalReply = 'Understood. We will keep your original session date and time, and your booking remains unchanged. Your deposit is still held for that session.';
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: withdrawalReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return withdrawalReply;
+    }
+
     if (this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage)) {
       const rescheduleTimeReply = await this.getRescheduleTimeReply(customerId);
       if (rescheduleTimeReply) {
@@ -1790,6 +2456,23 @@ ${contextString}`;
           isFallback: false,
         });
         return rescheduleTimeReply;
+      }
+    }
+
+    if (this.shouldUseRescheduleRequestReply(userMessage)) {
+      const rescheduleRequestReply = await this.getRescheduleTimeReply(customerId);
+      if (rescheduleRequestReply) {
+        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: rescheduleRequestReply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: true,
+          isFallback: false,
+        });
+        return rescheduleRequestReply;
       }
     }
 
@@ -1919,7 +2602,9 @@ ${contextString}`;
       }));
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
-      const fallbackReply = FALLBACK_MESSAGE;
+      const fallbackReply = isOutage
+        ? PROVIDER_OUTAGE_MESSAGE
+        : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
         failureReason: isOutage ? 'groq_daily_token_cap_reached' : String(error.message || error).slice(0, 200),
@@ -1989,9 +2674,39 @@ ${contextString}`;
     ].some((pattern) => pattern.test(normalized));
   }
 
+  private isPostActionAcknowledgement(
+    userMessage: string,
+    history: { role: 'user' | 'assistant', content: string }[]
+  ): boolean {
+    const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
+    if (!/^(ok|okay|thanks|thank you|got it|sawa|alright)( thank you)?$/.test(normalized)) return false;
+
+    return history
+      .filter((message) => message.role === 'assistant')
+      .slice(-3)
+      .some((message) => /session has been moved|rescheduled|booking remains confirmed|cancelled successfully/i.test(message.content));
+  }
+
+  private shouldConfirmRescheduleWithdrawal(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
+    if (!/^(sure|yes|yeah|yep|okay|ok)$/.test(normalized)) return false;
+
+    return history
+      .filter((message) => message.role === 'assistant')
+      .slice(-3)
+      .some((message) => /original session date and time|booking remains unchanged|deposit is still held/i.test(message.content));
+  }
+
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
     const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-    return /(?:reply\s+["â€œâ€']?yes["â€œâ€']?|if\s+that\s+works\s+for\s+you.*reply\s+["â€œâ€']?yes["â€œâ€']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm)/.test(previousAssistantMessage);
+    return /(?:reply\s+["â€œâ€']?yes["â€œâ€']?|if\s+that\s+works\s+for\s+you.*reply\s+["â€œâ€']?yes["â€œâ€']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b)/.test(previousAssistantMessage);
+    // ^ the "reply\s+[quote]?yes[quote]?" alternatives above use literal quote
+    // characters that got corrupted by a prior encoding mishap in this file and
+    // no longer match real curly/smart quotes reliably - reply\W{0,3}yes\b
+    // above is the robust replacement and is what actually matches in practice.
   }
 
   private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
@@ -2016,7 +2731,11 @@ ${contextString}`;
         oldDateTime: result.oldDateTime,
         newDateTime: result.newDateTime,
       });
-      return customerReplyTemplates.rescheduleConfirmed(result.service, dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A'));
+      return customerReplyTemplates.rescheduleConfirmed(
+        result.service,
+        dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A'),
+        result.depositForfeited
+      );
     }
 
     return null;
@@ -2292,12 +3011,13 @@ ${contextString}`;
       throw new Error('Customer name is required before proposing a booking. Ask the customer for their full name first.');
     }
 
-    let customer = await prisma.customer.findUnique({ where: { id: customerId } });
+     let customer = await prisma.customer.findUnique({ where: { id: customerId } });
+     const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (!customer) {
        customer = await prisma.customer.create({
            data: { id: customerId, name: name }
        });
-    } else if (customer.name !== name) {
+     } else if (customer.name !== name && !existingDraft?.isForSomeoneElse) {
        await prisma.customer.update({ where: { id: customerId }, data: { name }});
     }
 
@@ -2494,6 +3214,7 @@ ${contextString}`;
       newDateTime,
       oldDateTime: upcomingBooking.dateTime,
       service: upcomingBooking.service,
+      depositForfeited: this.isRescheduleWithin72Hours(upcomingBooking.dateTime),
     };
   }
 
@@ -2650,7 +3371,122 @@ ${contextString}`;
   /**
    * Logic to save a note for a customer session
    */
-  private async executeAddNoteTool(customerId: string, bookingDate: string, note: string, type: string): Promise<{ created: boolean; reason?: string; type?: string }> {
+  extractSessionNoteMetadata(note: string, type?: string, category?: string, priority?: string): {
+    normalizedType: string;
+    category: string;
+    priority: string;
+    tags: string[];
+    details: {
+      addOns: string[];
+      companions: string[];
+      accessibilityNeeds: string[];
+      stylingRequests: string[];
+      deliveryPreferences: string[];
+    };
+  } {
+    const rawNote = (note || '').trim();
+    const lower = rawNote.toLowerCase();
+
+    const addOns: string[] = [];
+    for (const item of ADDON_CATALOG) {
+      if (item.match.test(rawNote)) {
+        const itemName = item.name;
+        if (!addOns.includes(itemName)) {
+          addOns.push(itemName);
+        }
+      }
+    }
+
+    const companions = Array.from(new Set(
+      ['husband', 'wife', 'partner', 'sister', 'brother', 'mother', 'father', 'friend', 'child', 'children', 'family', 'mother-in-law', 'father-in-law', 'relative']
+        .filter((word) => lower.includes(word))
+        .map((word) => word.replace(/-in-law/g, ''))
+    ));
+
+    const accessibilityNeeds = Array.from(new Set(
+      (['wheelchair', 'mobility', 'accessible', 'accessibility', 'medical', 'allerg', 'injur', 'pregnant'] as const)
+        .filter((word) => lower.includes(word))
+        .map((word) => word === 'pregnant' ? 'pregnancy-related need' : word)
+    ));
+
+    const stylingRequests = Array.from(new Set(
+      (['wig', 'makeup', 'hair', 'outfit', 'gown', 'backdrop', 'theme', 'colour', 'color'] as const)
+        .filter((word) => lower.includes(word))
+        .map((word) => word === 'colour' || word === 'color' ? 'colour/theme request' : word)
+    ));
+
+    const deliveryPreferences = Array.from(new Set(
+      (['email', 'whatsapp', 'download link', 'delivery', 'secure link'] as const)
+        .filter((word) => lower.includes(word))
+    ));
+
+    const highlightTags = new Set<string>();
+    if (addOns.length > 0) highlightTags.add('addon');
+    if (companions.length > 0) highlightTags.add('companion');
+    if (accessibilityNeeds.length > 0) highlightTags.add('accessibility');
+    if (stylingRequests.length > 0) highlightTags.add('styling');
+    if (deliveryPreferences.length > 0) highlightTags.add('delivery');
+
+    let normalizedType = (type || 'other').trim().toLowerCase();
+    if (normalizedType === 'other') {
+      if (/(list of services|service list|show.*services|send.*services|package list|pricing)/i.test(rawNote)) {
+        normalizedType = 'action_request';
+      } else if (/(delivery preference|download link|email.*link|whatsapp.*link|thank.*for.*photo|send.*photos?)/i.test(rawNote)) {
+        normalizedType = 'special_request';
+      } else if (highlightTags.size > 0 || addOns.length > 0 || companions.length > 0 || accessibilityNeeds.length > 0) {
+        normalizedType = 'special_request';
+      }
+    }
+
+    let categoryValue = ['client_wish', 'operational', 'addon', 'accessibility', 'companion', 'styling', 'delivery', 'other'].includes(category || '')
+      ? category!
+      : addOns.length > 0
+        ? 'addon'
+        : accessibilityNeeds.length > 0
+          ? 'accessibility'
+          : companions.length > 0
+            ? 'companion'
+            : stylingRequests.length > 0
+              ? 'styling'
+              : deliveryPreferences.length > 0
+                ? 'delivery'
+                : normalizedType === 'action_request'
+                  ? 'operational'
+                  : 'client_wish';
+
+    const prioritySignals = /(urgent|asap|must|important|allerg|medical|mobility|wheelchair|emergency|cannot|can't|need.*soon)/i;
+    let priorityValue = ['normal', 'high', 'urgent'].includes(priority || '')
+      ? priority!
+      : prioritySignals.test(rawNote) || accessibilityNeeds.length > 0 || (companions.length > 0 && addOns.length > 0)
+        ? 'high'
+        : 'normal';
+
+    const tags = Array.from(highlightTags);
+    return {
+      normalizedType,
+      category: categoryValue,
+      priority: priorityValue,
+      tags,
+      details: {
+        addOns,
+        companions,
+        accessibilityNeeds,
+        stylingRequests,
+        deliveryPreferences,
+      },
+    };
+  }
+
+  private async executeAddNoteTool(
+    customerId: string,
+    bookingDate: string,
+    note: string,
+    type: string,
+    category?: string,
+    priority?: string,
+    sourceMessage?: string,
+    platform?: string
+  ): Promise<{ created: boolean; reason?: string; type?: string }> {
     const rawNote = (note || '').trim();
     if (!rawNote) {
       return { created: false, reason: 'empty_note' };
@@ -2668,14 +3504,10 @@ ${contextString}`;
       return { created: false, reason: 'non_actionable_note' };
     }
 
-    let normalizedType = (type || 'other').trim().toLowerCase();
-    if (normalizedType === 'other') {
-      if (/(list of services|service list|show.*services|send.*services|package list|pricing)/i.test(rawNote)) {
-        normalizedType = 'action_request';
-      } else if (/(delivery preference|download link|email.*link|whatsapp.*link)/i.test(rawNote)) {
-        normalizedType = 'special_request';
-      }
-    }
+    const metadata = this.extractSessionNoteMetadata(rawNote, type, category, priority);
+    const normalizedType = metadata.normalizedType;
+    const normalizedCategory = metadata.category;
+    const normalizedPriority = metadata.priority;
 
     const duplicateWindowStart = dayjs().subtract(24, 'hour').toDate();
     const duplicate = await prisma.customerSessionNote.findFirst({
@@ -2721,6 +3553,18 @@ ${contextString}`;
         description: rawNote,
         type: normalizedType,
         status: 'pending',
+        category: normalizedCategory,
+        priority: normalizedPriority,
+        actionStatus: 'open',
+        structuredData: {
+          tags: metadata.tags,
+          details: metadata.details,
+          originalType: type || 'other',
+          originalCategory: category || null,
+          originalPriority: priority || null,
+        },
+        sourceMessage,
+        platform,
       }
     });
 

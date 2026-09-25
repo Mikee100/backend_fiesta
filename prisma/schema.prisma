@@ -471,6 +471,10 @@ model CustomerSessionNote {
   type          String   // 'external_people' | 'external_items' | 'special_request' | 'other'
   items         String[] @default([]) // e.g., ["makeup artist", "photographer"]
   description   String?  // Full description or original message
+  category      String   @default("client_wish") // client_wish, operational, addon, accessibility, companion, styling, delivery, other
+  priority      String   @default("normal") // normal, high, urgent
+  actionStatus  String   @default("open") // open, acknowledged, ready, completed
+  structuredData Json?   // Optional extracted details such as quantity, colour, or named person
   
   // Booking context
   bookingId     String?

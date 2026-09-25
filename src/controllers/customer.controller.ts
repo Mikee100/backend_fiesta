@@ -248,13 +248,16 @@ export class CustomerController {
   async updateSessionNote(req: Request, res: Response) {
     try {
       const noteId = String(req.params.noteId);
-      const { status, adminNotes, reviewedBy } = req.body;
+      const { status, adminNotes, reviewedBy, category, priority, actionStatus } = req.body;
       const note = await prisma.customerSessionNote.update({
         where: { id: noteId },
         data: {
           status,
           adminNotes,
           reviewedBy,
+          category,
+          priority,
+          actionStatus,
           reviewedAt: new Date()
         }
       });
