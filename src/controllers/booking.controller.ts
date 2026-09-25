@@ -17,6 +17,21 @@ export class BookingController {
       const bookings = await prisma.booking.findMany({
         include: {
           customer: true,
+          bookingAddons: {
+            where: { status: { not: 'cancelled' } },
+            orderBy: { createdAt: 'asc' },
+            select: {
+              id: true,
+              name: true,
+              sku: true,
+              quantity: true,
+              unitPrice: true,
+              totalPrice: true,
+              status: true,
+              note: true,
+              createdAt: true,
+            }
+          },
           payments: {
             orderBy: { createdAt: 'desc' },
             select: {
@@ -271,6 +286,21 @@ export class BookingController {
           customer: {
             select: { id: true, name: true, email: true, phone: true }
           },
+          bookingAddons: {
+            where: { status: { not: 'cancelled' } },
+            orderBy: { createdAt: 'asc' },
+            select: {
+              id: true,
+              name: true,
+              sku: true,
+              quantity: true,
+              unitPrice: true,
+              totalPrice: true,
+              status: true,
+              note: true,
+              createdAt: true,
+            }
+          },
           payments: {
             orderBy: { createdAt: 'desc' },
             select: {
@@ -307,6 +337,21 @@ export class BookingController {
         include: {
           customer: {
             select: { id: true, name: true, email: true, phone: true }
+          },
+          bookingAddons: {
+            where: { status: { not: 'cancelled' } },
+            orderBy: { createdAt: 'asc' },
+            select: {
+              id: true,
+              name: true,
+              sku: true,
+              quantity: true,
+              unitPrice: true,
+              totalPrice: true,
+              status: true,
+              note: true,
+              createdAt: true,
+            }
           },
           payments: {
             orderBy: { createdAt: 'desc' },

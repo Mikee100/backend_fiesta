@@ -36,6 +36,6 @@ export const customerReplyTemplates = {
   feedbackFollowUp: (name: string) =>
     `Hi ${name}, we wanted to check in after your session. How was the experience for you? We would really value your feedback.`,
 
-  rescheduleConfirmed: (service: string, dateTime: string) =>
-    `Your ${service} session has been moved to ${dateTime}.`,
+  rescheduleConfirmed: (service: string, dateTime: string, depositForfeited = false) =>
+    `Your ${service} session has been moved to ${dateTime}.${depositForfeited ? ' Because this change was made within 72 hours, your deposit has been forfeited according to our policy.' : ''}`,
 };

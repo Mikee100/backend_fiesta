@@ -130,13 +130,26 @@ export class PaymentController {
                 dateTime: draft.dateTimeIso ? new Date(draft.dateTimeIso) : new Date(),
                 status: 'confirmed',
                 durationMinutes: duration,
-                recipientName: draft.name
+                recipientName: draft.recipientName || (draft.isForSomeoneElse ? draft.name : null)
               },
               include: { customer: true }
             });
 
             // Attach any pending add-on line items captured during the draft flow
             await bookingAddonService.attachPendingToBooking(draft.customerId, targetBooking.id);
+
+            // Keep operational notes captured before payment attached to the
+            // booking as well, so recipient and special-request context survives
+            // the draft-to-booking transition.
+            await prisma.customerSessionNote.updateMany({
+              where: {
+                customerId: draft.customerId,
+                bookingId: null,
+                status: 'pending',
+                createdAt: { gte: draft.createdAt },
+              },
+              data: { bookingId: targetBooking.id },
+            });
 
             // Delete the draft
             await prisma.bookingDraft.delete({ where: { id: draft.id } });

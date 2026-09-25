@@ -14,6 +14,36 @@ const API_VERSION = process.env.WHATSAPP_API_VERSION || 'v25.0';
 const D360_API_KEY = process.env.D360_API_KEY;
 const D360_API_BASE_URL = process.env.D360_API_BASE_URL || 'https://waba-sandbox.360dialog.io/v1';
 
+export function normalizeWhatsappText(value: string): string {
+  return value
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function shouldRetryWhatsAppError(error: any): boolean {
+  const status = error?.response?.status ?? error?.status;
+  const message = String(error?.response?.data?.error?.message ?? error?.message ?? '');
+  const code = error?.response?.data?.error?.code ?? error?.code;
+
+  return Boolean(
+    status === 408 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    code === 2 ||
+    code === 'ECONNRESET' ||
+    message.toLowerCase().includes('temporarily unavailable') ||
+    message.toLowerCase().includes('rate limit') ||
+    message.toLowerCase().includes('timeout') ||
+    message.toLowerCase().includes('connection')
+  );
+}
+
 function getRequestConfig() {
   if (PROVIDER === '360dialog') {
     return {
@@ -49,26 +79,46 @@ export class WhatsAppService {
     }
 
     const { url, headers } = getRequestConfig();
+    const bodyText = normalizeWhatsappText(text);
 
-    try {
-      const response = await axios.post(
-        url,
-        {
-          messaging_product: 'whatsapp',
-          recipient_type: 'individual',
-          to: to,
-          type: 'text',
-          text: { body: text },
-        },
-        { headers }
-      );
-
-      console.log(`WhatsApp message sent to ${to}: ${response.data.messages[0].id}`);
-      return response.data;
-    } catch (error: any) {
-      console.error('Error sending WhatsApp message:', error.response?.data || error.message);
-      throw error;
+    if (!bodyText) {
+      throw new Error('WhatsApp message body is empty after normalization');
     }
+
+    let lastError: any = null;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await axios.post(
+          url,
+          {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to,
+            type: 'text',
+            text: { body: bodyText },
+          },
+          { headers }
+        );
+
+        console.log(`WhatsApp message sent to ${to}: ${response.data.messages[0].id}`);
+        return response.data;
+      } catch (error: any) {
+        lastError = error;
+        const isTransient = shouldRetryWhatsAppError(error);
+
+        if (!isTransient || attempt === 3) {
+          console.error('Error sending WhatsApp message:', error.response?.data || error.message);
+          throw error;
+        }
+
+        const backoffMs = 250 * attempt * 2;
+        console.warn(`Transient WhatsApp send failure on attempt ${attempt}; retrying in ${backoffMs}ms`, error.response?.data || error.message);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+      }
+    }
+
+    throw lastError;
   }
 
   /**

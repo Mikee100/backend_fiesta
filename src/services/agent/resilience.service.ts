@@ -115,3 +115,6 @@ export function isProviderRateLimitError(error: any): boolean {
 
 export const FALLBACK_MESSAGE =
   "We’ve reached today’s AI conversation limit for this chat. A team member will follow up with you shortly, and we’ll continue as soon as the daily limit resets.";
+
+export const PROVIDER_OUTAGE_MESSAGE =
+  "Our AI service is temporarily unavailable. A team member will follow up with you shortly, and we’ll continue when service is restored.";

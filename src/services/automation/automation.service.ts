@@ -63,21 +63,22 @@ export class AutomationService {
   }
 
   /**
-   * Check for past bookings (5-day feedback)
+   * Check for bookings whose session time was exactly one day ago.
    */
   async processFollowups() {
     console.log('Running Automation: processFollowups');
 
-    // Find bookings that happened exactly 5 days ago (give or take an hour)
-    const fiveDaysAgoStart = nowInBusinessTimezone().subtract(5, 'day').startOf('day').toDate();
-    const fiveDaysAgoEnd = nowInBusinessTimezone().subtract(5, 'day').endOf('day').toDate();
+    // The hourly job needs a one-hour catch-up window around the 24-hour mark.
+    const now = nowInBusinessTimezone();
+    const followupWindowStart = now.subtract(25, 'hour').toDate();
+    const followupWindowEnd = now.subtract(24, 'hour').toDate();
 
     const pastBookings = await prisma.booking.findMany({
       where: {
         status: 'confirmed',
         dateTime: {
-          gte: fiveDaysAgoStart,
-          lte: fiveDaysAgoEnd
+          gte: followupWindowStart,
+          lte: followupWindowEnd
         },
         // Don't send if already sent
         followups: {
@@ -103,7 +104,7 @@ export class AutomationService {
           data: {
             bookingId: booking.id,
             type: 'feedback',
-            scheduledFor: new Date(),
+            scheduledFor: dayjs(booking.dateTime).add(1, 'day').toDate(),
             status: 'sent',
             messageContent: message,
             sentAt: new Date()
