@@ -1,4 +1,4 @@
-﻿
+
 import OpenAI from 'openai';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
@@ -8,7 +8,7 @@ import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
-import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, isProviderRateLimitError } from './resilience.service';
+import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, classifyProviderRateLimit, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
@@ -25,6 +25,10 @@ const openai = new OpenAI({
 });
 
 const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant';
+const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process.env.AI_MAX_COMPLETION_TOKENS) || 1500));
+const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
+const MAX_RAG_CONTEXT_CHUNKS = 3;
+const MAX_HISTORY_MESSAGES = 6;
 
 // --- Hybrid Booking Extractor ---
 type BookingDetails = {
@@ -33,6 +37,29 @@ type BookingDetails = {
   date?: string | null;
   time?: string | null;
 };
+
+type TokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  completionCalls: number;
+};
+
+function usageFromCompletion(response: any, completionCalls: number = 1): TokenUsage {
+  return {
+    inputTokens: response?.usage?.prompt_tokens || 0,
+    outputTokens: response?.usage?.completion_tokens || 0,
+    totalTokens: response?.usage?.total_tokens || 0,
+    completionCalls,
+  };
+}
+
+function addUsage(target: TokenUsage, usage: TokenUsage): void {
+  target.inputTokens += usage.inputTokens;
+  target.outputTokens += usage.outputTokens;
+  target.totalTokens += usage.totalTokens;
+  target.completionCalls += usage.completionCalls;
+}
 
 export class BookingExtractor {
   // ðŸ§¼ STEP 1: Clean Input
@@ -69,8 +96,15 @@ export class BookingExtractor {
       time = timeMatch[0].toLowerCase().replace(/\s/g, '');
     }
     if (dateMatch) {
-      const day = dateMatch[1];
-      const parsed = nowInBusinessTimezone().date(Number(day));
+      const day = Number(dateMatch[1]);
+      const now = nowInBusinessTimezone();
+      let parsed = now.date(day);
+      // If the resolved date is already in the past, the customer almost
+      // certainly means the same day-of-month in the next calendar month
+      // (e.g. "3rd" said on Sep 30 → Oct 3, not Sep 3).
+      if (parsed.isValid() && parsed.isBefore(now, 'day')) {
+        parsed = now.add(1, 'month').date(day);
+      }
       if (parsed.isValid()) {
         date = parsed.format('YYYY-MM-DD');
       }
@@ -85,7 +119,7 @@ export class BookingExtractor {
   }
 
   // ðŸ¤– STEP 3: AI Extraction (STRICT JSON)
-  private async aiExtract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
+  private async aiExtract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     const response = await openai.chat.completions.create({
       model: CHAT_MODEL,
@@ -102,7 +136,8 @@ export class BookingExtractor {
         },
         { role: 'user', content: message }
       ],
-      temperature: 0
+      temperature: 0,
+      max_completion_tokens: MAX_EXTRACTOR_COMPLETION_TOKENS,
     });
     let details: BookingDetails = {};
     try {
@@ -110,7 +145,7 @@ export class BookingExtractor {
     } catch {
       details = {};
     }
-    return { details, tokensUsed: response.usage?.total_tokens || 0 };
+    return { details, usage: usageFromCompletion(response) };
   }
 
   // ðŸ”¥ FINAL HYBRID METHOD
@@ -122,21 +157,25 @@ export class BookingExtractor {
     return /\b(\d{1,2})(st|nd|rd|th)?\b|\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b|\b(am|pm)\b|\bbook|\bschedule|\bappointment|\bsession|\bpackage|\bbloom|\bmuse|\bicon|\blegend|\bqueen|\bempress|\bgoddess|\bresched|\bcancel|\bdeposit|\bmpesa|\bpay/i.test(text);
   }
 
-  async extract(message: string): Promise<{ details: BookingDetails; tokensUsed: number }> {
+  private needsAiExtraction(message: string): boolean {
+    const text = message.toLowerCase();
+    const rescheduleSignal = /\b(reschedule|change|move|postpone)\b/.test(text);
+    const hasDateSignal = /\b\d{1,2}(st|nd|rd|th)?\b|\b\d{4}-\d{2}-\d{2}\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
+    const hasTimeSignal = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
+    return rescheduleSignal && hasDateSignal && hasTimeSignal;
+  }
+
+  async extract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const regex = this.regexExtract(message);
     console.log('Regex result:', regex);
     if (regex.name && regex.service && regex.date && regex.time) {
-      return { details: regex, tokensUsed: 0 };
+      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
     }
-    // Skip the AI extraction call entirely if the message has no booking signals.
-    // The main agent LLM handles all conversation; this extractor is only used
-    // for the propose_reschedule guard - skipping it saves tokens and halves
-    // latency on pure informational messages.
-    if (!this.hasBookingSignals(message)) {
-      console.log('No booking signals detected - skipping AI extractor call.');
-      return { details: regex, tokensUsed: 0 };
+    if (!this.needsAiExtraction(message)) {
+      console.log('No reschedule date/time extraction needed - skipping AI extractor call.');
+      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
     }
-    const { details: ai, tokensUsed } = await this.aiExtract(message);
+    const { details: ai, usage } = await this.aiExtract(message);
     console.log('AI result:', ai);
     return {
       details: {
@@ -145,7 +184,7 @@ export class BookingExtractor {
         date: regex.date || ai.date,
         time: regex.time || ai.time
       },
-      tokensUsed
+      usage
     };
   }
 }
@@ -177,10 +216,63 @@ export class AgentService {
     );
   }
 
-  private async createCompletionWithToolNameGuard(params: any, allowedToolNames: string[]) {
+  /** Provider rejects the turn when the model emits a tool call while no tools were exposed. */
+  private isToolCallWithoutToolsError(error: any): boolean {
+    const message = String(error?.error?.message || error?.message || '').toLowerCase();
+    return (
+      error?.status === 400 &&
+      error?.code === 'tool_use_failed' &&
+      message.includes('tool choice is none')
+    );
+  }
+
+  private async createCompletionWithToolNameGuard(
+    params: any,
+    allowedToolNames: string[],
+    fallbackTools?: OpenAI.Chat.Completions.ChatCompletionTool[]
+  ): Promise<{ response: any; completionCalls: number }> {
     try {
-      return await openai.chat.completions.create(params);
+      return { response: await openai.chat.completions.create(params), completionCalls: 1 };
     } catch (error: any) {
+      if (this.isToolCallWithoutToolsError(error)) {
+        console.warn('Retrying completion after tool call was emitted with no tools exposed.');
+        if (fallbackTools && fallbackTools.length > 0) {
+          try {
+            return {
+              response: await openai.chat.completions.create({
+                ...params,
+                tools: fallbackTools,
+                tool_choice: 'auto',
+              }),
+              completionCalls: 2,
+            };
+          } catch (toolRetryError: any) {
+            console.warn('Retry with fallback tools failed:', toolRetryError?.message);
+          }
+        }
+
+        try {
+          const { tools: _tools, tool_choice: _toolChoice, ...toollessParams } = params;
+          return {
+            response: await openai.chat.completions.create({
+              ...toollessParams,
+              messages: [
+                ...params.messages,
+                {
+                  role: 'system',
+                  content: 'CRITICAL: No tools are available this turn. Do NOT emit a tool or function call. Reply to the customer in plain text only, and ask for any missing booking details instead of looking them up.'
+                }
+              ],
+              temperature: 0,
+            }),
+            completionCalls: 2,
+          };
+        } catch (textRetryError: any) {
+          console.error('Toolless retry failed after model emitted tool call:', textRetryError?.message);
+          throw error;
+        }
+      }
+
       if (!this.isToolNameValidationError(error)) {
         throw error;
       }
@@ -213,11 +305,14 @@ export class AgentService {
         }
       ];
 
-      return await openai.chat.completions.create({
-        ...params,
-        messages: retryMessages,
-        temperature: 0,
-      });
+      return {
+        response: await openai.chat.completions.create({
+          ...params,
+          messages: retryMessages,
+          temperature: 0,
+        }),
+        completionCalls: 2,
+      };
     }
   }
 
@@ -228,15 +323,79 @@ export class AgentService {
   // customer's existing upcoming-booking date from context) even when the
   // customer only asked an info question and stated no new date/time at all.
   private messageContainsExplicitDateTimeSignal(message: string): boolean {
-    const text = message.toLowerCase();
-    const hasDateSignal = /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(st|nd|rd|th)?\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
-    const hasTimeSignal = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
-    return hasDateSignal && hasTimeSignal;
+    return this.messageContainsExplicitDateSignal(message) && this.messageContainsExplicitTimeSignal(message);
   }
 
-  private getAuthoritativeRequestedDate(userMessage: string, proposedDate: string, extractedDate?: string | null): string {
+  private messageContainsExplicitDateSignal(message: string): boolean {
+    const text = message.toLowerCase();
+    return /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(st|nd|rd|th)?\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
+  }
+
+  private messageContainsExplicitTimeSignal(message: string): boolean {
+    const text = message.toLowerCase();
+    return /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
+  }
+
+  private shouldResolvePackageSelectionImmediately(userMessage: string): boolean {
+    return this.conversationFlows.isPackageSelection(userMessage)
+      && !this.messageContainsExplicitDateSignal(userMessage);
+  }
+
+  private getAuthoritativeRequestedDate(
+    userMessage: string,
+    proposedDate: string,
+    extractedDate?: string | null,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): string {
     const hasDayOfMonth = /\b\d{1,2}(st|nd|rd|th)?\b/.test(userMessage.toLowerCase());
-    return hasDayOfMonth && extractedDate ? extractedDate : proposedDate;
+    if (!hasDayOfMonth) {
+      const weekdayDate = this.getContextualBookingWeekdayDate(userMessage, history);
+      return weekdayDate || proposedDate;
+    }
+    if (!extractedDate) return proposedDate;
+    // Guard: never let a past extracted date override the LLM's future proposed
+    // date. A past extractedDate almost always means the regex picked up the
+    // wrong calendar month (e.g. Sep 3 when the customer meant Oct 3).
+    const extractedIsInPast = dayjs(extractedDate).isBefore(dayjs(), 'day');
+    if (extractedIsInPast) return proposedDate;
+    return extractedDate;
+  }
+
+  private getContextualBookingWeekdayDate(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): string | null {
+    const weekdayPattern = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+    const bookingContextPattern = /\b(slots?|availability|available|booking|book|session|appointment|schedule)\b/i;
+    const contextualText = weekdayPattern.test(userMessage)
+      ? userMessage
+      : [...history].reverse().find((message) =>
+        bookingContextPattern.test(message.content) && weekdayPattern.test(message.content)
+      )?.content;
+    const weekdayName = contextualText?.match(weekdayPattern)?.[1]?.toLowerCase();
+    if (!weekdayName) return null;
+
+    const weekdays: Record<string, number> = {
+      sunday: 0,
+      monday: 1,
+      tuesday: 2,
+      wednesday: 3,
+      thursday: 4,
+      friday: 5,
+      saturday: 6,
+    };
+    const weekday = weekdays[weekdayName];
+    const explicitDate = contextualText?.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0];
+    if (explicitDate && dayjs(explicitDate).isValid() && dayjs(explicitDate).day() === weekday) {
+      return explicitDate;
+    }
+
+    const now = nowInBusinessTimezone();
+    let date = now.day(weekday);
+    if (date.isBefore(now, 'day') || (date.isSame(now, 'day') && /\bnext\b/i.test(contextualText || ''))) {
+      date = date.add(7, 'day');
+    }
+    return date.format('YYYY-MM-DD');
   }
 
   private shouldUseRescheduleRequestReply(userMessage: string): boolean {
@@ -319,7 +478,7 @@ export class AgentService {
   }
 
   private getBusinessIntroductionReply(): string {
-    return 'Fiesta House is a photography studio in Parklands, Nairobi, specialising in maternity, newborn and family sessions. We help plan the look of the shoot, guide you through posing, handle the photography, and deliver your edited photos afterwards. For maternity sessions, we can also help with makeup, styling and outfit choices so you feel comfortable in front of the camera. Is there one part of the experience you want to know more about?';
+    return 'Welcome to Fiesta House! We are a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family portraiture. We take care of everything—from our curated client gown closet and professional hair & makeup to gentle posing guidance so you feel relaxed and radiant in front of the camera. What kind of photoshoot are you planning?';
   }
 
   private shouldUseBookingProcessReply(userMessage: string): boolean {
@@ -347,26 +506,90 @@ export class AgentService {
     return match ? match[0].toUpperCase() : null;
   }
 
+  private extractInvoiceSessionDateRange(userMessage: string): { start: Date; end: Date } | null {
+    const monthPattern = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+    const match = userMessage.match(new RegExp(`\\b(?:(\\d{1,2})(?:st|nd|rd|th)?[\\s/-]+${monthPattern}|${monthPattern}[\\s/-]+(\\d{1,2})(?:st|nd|rd|th)?)(?:,?\\s+(\\d{4}))?\\b`, 'i'));
+    if (!match) return null;
+
+    const day = Number(match[1] || match[4]);
+    const monthName = (match[2] || match[3]).slice(0, 3).toLowerCase();
+    const month = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(monthName);
+    if (month < 0 || day < 1 || day > 31) return null;
+
+    const year = Number(match[5] || nowInBusinessTimezone().year());
+    const start = nowInBusinessTimezone().year(year).month(month).date(day).startOf('day');
+    if (start.year() !== year || start.month() !== month || start.date() !== day) return null;
+
+    return { start: start.toDate(), end: start.add(1, 'day').toDate() };
+  }
+
   private shouldUseInvoiceRequestReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     const invoiceKeywords = /(invoice|receipt|payment summary)/.test(text);
-    const actionKeywords = /(send|sent|share|download|get|view|need|can you|could you)/.test(text);
+    const actionKeywords = /(send|sent|share|download|get|give(?: me)?|provide|view|need|can you|could you)/.test(text);
     return invoiceKeywords && actionKeywords;
   }
 
-  private async sendStoredInvoiceToCustomer(customerId: string, requestedInvoiceNumber?: string): Promise<string> {
-    const invoice = requestedInvoiceNumber
-      ? await prisma.invoice.findFirst({
+  private async sendStoredInvoiceToCustomer(
+    customerId: string,
+    requestedInvoiceNumber?: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = [],
+    userMessage = ''
+  ): Promise<string> {
+    const requestedSessionDate = this.extractInvoiceSessionDateRange(userMessage);
+    const refersToPastAppointment = !requestedInvoiceNumber && [...history].reverse()
+      .find((message) => message.role === 'assistant')?.content
+      .includes('The most recent past booking I have on record is');
+    const pastBooking = refersToPastAppointment
+      ? await prisma.booking.findFirst({
+          where: { customerId, status: { not: 'cancelled' }, dateTime: { lt: new Date() } },
+          orderBy: { dateTime: 'desc' },
+          select: { id: true },
+        })
+      : null;
+
+    let invoice;
+    if (requestedInvoiceNumber) {
+      invoice = await prisma.invoice.findFirst({
           where: { customerId, invoiceNumber: requestedInvoiceNumber },
           include: { booking: true },
-        })
-      : await prisma.invoice.findFirst({
+        });
+    } else if (requestedSessionDate) {
+      const bookingOnDate = await prisma.booking.findFirst({
+        where: {
+          customerId,
+          status: { not: 'cancelled' },
+          dateTime: { gte: requestedSessionDate.start, lt: requestedSessionDate.end },
+        },
+        orderBy: { dateTime: 'desc' },
+        select: { id: true },
+      });
+      if (bookingOnDate) {
+        invoice = await prisma.invoice.findUnique({
+          where: { bookingId: bookingOnDate.id },
+          include: { booking: true },
+        });
+      }
+    } else if (pastBooking) {
+      invoice = await prisma.invoice.findUnique({
+            where: { bookingId: pastBooking.id },
+            include: { booking: true },
+          });
+    } else {
+      invoice = await prisma.invoice.findFirst({
           where: { customerId },
           orderBy: { createdAt: 'desc' },
           include: { booking: true },
         });
+    }
 
     if (!invoice) {
+      if (requestedSessionDate) {
+        return "I couldn't find a saved invoice for a session on that date, so I haven't sent another session's invoice.";
+      }
+      if (refersToPastAppointment) {
+        return "I couldn't find an invoice saved for your most recent past session. I don't want to send you the wrong session's invoice, so please ask the team to check that booking.";
+      }
       if (requestedInvoiceNumber) {
         return `I could not find invoice ${requestedInvoiceNumber} under your account. Please confirm the invoice number or ask the team to resend it.`;
       }
@@ -415,6 +638,11 @@ export class AgentService {
   private shouldClarifyMixedIntent(userMessage: string): boolean {
     if (this.shouldUseUpcomingAppointmentDetailsReply(userMessage)) return false;
     const text = userMessage.toLowerCase();
+    const invoiceForSession = this.shouldUseInvoiceRequestReply(userMessage)
+      && /\b(session|shoot|appointment|booking)\b/.test(text)
+      && !/\b(book|schedule|reschedule|cancel)\b/.test(text);
+    if (invoiceForSession) return false;
+
     const hasInvoice = /(invoice|receipt|payment summary)/.test(text);
     const hasPackage = /(package|session|shoot|service|edition|the bloom|the icon|the empress|the royal|gold|platinum|vip|vvip)/.test(text);
     const hasDate = /(next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|\b\d{1,2}(?:st|nd|rd|th)?\b|tomorrow|today|weekend)/.test(text);
@@ -462,6 +690,36 @@ export class AgentService {
   /** Collapse unicode dashes so regexes written with "-" still match model output. */
   private normalizeHyphens(value: string): string {
     return value.replace(/[\u2010-\u2015\u2212]/g, '-');
+  }
+
+  private shouldExposeTools(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[],
+    platform: string
+  ): boolean {
+    if (platform !== 'whatsapp' && platform !== 'web') return false;
+
+    if (this.messageContainsExplicitDateSignal(userMessage) || this.messageContainsExplicitTimeSignal(userMessage)) {
+      return true;
+    }
+
+    const text = userMessage.toLowerCase();
+    const explicitAction = /\b(book|schedule|reschedule|change|move|postpone|cancel|confirm|check\s+(?:availability|available\s+(?:slots|times))|availability|available\s+slots|reserve|hold\s+(?:a\s+)?(?:date|slot)|resend|send\s+(?:the\s+)?(?:payment|m-?pesa)|pay\s+(?:the\s+)?(?:deposit|balance)|add\s+(?:an?\s+)?(?:add-on|extra)|bringing|coming\s+with)\b/.test(text);
+    const deliveryPreferenceAction = /\b(?:prefer|save|set|use|send|receive|deliver)\b.{0,35}\b(?:email|whatsapp|download\s+link|delivery)\b/.test(text);
+    if (explicitAction || deliveryPreferenceAction) {
+      return true;
+    }
+
+    const givesExplicitTime = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{2}:\d{2}\b/i.test(text);
+    const recentlyAskedForTime = history.slice(-2).some((message) =>
+      message.role === 'assistant' && /\b(?:what time|which time|preferred time|time would work)\b/i.test(message.content)
+    );
+    return givesExplicitTime && recentlyAskedForTime;
+  }
+
+  private customerReference(customerId: string): string {
+    const digits = customerId.replace(/\D/g, '');
+    return digits ? `***${digits.slice(-4)}` : 'unknown';
   }
 
   /** Exact add-on pricing injected into the system prompt so the model cannot invent it. */
@@ -572,6 +830,56 @@ export class AgentService {
     return mentionsAnotherPerson && bookingContext && jointSessionSignal;
   }
 
+  private getStudioPolicyReply(userMessage: string): string | null {
+    const text = userMessage.toLowerCase();
+
+    if (/\b(nude|semi[-\s]?nude)\b/.test(text) && /\b(session|shoot|maternity|portrait|photo)\b/.test(text)) {
+      return 'Yes, nude and semi-nude maternity portraits are available. We handle them with professionalism and privacy so you can feel comfortable throughout the session.';
+    }
+
+    if (/\b(couple|partner|husband|wife|children|kids|family)\b/.test(text) && /\b(session|shoot|join|include|come|attend)\b/.test(text)) {
+      return 'Your partner and children are welcome to join your maternity session. We will guide poses that include everyone beautifully.';
+    }
+
+    if (/(late\s+night|late-night|evening)/.test(text) && /\b(sessions?|shoot|booking|open|slot)\b/.test(text)) {
+      return 'Our studio hours are 9 AM to 7 PM, and we are closed on Mondays, so we do not offer late-night sessions.';
+    }
+
+    return null;
+  }
+
+  private getOutOfScopeReply(userMessage: string): string | null {
+    const text = userMessage.toLowerCase();
+    const medicalOrExplicitQuestion = /\b(fertile|fertility|ovulat(?:e|ion|ing)|fertili[sz](?:e|ation)|conceiv(?:e|ing)|conception|sperm|semen|viable\s+egg|egg\s+viab|miscarriage|medication|diagnos(?:is|e)|treatment|contraception|pregnancy\s+(?:complication|symptom)|reproductive\s+health|sexual\s+health|have\s+(?:unprotected\s+)?sex|fuck|sex\s+to\s+(?:get\s+)?pregnant|good\s+seeds|are\s+you\s+into\s+sex|horny)\b/.test(text);
+    const professionalAdviceRequest = /\b(?:legal|financial|investment|tax)\s+advice\b|\bshould\s+i\s+(?:invest|take\s+out\s+a\s+loan)\b|\b(?:lawsuit|lawyer|attorney)\b/.test(text);
+    const explicitSexualRequest = /\b(talk\s+dirty|dirty\s+talk|sexual\s+roleplay)\b/.test(text);
+
+    if (explicitSexualRequest) return 'I’ll keep things professional here, but I can definitely help you plan your Fiesta House shoot.';
+    if (!medicalOrExplicitQuestion && !professionalAdviceRequest) return null;
+
+    return 'That’s outside my studio brief; a qualified professional is the right person to ask. I’m here if you need help with a shoot or booking.';
+  }
+
+  private isClearlyUnrelatedRequest(userMessage: string): boolean {
+    const text = userMessage.toLowerCase().trim();
+    return /\b(tell\s+(?:me\s+)?a\s+joke|capital\s+of|president\s+of|meaning\s+of\s+life|politics?|election|weather|sports?|football|recipe|cook(?:ing)?|program(?:ming)?|code|crypto|bitcoin|stock\s+market|girlfriend|boyfriend|dating|relationship\s+advice)\b/.test(text);
+  }
+
+  private getScopeBoundaryReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): string | null {
+    const studioPolicyReply = this.getStudioPolicyReply(userMessage);
+    if (studioPolicyReply) return studioPolicyReply;
+
+    const outOfScopeReply = this.getOutOfScopeReply(userMessage);
+    if (outOfScopeReply) return outOfScopeReply;
+
+    if (!this.isClearlyUnrelatedRequest(userMessage)) return null;
+
+    return 'I’m your Fiesta House studio assistant, so I stick to shoots and bookings. If you need help with a session, I’m happy to help.';
+  }
+
   private shouldClarifyBookingForSomeoneElse(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
@@ -635,9 +943,14 @@ export class AgentService {
   private shouldUseUpcomingAppointmentDetailsReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) return false;
+    if (this.shouldUseLastAppointmentDetailsReply(userMessage)) return false;
     if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
     if (/\bwhat(?:'s| is| are)?\b.*\b(included|in|on|booked for)\b.*\b(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
     return /\b(any|what|more|tell me about)\b.*\b(details?|information|shoot|session|appointment|booking)\b|\b(details?|information)\b.*\b(session|shoot|appointment|booking)\b/.test(text);
+  }
+
+  private shouldUseLastAppointmentDetailsReply(userMessage: string): boolean {
+    return /\b(last|previous|most recent)\s+(session|shoot|appointment|booking)\b/i.test(userMessage);
   }
 
   private formatBookingDuration(durationMinutes?: number | null): string {
@@ -649,7 +962,22 @@ export class AgentService {
     return `${hours} hour${hours === 1 ? '' : 's'} ${remainder} minutes`;
   }
 
-  private async getUpcomingAppointmentDetailsReply(customerId: string): Promise<string | null> {
+  private wasUpcomingAppointmentDetailsJustProvided(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const previousUserMessage = [...history].reverse().find((message) => message.role === 'user')?.content;
+    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return Boolean(
+      previousUserMessage
+      && this.shouldUseUpcomingAppointmentDetailsReply(previousUserMessage)
+      && /\b(session|booking|appointment)\b/i.test(previousAssistantMessage)
+    );
+  }
+
+  private async getUpcomingAppointmentDetailsReply(
+    customerId: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): Promise<string | null> {
     const booking = await prisma.booking.findFirst({
       where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
       orderBy: { dateTime: 'asc' },
@@ -674,17 +1002,57 @@ export class AgentService {
     const bookerName = booking.customer?.name?.trim() || '';
     const recipientName = booking.recipientName?.trim() || '';
     const isSelfBooking = !recipientName || recipientName.toLowerCase() === bookerName.toLowerCase();
-    const recipient = isSelfBooking
-      ? ''
-      : ` This session is for ${recipientName}${bookerName ? `; ${bookerName} is the booking customer.` : '.'}`;
-    const addons = booking.bookingAddons.length > 0
-      ? ` Add-ons: ${booking.bookingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`).join(', ')}.`
-      : '';
-    const paymentText = payment
-      ? ` Deposit paid: Ksh ${payment.amount.toLocaleString()} and the booking is confirmed.`
-      : ' The booking is confirmed.';
+    const date = localDateTime.format('dddd, D MMMM YYYY');
+    const time = localDateTime.format('h:mm A');
+    const recipient = isSelfBooking ? '' : ` for ${recipientName}`;
+    const extras = booking.bookingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`);
+    const extrasText = extras.length > 0 ? ` Your saved extras are ${extras.join(' and ')}.` : '';
+    const confirmation = payment ? ' It is confirmed, and your deposit has been paid.' : ' Your booking is confirmed.';
+    const duration = this.formatBookingDuration(booking.durationMinutes);
 
-    return `Your ${booking.service} session is on ${localDateTime.format('dddd, D MMMM YYYY')} at ${localDateTime.format('h:mm A')}. It is scheduled for ${this.formatBookingDuration(booking.durationMinutes)}. Location: 4th Avenue, Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi.${recipient}${addons}${paymentText}`;
+    if (this.wasUpcomingAppointmentDetailsJustProvided(history)) {
+      return `It’s the same session we just discussed: ${booking.service} on ${date} at ${time}${recipient}. It runs for ${duration} at our Parklands studio.${extrasText}${confirmation}`;
+    }
+
+    return `Your ${booking.service} session is on ${date} at ${time}${recipient}. It runs for ${duration} at our Parklands studio.${extrasText}${confirmation}`;
+  }
+
+  private async getLastAppointmentDetailsReply(customerId: string): Promise<string> {
+    const booking = await prisma.booking.findFirst({
+      where: {
+        customerId,
+        status: { not: 'cancelled' },
+        dateTime: { lt: new Date() },
+      },
+      orderBy: { dateTime: 'desc' },
+      select: {
+        service: true,
+        dateTime: true,
+        durationMinutes: true,
+        recipientName: true,
+        bookingAddons: {
+          where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
+          orderBy: { createdAt: 'asc' },
+          select: { name: true, quantity: true },
+        },
+      },
+    });
+
+    if (!booking) return "I don't see a past booking on record yet. Are you asking about your upcoming session?";
+
+    const localDateTime = inBusinessTimezone(booking.dateTime);
+    const details = [
+      `Date: ${localDateTime.format('dddd, D MMMM YYYY')} at ${localDateTime.format('h:mm A')}`,
+      ...(booking.durationMinutes ? [`Duration: ${this.formatBookingDuration(booking.durationMinutes)}`] : []),
+      ...(booking.recipientName ? [`Booked for: ${booking.recipientName}`] : []),
+    ];
+
+    if (booking.bookingAddons.length > 0) {
+      details.push('Add-ons recorded:');
+      details.push(...booking.bookingAddons.map((addon) => `- ${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`));
+    }
+
+    return `The most recent past booking I have on record is ${booking.service}.\n${details.join('\n')}\n\nDoes that sound like the session you mean?`;
   }
 
   private async getUpcomingAppointmentTimeReply(customerId: string): Promise<string | null> {
@@ -744,61 +1112,61 @@ export class AgentService {
 
     let badge = '';
     if (lowerName.includes('empress')) {
-      badge = ' âœ¨ *(Signature Edition â€” Most Loved)*';
+      badge = ' (Signature Edition - Most Loved)';
     } else if (lowerName.includes('goddess')) {
-      badge = ' ðŸ‘‘ *(Flagship Edition)*';
+      badge = ' (Flagship Edition)';
     }
 
     const items: string[] = [];
-    if (pkg.duration) items.push(`â±ï¸ ${pkg.duration}`);
-    if (pkg.images > 0) items.push(`ðŸ“¸ ${pkg.images} final edited photos`);
-    if (pkg.makeup) items.push('ðŸ’„ Professional makeup');
+    if (pkg.duration) items.push(`Session length: ${pkg.duration}`);
+    if (pkg.images > 0) items.push(`${pkg.images} final edited photos`);
+    if (pkg.makeup) items.push('Professional makeup');
 
     if (pkg.outfits > 0) {
       if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-        items.push(`ðŸ‘— ${pkg.outfits} studio outfits + styling (incl. Power Suit)`);
+        items.push(`${pkg.outfits} studio outfits with styling, including the Power Suit`);
       } else {
-        items.push(`ðŸ‘— ${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} + styling`);
+        items.push(`${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} with styling`);
       }
     }
 
     if (pkg.wig) {
       if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-        items.push('ðŸ’‡â€â™€ï¸ 2 styled wigs');
+        items.push('2 styled wigs');
       } else {
-        items.push('ðŸ’‡â€â™€ï¸ 1 styled wig');
+        items.push('1 styled wig');
       }
     }
 
     if (pkg.balloonBackdrop) {
       if (lowerName.includes('goddess')) {
-        items.push('ðŸŽˆ Custom balloon backdrop or Goddess Sculpture Set');
+        items.push('Custom balloon backdrop or Goddess Sculpture Set');
       } else {
-        items.push('ðŸŽˆ Custom balloon backdrop with flowers');
+        items.push('Custom balloon backdrop with flowers');
       }
     }
 
     if (lowerName.includes('goddess')) {
-      items.push('ðŸŽ¬ 1 professionally produced Reel');
+      items.push('1 professionally produced Reel');
     }
 
     if (pkg.photobook) {
       const size = pkg.photobookSize ? ` (${pkg.photobookSize})` : '';
-      items.push(`ðŸ“š Photobook hardcover${size}`);
+      items.push(`Hardcover photobook${size}`);
     }
 
     if (pkg.mount) {
       if (lowerName.includes('goddess')) {
-        items.push('ðŸ–¼ï¸ 1 A2 fine art mount');
+        items.push('1 A2 fine art mount');
       } else {
-        items.push('ðŸ–¼ï¸ 1 A3 fine art mount');
+        items.push('1 A3 fine art mount');
       }
     }
 
-    return `ðŸŒ¸ *${pkg.name}* â€” *Ksh ${pkg.price.toLocaleString()}*${badge}\n${items.map((item) => `  â€¢ ${item}`).join('\n')}`;
+    return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}${badge}\n${items.map((item) => `- ${item}`).join('\n')}`;
   }
 
-  private async getPackageCatalogReply(): Promise<string | null> {
+  private async getPackageCatalogReply(showInclusions = false): Promise<string | null> {
     try {
       const packages = await prisma.package.findMany({
         orderBy: [{ price: 'asc' }, { name: 'asc' }],
@@ -821,7 +1189,11 @@ export class AgentService {
       if (!packages.length) return null;
 
       const cards = packages.map((pkg) => this.buildPackageCard(pkg));
-      return `âœ¨ *Fiesta House Maternity â€” Rate Card 2026* âœ¨\n\nHere are our maternity packages:\n\n${cards.join('\n\n')}\n\nIf one catches your eye, let me know! I can share more details or help check available shoot dates for you. ðŸ’–`;
+      const introduction = showInclusions ? 'Here is what each package includes:' : 'Here are our maternity packages:';
+      const closing = showInclusions
+        ? 'If one stands out, I can help you choose a date for it.'
+        : 'Tell me which package you are considering, and I can explain its inclusions or help check available dates.';
+      return `Fiesta House Maternity - Rate Card 2026\n\n${introduction}\n\n${cards.join('\n\n')}\n\n${closing}`;
     } catch (err) {
       console.error('Failed to build package catalog reply:', err);
       return null;
@@ -1140,23 +1512,23 @@ export class AgentService {
 
   private getBespokeReply(): string {
     return [
-      'âœ¨ *Bespoke Experiences* âœ¨',
+      'Bespoke Experiences',
       '',
       'For the mother whose vision does not fit inside a package, we design custom experiences by consultation.',
       '',
-      'Reach out to our team to begin the conversation, and we will craft a session around your unique story. ðŸ’–'
+      'Reach out to our team to begin the conversation, and we will craft a session around your unique story.'
     ].join('\n');
   }
 
   private getTravellingMothersReply(): string {
     return [
-      'âœˆï¸ *For Our Travelling Mothers* ðŸŒ¸',
+      'For Our Travelling Mothers',
       '',
       'For mothers journeying to us from beyond Nairobi, we curate the full arrival.',
       '',
-      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge â€” so all you carry with you is your presence.',
+      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge, so all you carry with you is your presence.',
       '',
-      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you. ðŸ’–'
+      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you.'
     ].join('\n');
   }
 
@@ -1324,11 +1696,28 @@ export class AgentService {
     }
   }
 
-  private getSystemPrompt(businessContext: string, platform: string): string {
+  getInstructionGuide(): string {
+    return this.getSystemPrompt('', 'whatsapp');
+  }
+
+  private getSystemPrompt(
+    businessContext: string,
+    platform: string,
+    includePackagePricing = true,
+    includeAddonPricing = true
+  ): string {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
+    const packagePricing = includePackagePricing
+      ? 'The Editions are THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 (Most Loved / Signature), and THE GODDESS: Ksh 120,000 (Flagship).'
+      : 'Use package prices only when present in Business Context; if unavailable, offer to confirm with the team rather than guess.';
+    const addonPricing = includeAddonPricing
+      ? this.getAddonPricingLine()
+      : 'Use exact add-on prices only when present in Business Context; if unavailable, offer to confirm with the team rather than guess.';
     return `Current Date/Time: ${now}
-You are the official AI assistant for Fiesta House Attire & Maternity.
-Your goal is to answer customer questions accurately and help them make bookings.
+You are the dedicated Studio Concierge & Host for Fiesta House Attire & Maternity, a premier luxury maternity, newborn, and family photography studio in Parklands, Nairobi.
+Your purpose is to provide warm, consultative, and effortless guidance—helping expecting mothers and families feel celebrated, pampered, and completely at ease as they plan and book their photography sessions.
+
+Conversation process (internal; do not narrate): Understand the customer's vision and intent from the full conversation history. Decide whether a tool is needed, provide consultative guidance with genuine warmth, and proactively guide them toward the next natural step in their booking journey. Treat follow-ups with continuous context and care.
 
 Business Context and Customer History:
 ${businessContext}
@@ -1344,6 +1733,7 @@ A4. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel th
 A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. If the customer already has a confirmed booking or Payment Status indicates their deposit was paid, NEVER tell the customer that their payment is pending, and never ask them to enter their PIN again. Confirm warmly that their payment has been received and their session is confirmed.
 A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done.
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
+A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
 
 [B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
 B1. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
@@ -1361,20 +1751,20 @@ B5. SESSION NOTES - USE JUDGEMENT ON WHAT'S WORTH SAVING: use 'add_session_note'
 [C] BUSINESS KNOWLEDGE (answer from this, then tool results, then escalate)
 C1. INFORMATION PRIORITY ORDER: answer customer questions using, in this order: (1) the Business Context provided above, (2) the customer's own Upcoming/Past Booking or payment context provided above, (3) results actually returned by a tool call this turn. If none of these answer the question, follow C2. Never invent facts, prices, or policies that aren't present in one of these three sources.
 C2. If none of the above answers their question, politely let them know you'll have a human team member follow up.
-C3. RATE CARD 2026 & ACTIVE OFFERINGS: Our active packages are "THE EDITIONS" (THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 - Most Loved / Signature, THE GODDESS: Ksh 120,000 - Flagship). Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked "anything new in the business" or about our offerings, proudly present our Rate Card 2026 Editions, Additions & Extra Services (extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture set, Reels), Bespoke Experiences, or Concierge Services for Travelling Mothers. NEVER state that legacy packages are our current lineup. NEVER use the word "standard" as a generic stand-in for "our packages" (e.g. never say "we only have our standard packages available") - "Standard" is itself a retired legacy package name and using it this way is confusing; say "our packages" or "our Editions" instead.
-C3b. ADD-ON PRICES - THESE ARE THE ONLY CORRECT FIGURES, QUOTE THEM EXACTLY: ${this.getAddonPricingLine()} When a customer asks what add-ons are available, list every one of these with its exact price. NEVER write "price varies", "varies by package", or any other placeholder for an add-on that has a fixed price above, and never invent an add-on that is not on this list. Add-ons are settled with the balance, not the deposit.
+C3. RATE CARD 2026 & ACTIVE OFFERINGS: ${packagePricing} Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked about current offerings, describe THE EDITIONS; additions include extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture Set, and Reels; Bespoke Experiences; or Concierge Services for Travelling Mothers. Never present legacy names as current packages or use "standard" generically for the lineup.
+C3b. ADD-ON PRICES: These are the only exact prices to quote: ${addonPricing} When asked what add-ons are available, list their prices accurately; never invent a price or say a fixed-price item "varies". Add-ons are settled with the balance, not the deposit.
 C4. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
 C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"
 
 [D] CONVERSATION STYLE
-D1. IDENTITY & NAME HANDLING: If you know the customer's name, greet them by name. If the Customer Name is "Unknown" or "WhatsApp User", ask for their real full name naturally within the flow of the first or second reply (e.g. "By the way, what name should I put down for you?"), and update how you address them once they provide it. You MUST have their real name before proposing any booking - never invent or reuse a placeholder name.
-D2. VOICE: You are a thoughtful, capable studio assistant having a real conversation, not a chatbot reading a script. Many customers are expectant mothers planning an important photo session: be warm, calm, and personally attentive without being overly familiar or assuming anything they have not said. Start by responding directly to what the customer just said. Use plain, everyday language and contractions. Prefer one or two short sentences; ask one clear question only when you genuinely need an answer. Do not use canned openers such as "Sure thing", "Absolutely", "No worries", or "I understand" unless they add genuine meaning. Do not restate the customer's message, narrate obvious steps, or repeat options they have already seen.
-D3. SOUND LIKE A PERSON, NOT A TEMPLATE: Vary your sentence structure, word choice, and phrasing from message to message - never reuse the exact same sentence, opener, or closing question twice in one conversation, even if the underlying situation is similar. React to the specific thing the customer said rather than falling back on a generic all-purpose reply. If you notice you are about to write something that reads like a form letter or an FAQ entry, rephrase it as something you would actually text a person.
-D4. FORMAT: Write messages as natural WhatsApp text. Do not use markdown, numbered lists, headings, or menus unless the customer explicitly asks for a list or needs to choose between more than two genuinely valid options. Never offer a menu of actions merely because one was mentioned earlier; answer the current message in context. When explaining a multi-step process (e.g. how booking works, what happens after the shoot), describe it as flowing prose in one or two natural sentences instead of a numbered checklist - only use a numbered or bulleted list if the customer explicitly asks for "steps" or "a list".
-D5. LENGTH: Messages on some platforms have length limits, and walls of text feel robotic - aim to keep responses under 800 characters when possible, but never cut a booking confirmation, payment detail, or other important explanation short just to hit that number.
-D6. OWN ERRORS: If a previous reply gave incorrect or impossible guidance, correct it plainly and briefly. Do not defend, repeat, or ask the customer to follow an invalid option.
-D7. EXAMPLE: For "Tell me about the business first", do not send a brochure or a package list. Say something like: "Fiesta House creates maternity, newborn and family photo sessions in Parklands, Nairobi. We handle the styling, makeup and photography so you can feel comfortable and enjoy the experience. Are you mainly looking into a maternity session?" Use this as a style example only; facts must still come from the Business Context.
-D8. PROACTIVE CLOSING, WHEN APPROPRIATE: After answering a pure informational question (e.g. location, price, package details, phone number), it's often good to end with a single warm, open-ended question that moves the conversation forward - for example asking whether they'd like to check availability, what stage their pregnancy is at, or which package caught their eye. This is a preference, not a rule to force every time: skip it for quick factual/support exchanges where it would feel like you're selling rather than helping (e.g. simply confirming opening hours), and never add it once the customer has already confirmed their booking, reschedule, or cancellation.`;
+D1. IDENTITY & NAME HANDLING: Greet clients warmly by name whenever known. If the Customer Name is "Unknown" or "WhatsApp User", ask for their name with genuine hospitality (e.g. "By the way, what name should I put down for you?"), and address them naturally once provided. You MUST have their real name before proposing any booking - never invent or reuse a placeholder name.
+D2. VOICE: Be warm, gracious, capable, and attentive—like a dedicated personal concierge at a luxury photography studio. Maternity and newborn milestones are celebratory life events; share their excitement and speak with genuine care and reassurance.
+D3. CONTEXT & VARIATION: Read recent turns, resolve references, acknowledge repeats, and vary phrasing. Avoid robotic canned openers, parroting, narration, repeated wording, and rigid menus. Speak consultatively—highlighting what makes each session special (styling from our gown closet, professional hair & makeup, partner joining).
+D4. FORMAT: Use plain WhatsApp text that is easy and inviting to read on mobile, typically 2 to 4 comfortable sentences. Use a list only when specifically requested or genuinely clearer; never dump irrelevant context fields.
+D5. LENGTH: Aim for concise, well-paced replies (under 800 characters) that provide helpful substance without overwhelming the customer or sounding like an abrupt robot.
+D6. OWN ERRORS: Correct previous incorrect guidance plainly and briefly with polite grace; do not defend or repeat it.
+D7. BUSINESS INTRODUCTION EXAMPLE: Describe Fiesta House as a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family sessions. Mention our curated client gown closet, professional hair & makeup pampering, and relaxed posing guidance naturally rather than giving a brochure. Use only facts in Business Context.
+D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step invitation or question (e.g. offering to check open dates or reserve a slot). Keep it genuine and caring rather than aggressive, and skip it once a booking, reschedule, or cancellation is confirmed.`;
   }
 
 
@@ -1383,7 +1773,8 @@ D8. PROACTIVE CLOSING, WHEN APPROPRIATE: After answering a pure informational qu
    * DB errors, etc.) - callers should go through handleMessage, which wraps
    * this with the circuit breaker, rate limiting, and a safe fallback.
    */
-  private async runAgent(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<{ content: string; tokensUsed: number }> {
+  private async runAgent(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<{ content: string; tokensUsed: number; failureType?: string }> {
+    const modelRunStartedAt = Date.now();
     // 1. Fetch Customer and Booking History for Memory
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
@@ -1456,11 +1847,10 @@ D8. PROACTIVE CLOSING, WHEN APPROPRIATE: After answering a pure informational qu
       : 'No prior interaction history - this looks like a new customer.';
 
     // 2. Retrieve RAG Context
-    const relevantKnowledge = await knowledgeRetrieval.search(userMessage, 10);
+    const relevantKnowledge = await knowledgeRetrieval.search(userMessage, MAX_RAG_CONTEXT_CHUNKS);
     const contextString = relevantKnowledge.map(k => k.content).join('\n---\n');
 
-    const fullContext = `Customer Phone: ${customerId}
-Customer Name: ${customerName}
+    const fullContext = `Customer Name: ${customerName}
   Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
 Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
 Payment Status: ${paymentSummary}
@@ -1471,19 +1861,25 @@ Business Context:
 ${contextString}`;
 
     // 3. Build conversation history
+    const recentConversation = [...history.slice(-MAX_HISTORY_MESSAGES).map((message) => message.content), userMessage]
+      .join('\n')
+      .toLowerCase();
+    const includePackagePricing = /\b(package|edition|bloom|muse|icon|legend|queen|empress|goddess|rate\s*card|pricing|price|cost|how\s+much|cheapest|affordable)\b/.test(recentConversation);
+    const includeAddonPricing = /\b(add-?ons?|extras?|extra\s+(?:outfit|photo|makeup)|styled\s+wig|wig\s+hire|power\s+suit|sculpture\s+set|balloon\s+backdrop|reel\s+pricing)\b/.test(recentConversation);
+
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: 'system', content: this.getSystemPrompt(fullContext, platform) },
-      ...history,
+      { role: 'system', content: this.getSystemPrompt(fullContext, platform, includePackagePricing, includeAddonPricing) },
+      ...history.slice(-MAX_HISTORY_MESSAGES),
       { role: 'user', content: userMessage }
     ];
 
     // 3. Hybrid Extraction (for logging/debug, we'll let LLM handle the tool calls)
     const extractor = new BookingExtractor();
-    const { details: extracted, tokensUsed: extractorTokens } = await extractor.extract(userMessage);
+    const { details: extracted, usage: extractorUsage } = await extractor.extract(userMessage);
     console.log('Extracted details:', extracted);
 
     // 4. Define the tools the AI can use
-    const allTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+    const availableTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       {
         type: 'function',
         function: {
@@ -1505,7 +1901,7 @@ ${contextString}`;
     ];
 
     if (platform === 'whatsapp' || platform === 'web') {
-      allTools.push(
+      availableTools.push(
         {
           type: 'function',
           function: {
@@ -1597,6 +1993,7 @@ ${contextString}`;
       );
     }
 
+    const allTools = this.shouldExposeTools(userMessage, history, platform) ? availableTools : [];
     const allowedToolNames = allTools
       .map((tool) => tool.type === 'function' ? tool.function.name : '')
       .filter((name): name is string => !!name);
@@ -1605,16 +2002,19 @@ ${contextString}`;
     // then book), so the model can legitimately want to chain more than one
     // tool call in a single turn - loop until it returns plain text instead of
     // assuming a single round. A hard cap prevents a runaway loop.
-    let tokensUsed = extractorTokens;
-    const MAX_TOOL_ROUNDS = 5;
-    let currentResponse = await this.createCompletionWithToolNameGuard({
+    const usage: TokenUsage = { ...extractorUsage };
+    let toolCalls = 0;
+    const MAX_TOOL_ROUNDS = 3;
+    const completionParams = {
       model: CHAT_MODEL,
       messages,
-      tools: allTools,
-      tool_choice: 'auto',
-      temperature: 0.3
-    }, allowedToolNames);
-    tokensUsed += currentResponse.usage?.total_tokens || 0;
+      temperature: 0.3,
+      max_completion_tokens: MAX_AGENT_COMPLETION_TOKENS,
+      ...(allTools.length > 0 ? { tools: allTools, tool_choice: 'auto' as const } : {}),
+    };
+    let completion = await this.createCompletionWithToolNameGuard(completionParams, allowedToolNames, availableTools);
+    let currentResponse = completion.response;
+    addUsage(usage, usageFromCompletion(currentResponse, completion.completionCalls));
 
     let rounds = 0;
     let proposedThisTurn = false; // blocks confirm_booking if propose_booking (even a re-propose with changed details) ran earlier in this same turn
@@ -1626,6 +2026,7 @@ ${contextString}`;
 
       for (const toolCall of responseMessage.tool_calls!) {
         if (toolCall.type === 'function') {
+          toolCalls++;
           const functionName = toolCall.function.name;
           let args: any = {};
           let toolResponse: string;
@@ -1649,7 +2050,7 @@ ${contextString}`;
               toolResponse = `ERROR: A booking/reschedule was already confirmed earlier in this same turn. The task is done - stop calling booking tools and just tell the customer it's confirmed.`;
             }
             else if (functionName === 'propose_booking') {
-              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date);
+              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date, history);
               const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${requestedDate}T${args.time}`);
               proposedThisTurn = true;
               toolResponse = `PROPOSED (not yet charged): ${args.service} on ${requestedDate} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "Great, I can hold ${args.service} for ${requestedDate} at ${args.time}. The deposit is KSH ${result.depositAmount}. If that works for you, just reply yes and I'll send the M-Pesa prompt." Do NOT call confirm_booking in this same turn.`;
@@ -1726,7 +2127,7 @@ ${contextString}`;
               }
             }
             else if (functionName === 'get_available_slots') {
-              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date);
+              const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date, history);
               const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k));
               if (!serviceKey) {
                 toolResponse = `ERROR: "${args.service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these.`;
@@ -1776,19 +2177,40 @@ ${contextString}`;
         }
       }
 
-      currentResponse = await this.createCompletionWithToolNameGuard({
-        model: CHAT_MODEL,
+      if (allTools.length === 0 && currentResponse.choices[0].message.tool_calls) {
+        completionParams.tools = availableTools;
+        completionParams.tool_choice = 'auto';
+      }
+
+      completion = await this.createCompletionWithToolNameGuard({
+        ...completionParams,
         messages,
-        tools: allTools,
-        tool_choice: 'auto',
-        temperature: 0.3
-      }, allowedToolNames);
-      tokensUsed += currentResponse.usage?.total_tokens || 0;
+      }, allowedToolNames, availableTools);
+      currentResponse = completion.response;
+      addUsage(usage, usageFromCompletion(currentResponse, completion.completionCalls));
     }
 
+    const modelContent = currentResponse.choices[0].message.content?.trim() || '';
+    const emptyResponse = modelContent.length === 0;
+    console.info('[AGENT_USAGE]', JSON.stringify({
+      customerRef: this.customerReference(customerId),
+      model: CHAT_MODEL,
+      completionCalls: usage.completionCalls,
+      toolCalls,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      totalTokens: usage.totalTokens,
+      latencyMs: Date.now() - modelRunStartedAt,
+      rateLimited: false,
+      failureType: emptyResponse ? 'empty_model_response' : null,
+    }));
+
     return {
-      content: this.formatCustomerReply(currentResponse.choices[0].message.content || "I'm sorry, I couldn't process that."),
-      tokensUsed,
+      content: emptyResponse
+        ? 'Sorry, I lost the thread there. Could you tell me a little more about what you need?'
+        : this.formatCustomerReply(modelContent),
+      tokensUsed: usage.totalTokens,
+      ...(emptyResponse ? { failureType: 'empty_model_response' } : {}),
     };
   }
 
@@ -1801,6 +2223,10 @@ ${contextString}`;
   async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
     const startedAt = Date.now();
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
+    const allowDeterministicInfoReplies = !naturalAssistantMode;
+
+    const scopeBoundaryReply = this.getScopeBoundaryReply(userMessage, history);
+    if (scopeBoundaryReply) return scopeBoundaryReply;
 
     console.log('[AGENT_FLOW] handleMessage start:', JSON.stringify({
       customerId,
@@ -1919,7 +2345,9 @@ ${contextString}`;
     }
 
     if (this.isPostActionAcknowledgement(userMessage, history)) {
-      const acknowledgement = 'You are welcome! Let me know if you need anything else.';
+      const acknowledgement = this.previousMessageRequestsConfirmation(history)
+        ? 'No rush. Let me know when you are ready to go ahead.'
+        : 'You are welcome. I am here if you need anything else.';
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,
@@ -1971,8 +2399,23 @@ ${contextString}`;
       }
     }
 
+    if (this.shouldUseLastAppointmentDetailsReply(userMessage)) {
+      const lastAppointmentReply = await this.getLastAppointmentDetailsReply(customerId);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: lastAppointmentReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return lastAppointmentReply;
+    }
+
     if (this.shouldUseUpcomingAppointmentDetailsReply(userMessage)) {
-      const appointmentDetailsReply = await this.getUpcomingAppointmentDetailsReply(customerId);
+      const appointmentDetailsReply = await this.getUpcomingAppointmentDetailsReply(customerId, history);
       if (appointmentDetailsReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
         await this.logConversationLearning({
@@ -2005,7 +2448,7 @@ ${contextString}`;
 
     if (this.shouldUseInvoiceRequestReply(userMessage)) {
       const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
-      const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined);
+      const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined, history, userMessage);
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,
@@ -2072,7 +2515,7 @@ ${contextString}`;
       return multiPersonReply;
     }
 
-    if (this.shouldUsePackageBudgetReply(userMessage)) {
+    if (this.shouldUsePackageBudgetReply(userMessage) && allowDeterministicInfoReplies) {
       const packageBudgetReply = this.getPackageBudgetReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -2085,21 +2528,6 @@ ${contextString}`;
         isFallback: false,
       });
       return packageBudgetReply;
-    }
-
-    if (this.shouldClarifyMixedIntent(userMessage)) {
-      const mixedIntentReply = this.getMixedIntentClarificationReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: mixedIntentReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return mixedIntentReply;
     }
 
     // Deterministic resend handling: only resend payment prompts when there's
@@ -2123,10 +2551,9 @@ ${contextString}`;
 
     // In natural assistant mode, keep critical guardrails deterministic but
     // let low-risk informational replies be generated naturally by the LLM.
-    const allowDeterministicInfoReplies = !naturalAssistantMode;
     const informationalFlow = this.conversationFlowHandler.resolveInformationalFlow(userMessage, history);
 
-    if (informationalFlow === 'business_introduction') {
+    if (informationalFlow === 'business_introduction' && allowDeterministicInfoReplies) {
       const businessIntroductionReply = this.getBusinessIntroductionReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -2141,7 +2568,7 @@ ${contextString}`;
       return businessIntroductionReply;
     }
 
-    if (informationalFlow === 'weekday') {
+    if (informationalFlow === 'weekday' && allowDeterministicInfoReplies) {
       const weekdayReply = this.getWeekdayReply(userMessage, history);
       if (weekdayReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -2158,7 +2585,7 @@ ${contextString}`;
       }
     }
 
-    if (informationalFlow === 'website') {
+    if (informationalFlow === 'website' && allowDeterministicInfoReplies) {
       const websiteReply = this.getWebsiteReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -2173,7 +2600,7 @@ ${contextString}`;
       return websiteReply;
     }
 
-    if (informationalFlow === 'contact_details') {
+    if (informationalFlow === 'contact_details' && allowDeterministicInfoReplies) {
       const contactDetailsReply = this.getContactDetailsReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -2188,7 +2615,7 @@ ${contextString}`;
       return contactDetailsReply;
     }
 
-    if (informationalFlow === 'portfolio') {
+    if (informationalFlow === 'portfolio' && allowDeterministicInfoReplies) {
       const portfolioReply = this.getPortfolioReply();
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
@@ -2428,7 +2855,7 @@ ${contextString}`;
 
     if (this.shouldUseRescheduleWithdrawalReply(userMessage, history)) {
       await this.withdrawPendingReschedule(customerId);
-      const withdrawalReply = 'Understood. We will keep your original session date and time, and your booking remains unchanged. Your deposit is still held for that session.';
+      const withdrawalReply = 'Understood! We will keep your original session date and time, and your booking remains unchanged. Your deposit is still held for that session. Let us know if you need anything else preparing for your shoot!';
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,
@@ -2493,7 +2920,7 @@ ${contextString}`;
       }
     }
 
-    if (this.conversationFlows.isPackageSelection(userMessage)) {
+    if (this.shouldResolvePackageSelectionImmediately(userMessage) && allowDeterministicInfoReplies) {
       const selectionReply = await this.getPackageSelectionReply(customerId, userMessage);
       if (selectionReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -2510,7 +2937,7 @@ ${contextString}`;
       }
     }
 
-    if (this.conversationFlows.isPackageAdviceRequest(userMessage)) {
+    if (this.conversationFlows.isPackageAdviceRequest(userMessage) && allowDeterministicInfoReplies) {
       const adviceReply = await this.getPackageAdviceReply(userMessage);
       if (adviceReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -2527,8 +2954,9 @@ ${contextString}`;
       }
     }
 
-    if (this.conversationFlows.isPackageCatalogRequest(userMessage)) {
-      const catalogReply = await this.getPackageCatalogReply();
+    if (this.conversationFlows.isPackageCatalogRequest(userMessage, history)) {
+      const showInclusions = this.conversationFlows.isPackageInclusionFollowUp(userMessage, history);
+      const catalogReply = await this.getPackageCatalogReply(showInclusions);
       if (catalogReply) {
         await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
         await this.logConversationLearning({
@@ -2570,7 +2998,7 @@ ${contextString}`;
 
     try {
       console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
-      const { content, tokensUsed } = await this.runAgent(customerId, userMessage, history, platform);
+      const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
       console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
         customerId,
         tokensUsed,
@@ -2578,6 +3006,26 @@ ${contextString}`;
       }));
       circuitBreaker.recordSuccess();
       await this.recordTokenUsage(customerId, tokensUsed);
+      if (failureType) {
+        await this.logAiJobMetric({
+          customerId,
+          platform,
+          success: false,
+          isFallback: true,
+          failureReason: failureType,
+          latencyMs: Date.now() - startedAt,
+        });
+        await this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: content,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: false,
+          isFallback: true,
+        });
+        return content;
+      }
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,
@@ -2592,13 +3040,25 @@ ${contextString}`;
       return content;
     } catch (error: any) {
       console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
+      const rateLimitType = classifyProviderRateLimit(error);
       console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({
-        customerId,
+        customerRef: this.customerReference(customerId),
         errorName: error?.name,
-        errorMessage: error?.message,
         status: error?.status,
         code: error?.code,
-        isRateLimit: isProviderRateLimitError(error)
+        rateLimitType,
+      }));
+      console.info('[AGENT_USAGE]', JSON.stringify({
+        customerRef: this.customerReference(customerId),
+        model: CHAT_MODEL,
+        completionCalls: null,
+        toolCalls: null,
+        inputTokens: null,
+        outputTokens: null,
+        totalTokens: null,
+        latencyMs: Date.now() - startedAt,
+        rateLimited: rateLimitType !== null,
+        failureType: rateLimitType || 'agent_pipeline_failure',
       }));
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
@@ -2607,7 +3067,7 @@ ${contextString}`;
         : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
       await this.logAiJobMetric({
         customerId, platform, success: false, isFallback: true,
-        failureReason: isOutage ? 'groq_daily_token_cap_reached' : String(error.message || error).slice(0, 200),
+        failureReason: rateLimitType || String(error.message || error).slice(0, 200),
         circuitBreakerTrip: justTripped,
         circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
         latencyMs: Date.now() - startedAt
@@ -2621,11 +3081,10 @@ ${contextString}`;
         wasSuccessful: false,
         isFallback: true,
       });
-      // The Groq account-wide daily cap is a total outage affecting every
-      // customer, not this one - flag it distinctly (and rate-limited) so it
-      // doesn't get buried among normal per-customer escalations.
-      if (isOutage && shouldNotifyOutage()) {
+      if (rateLimitType === 'daily_tpd_exhausted' && shouldNotifyOutage()) {
         await this.escalate(customerId, 'error', `AI PROVIDER OUTAGE: Groq's daily token limit has been reached - ALL customers are currently getting the fallback message, not just this one. It resets on its own; check console.groq.com/settings/billing if this keeps recurring. Original error: ${error.message}`);
+      } else if (rateLimitType === 'transient_rate_limit' && shouldNotifyOutage()) {
+        await this.escalate(customerId, 'error', `AI PROVIDER RATE LIMIT: requests are being limited. No automatic retry was attempted. Original error: ${error.message}`);
       } else if (justTripped && !isOutage) {
         await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
       }
@@ -2679,12 +3138,14 @@ ${contextString}`;
     history: { role: 'user' | 'assistant', content: string }[]
   ): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
-    if (!/^(ok|okay|thanks|thank you|got it|sawa|alright)( thank you)?$/.test(normalized)) return false;
+    const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good)(?:\s+(?:thanks|thank you))?$/.test(normalized);
+    if (!isAcknowledgement) return false;
 
-    return history
-      .filter((message) => message.role === 'assistant')
-      .slice(-3)
-      .some((message) => /session has been moved|rescheduled|booking remains confirmed|cancelled successfully/i.test(message.content));
+    const awaitingConfirmation = this.previousMessageRequestsConfirmation(history);
+    const includesThanks = /\b(thanks|thank you)\b/.test(normalized);
+    if (awaitingConfirmation && !includesThanks && /^(?:ok|okay|alright|sawa)$/.test(normalized)) return false;
+
+    return true;
   }
 
   private shouldConfirmRescheduleWithdrawal(

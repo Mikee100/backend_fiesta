@@ -108,9 +108,25 @@ export function shouldNotifyOutage(): boolean {
   return true;
 }
 
-/** Detects the specific "whole Groq account is out of daily tokens" error shape. */
+export type ProviderRateLimitType = 'daily_tpd_exhausted' | 'transient_rate_limit' | null;
+
+export function classifyProviderRateLimit(error: any): ProviderRateLimitType {
+  const status = error?.status ?? error?.response?.status;
+  const code = error?.code ?? error?.error?.code ?? error?.response?.data?.error?.code;
+  if (status !== 429 && code !== 'rate_limit_exceeded') return null;
+
+  const message = String(error?.message ?? error?.error?.message ?? error?.response?.data?.error?.message ?? '').toLowerCase();
+  const headers = error?.headers ?? error?.response?.headers ?? {};
+  const tokenLimit = String(headers['x-ratelimit-limit-tokens'] ?? headers['x-ratelimit-reset-tokens'] ?? '').toLowerCase();
+  if (message.includes('tokens per day') || message.includes('(tpd)') || message.includes('daily token') || tokenLimit.includes('day')) {
+    return 'daily_tpd_exhausted';
+  }
+
+  return 'transient_rate_limit';
+}
+
 export function isProviderRateLimitError(error: any): boolean {
-  return error?.status === 429 || error?.code === 'rate_limit_exceeded' || error?.error?.code === 'rate_limit_exceeded';
+  return classifyProviderRateLimit(error) !== null;
 }
 
 export const FALLBACK_MESSAGE =
