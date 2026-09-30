@@ -530,6 +530,11 @@ test('links to the dedicated Suspending Concept gallery after a contextual visua
 
   assert.match(reply, /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/);
   assert.equal(agent.getSuspendingConceptGalleryReply('Where can I see this idea?', []), null);
+  assert.equal(agent.getSuspendingConceptGalleryReply('Show me the packages', history), null);
+  assert.match(
+    agent.getSuspendingConceptGalleryReply('Show me some pictures', history),
+    /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/
+  );
 });
 
 test('links review and testimonial page requests to the reviews page', () => {

@@ -1628,7 +1628,10 @@ export class AgentService {
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
   ): string | null {
-    const asksToSeeExample = /\b(where\s+(?:can|could|do)\s+i\s+(?:see|view)|can\s+i\s+see|show\s+me|see\s+this\s+(?:idea|concept))\b/i.test(userMessage);
+    if (/\b(packages?|editions?|price list|pricing)\b/i.test(userMessage)) return null;
+
+    const asksToSeeExample = /\b(where\s+(?:can|could|do)\s+i\s+(?:see|view)|can\s+i\s+see|see\s+this\s+(?:idea|concept))\b/i.test(userMessage)
+      || /\bshow\s+me\b.{0,24}\b(gallery|photos?|pictures?|images?|examples?|concept)\b/i.test(userMessage);
     if (!asksToSeeExample) return null;
 
     const mentionsConcept = /suspending\s+concept/i.test(userMessage)
