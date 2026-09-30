@@ -43,6 +43,16 @@ export class AutomationService {
 
         await whatsappService.sendMessage(booking.customer.id, message);
 
+        await prisma.message.create({
+          data: {
+            content: message,
+            platform: 'whatsapp',
+            direction: 'outbound',
+            customerId: booking.customer.id,
+            handledBy: 'system'
+          }
+        });
+
         // Record reminder
         await prisma.bookingReminder.create({
           data: {

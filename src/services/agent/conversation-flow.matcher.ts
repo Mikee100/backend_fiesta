@@ -4,8 +4,34 @@ export type ConversationMessage = {
 };
 
 export class ConversationFlowMatcher {
-  isPackageCatalogRequest(message: string): boolean {
-    return /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages|tell\s+me\s+about\s+(the\s+)?(packages|services)|packages?\s+(or|and)\s+services)/.test(message.toLowerCase());
+  isPackageCatalogRequest(message: string, history: ConversationMessage[] = []): boolean {
+    const text = message.toLowerCase().trim();
+    const explicitCatalogRequest = /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages|tell\s+me\s+about\s+(the\s+)?(packages|services)|packages?\s+(or|and)\s+services|what\s+does\s+each\s+(package|edition)\s+(include|come\s+with))/i.test(text);
+    if (explicitCatalogRequest || this.isPackageInclusionFollowUp(message, history)) return true;
+
+    const contextualFollowUp = /^(?:tell\s+me\s+about\s+(?:them|those)|what\s+about\s+(?:them|those)|can\s+you\s+tell\s+me\s+about\s+(?:them|those))\s*[?.!]*$/.test(text);
+    if (!contextualFollowUp) return false;
+
+    const recentAssistantMessages = history
+      .filter((entry) => entry.role === 'assistant')
+      .slice(-3);
+    return recentAssistantMessages.some((entry) => /\bpackages?\b|\bservices?\b|\beditions\b/i.test(entry.content));
+  }
+
+  isPackageInclusionFollowUp(message: string, history: ConversationMessage[] = []): boolean {
+    const text = message.toLowerCase().trim();
+    const asksWhatEachIncludes = /^(?:so\s+)?what\s+(?:does|do)\s+each(?:\s+one)?\s+(?:come\s+with|include|includes)\s*[?.!]*$|^what\s+comes\s+with\s+each\s*[?.!]*$|^what(?:'s|\s+is)\s+included\s+(?:in|with)\s+each\s*[?.!]*$/.test(text);
+    if (!asksWhatEachIncludes) return false;
+
+    const recentAssistantMessages = history
+      .filter((entry) => entry.role === 'assistant')
+      .slice(-3)
+      .map((entry) => entry.content.toLowerCase());
+    const packageNamesMentioned = ['the bloom', 'the muse', 'the icon', 'the legend', 'the queen', 'the empress', 'the goddess']
+      .filter((name) => recentAssistantMessages.some((content) => content.includes(name)));
+
+    return packageNamesMentioned.length >= 2
+      || recentAssistantMessages.some((content) => /all (?:the )?(?:current )?(?:packages|editions)/.test(content));
   }
 
   isPackageAdviceRequest(message: string): boolean {

@@ -20,6 +20,7 @@ import { notificationEvents } from './src/services/notifications/notification.se
 import dotenv from 'dotenv';
 import { validateStartupEnv } from './src/config/env-validation';
 import { knowledgeRetrieval } from './src/services/knowledge/retrieval.service';
+import { agentService } from './src/services/agent/agent.service';
 
 // Load .env only if it exists (for local dev)
 dotenv.config();
@@ -134,6 +135,10 @@ app.use('/api/customers', customerRoutes);
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/mpesa', paymentRoutes);
+
+app.get('/api/ai-instructions', (_req, res) => {
+  res.json({ instructions: agentService.getInstructionGuide() });
+});
 
 // Calendar Routes
 app.get('/api/calendar/events', calendarController.getEvents.bind(calendarController));

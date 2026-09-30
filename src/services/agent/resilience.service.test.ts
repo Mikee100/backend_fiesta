@@ -1,6 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scoreSentiment, circuitBreaker } from './resilience.service';
+import { scoreSentiment, circuitBreaker, classifyProviderRateLimit } from './resilience.service';
+
+test('classifies a Groq daily TPD response without treating it as retryable work', () => {
+  const error = {
+    status: 429,
+    code: 'rate_limit_exceeded',
+    message: 'Rate limit reached on tokens per day (TPD). Limit: 200000. Used: 198975.',
+  };
+
+  assert.equal(classifyProviderRateLimit(error), 'daily_tpd_exhausted');
+});
+
+test('classifies other provider 429 responses separately from daily TPD exhaustion', () => {
+  assert.equal(classifyProviderRateLimit({ status: 429, code: 'rate_limit_exceeded', message: 'Too many requests' }), 'transient_rate_limit');
+});
 
 test('scoreSentiment: neutral message scores non-negative', () => {
   const { score, sentiment } = scoreSentiment('What time do you open?');

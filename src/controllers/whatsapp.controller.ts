@@ -4,6 +4,7 @@ import { whatsappService } from '../services/messaging/whatsapp.service';
 import { whatsappTemplatesService } from '../services/messaging/whatsapp-templates.service';
 import * as messageDebouncer from '../services/messaging/debounce.service';
 import prisma from '../config/prisma';
+import { retryOnPrismaDisconnect } from '../utils/prisma-retry';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -188,12 +189,12 @@ export class WhatsAppController {
   private async processPendingTurn(customerId: string): Promise<void> {
     try {
       console.log(`[WHATSAPP_TURN] Starting turn processing for customer ${customerId}`);
-      const lastOutbound = await prisma.message.findFirst({
+      const lastOutbound = await retryOnPrismaDisconnect(prisma, () => prisma.message.findFirst({
         where: { customerId, platform: 'whatsapp', direction: 'outbound' },
         orderBy: { createdAt: 'desc' }
-      });
+      }));
 
-      const pendingInbound = await prisma.message.findMany({
+      const pendingInbound = await retryOnPrismaDisconnect(prisma, () => prisma.message.findMany({
         where: {
           customerId,
           platform: 'whatsapp',
@@ -201,7 +202,7 @@ export class WhatsAppController {
           ...(lastOutbound ? { createdAt: { gt: lastOutbound.createdAt } } : {})
         },
         orderBy: { createdAt: 'asc' }
-      });
+      }));
 
       if (pendingInbound.length === 0) {
         console.log(`[WHATSAPP_TURN] No pending inbound messages for ${customerId}`);
@@ -215,11 +216,11 @@ export class WhatsAppController {
         messageIds: pendingInbound.map(m => m.id)
       }));
 
-      const recentMessages = await prisma.message.findMany({
+      const recentMessages = await retryOnPrismaDisconnect(prisma, () => prisma.message.findMany({
         where: { customerId, createdAt: { lt: pendingInbound[0].createdAt } },
         orderBy: { createdAt: 'desc' },
-        take: 10
-      });
+        take: 6
+      }));
       const history = recentMessages.reverse().map(m => ({
         role: (m.direction === 'inbound' ? 'user' : 'assistant') as 'user' | 'assistant',
         content: m.content
@@ -241,7 +242,10 @@ export class WhatsAppController {
 
       await whatsappService.sendMessage(customerId, aiReply);
     } catch (error: any) {
-      console.error('Error processing debounced WhatsApp turn:', error);
+      console.error('Error processing debounced WhatsApp turn:', {
+        code: error?.code,
+        message: error?.message || error,
+      });
     }
   }
 
