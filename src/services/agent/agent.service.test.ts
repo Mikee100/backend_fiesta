@@ -3,6 +3,8 @@ import test from 'node:test';
 import axios from 'axios';
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
+import { bookingAddonService } from '../booking/booking-addon.service';
+import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
@@ -427,6 +429,56 @@ test('recognizes an add-on selection without restarting booking', () => {
 
   assert.equal(addon?.sku, 'wig_hire');
   assert.match(agent.getAddonSelectionReply(addon), /Styled wig hire|Ksh 4,000|not the deposit/i);
+  assert.equal(agent.getSelectedAddon('add an extra professional make-up for me as an add on')?.sku, 'extra_makeup');
+  assert.equal(agent.getSelectedAddon('lets include the suspenind concep')?.sku, 'suspending_concept');
+});
+
+test('persists the common Suspending Concept misspelling as its priced add-on', async () => {
+  const originalFindFirst = prisma.bookingAddon.findFirst;
+  const originalCreate = prisma.bookingAddon.create;
+  let createdAddon: any;
+  (prisma.bookingAddon.findFirst as any) = async () => null;
+  (prisma.bookingAddon.create as any) = async ({ data }: any) => {
+    createdAddon = data;
+    return data;
+  };
+
+  try {
+    const createdCount = await bookingAddonService.createFromNote({
+      customerId: 'customer-123',
+      bookingId: 'booking-123',
+      note: 'lets include the suspenind concep',
+    });
+
+    assert.equal(createdCount, 1);
+    assert.equal(createdAddon.sku, 'suspending_concept');
+    assert.equal(createdAddon.name, 'Suspending Concept');
+    assert.equal(createdAddon.unitPrice, 7000);
+    assert.equal(createdAddon.totalPrice, 7000);
+  } finally {
+    prisma.bookingAddon.findFirst = originalFindFirst;
+    prisma.bookingAddon.create = originalCreate;
+  }
+});
+
+test('resolves an affirmative reply to a single offered paid add-on', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'Professional makeup is included in your THE ICON package. If you’d like an extra makeup touch-up or a second set of looks, we can add that for Ksh 3,500. Just let me know!'
+  }];
+  const addon = agent.getSelectedAddon('yess thats what i want', history);
+
+  assert.equal(addon?.sku, 'extra_makeup');
+  assert.match(agent.getAddonSelectionReply(addon), /Extra professional makeup.*Ksh 3,500/);
+});
+
+test('does not infer a specific add-on from a general list or vague affirmation', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'Here are the add-ons we offer: extra makeup, styled wig hire, or extra edited photos. Let me know if any interest you.'
+  }];
+
+  assert.equal(agent.getSelectedAddon('yes', history), null);
 });
 
 test('routes previous add-on questions to booking history', () => {
@@ -528,11 +580,96 @@ test('routes invoice requests to stored PDF delivery instead of a fabricated inv
   );
 });
 
+test('routes a not-received invoice follow-up to stored invoice delivery', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'Your updated invoice has just been sent to your WhatsApp.'
+  }];
+
+  assert.equal(agent.shouldUseInvoiceRequestReply('I have not received it..send it to me', history), true);
+  assert.equal(agent.shouldUseInvoiceRequestReply('I have not received it..send it to me', []), false);
+});
+
+test('refreshes an existing invoice with newly selected priced add-ons', async () => {
+  const originals = {
+    bookingFindUnique: prisma.booking.findUnique,
+    invoiceFindUnique: prisma.invoice.findUnique,
+    packageFindFirst: prisma.package.findFirst,
+    paymentFindMany: prisma.payment.findMany,
+    invoiceUpdate: prisma.invoice.update,
+    sumForBooking: bookingAddonService.sumForBooking,
+    markInvoiced: bookingAddonService.markInvoiced,
+    generatePdf: invoiceService.generatePdf,
+  };
+  const existingInvoice = {
+    id: 'invoice-1',
+    invoiceNumber: 'INV-2026-006',
+    status: 'sent',
+    sentAt: new Date('2026-09-30T17:00:00.000Z'),
+    paidAt: null,
+    tax: 0,
+    discount: 0,
+    createdAt: new Date('2026-09-30T16:00:00.000Z'),
+  };
+  let updateData: any;
+  let pdfInput: any;
+
+  (prisma.booking.findUnique as any) = async () => ({
+    id: 'booking-1',
+    customerId: 'customer-1',
+    service: 'THE ICON',
+    dateTime: new Date('2026-10-03T11:00:00.000Z'),
+    customer: { name: 'Joan', phone: '254700000000' },
+  });
+  (prisma.invoice.findUnique as any) = async () => existingInvoice;
+  (prisma.package.findFirst as any) = async () => ({ price: 35000 });
+  (prisma.payment.findMany as any) = async () => [{ amount: 10, mpesaReceipt: 'TEST-RECEIPT' }];
+  (prisma.invoice.update as any) = async ({ data }: any) => {
+    updateData = data;
+    return { ...existingInvoice, ...data, booking: { service: 'THE ICON', dateTime: new Date('2026-10-03T11:00:00.000Z') } };
+  };
+  (bookingAddonService.sumForBooking as any) = async () => ({
+    addonsTotal: 3500,
+    lineItems: [{ name: 'Extra professional makeup', quantity: 1, unitPrice: 3500, totalPrice: 3500 }],
+  });
+  (bookingAddonService.markInvoiced as any) = async () => {};
+  (invoiceService.generatePdf as any) = async (data: any) => {
+    pdfInput = data;
+    return Buffer.from('refreshed-pdf');
+  };
+
+  try {
+    const invoice = await invoiceService.createOrRefreshForBooking('booking-1');
+
+    assert.ok(invoice);
+    assert.equal(invoice.invoiceNumber, 'INV-2026-006');
+    assert.equal(updateData.total, 38500);
+    assert.equal(updateData.depositPaid, 10);
+    assert.equal(updateData.balanceDue, 38490);
+    assert.equal(updateData.status, 'sent');
+    assert.deepEqual(pdfInput.addonLines, [{
+      name: 'Extra professional makeup', quantity: 1, unitPrice: 3500, totalPrice: 3500,
+    }]);
+    assert.equal(updateData.pdfData.toString(), 'refreshed-pdf');
+  } finally {
+    prisma.booking.findUnique = originals.bookingFindUnique;
+    prisma.invoice.findUnique = originals.invoiceFindUnique;
+    prisma.package.findFirst = originals.packageFindFirst;
+    prisma.payment.findMany = originals.paymentFindMany;
+    prisma.invoice.update = originals.invoiceUpdate;
+    bookingAddonService.sumForBooking = originals.sumForBooking;
+    bookingAddonService.markInvoiced = originals.markInvoiced;
+    invoiceService.generatePdf = originals.generatePdf;
+  }
+});
+
 test('sends the invoice for the past session discussed immediately before the request', async () => {
   const originalBookingFindFirst = prisma.booking.findFirst;
   const originalInvoiceFindUnique = prisma.invoice.findUnique;
   const originalInvoiceFindFirst = prisma.invoice.findFirst;
   const originalInvoiceUpdate = prisma.invoice.update;
+  const originalRefreshInvoice = invoiceService.createOrRefreshForBooking;
+  const originalAddonSum = bookingAddonService.sumForBooking;
   const originalSendDocument = whatsappService.sendDocument;
   let sentFileName = '';
   let searchedForLatestInvoice = false;
@@ -556,6 +693,17 @@ test('sends the invoice for the past session discussed immediately before the re
     return null;
   };
   (prisma.invoice.update as any) = async () => ({});
+  (invoiceService.createOrRefreshForBooking as any) = async () => ({
+    id: 'past-invoice',
+    invoiceNumber: 'INV-PAST',
+    bookingId: 'past-booking',
+    total: 35000,
+    depositPaid: 2000,
+    balanceDue: 33000,
+    pdfData: Buffer.from('pdf'),
+    booking: { service: 'THE ICON', dateTime: new Date('2026-08-10T07:00:00.000Z') },
+  });
+  (bookingAddonService.sumForBooking as any) = async () => ({ addonsTotal: 0, lineItems: [] });
   (whatsappService.sendDocument as any) = async (_customerId: string, _data: Buffer, fileName: string) => {
     sentFileName = fileName;
     return {};
@@ -575,6 +723,8 @@ test('sends the invoice for the past session discussed immediately before the re
     prisma.invoice.findUnique = originalInvoiceFindUnique;
     prisma.invoice.findFirst = originalInvoiceFindFirst;
     prisma.invoice.update = originalInvoiceUpdate;
+    invoiceService.createOrRefreshForBooking = originalRefreshInvoice;
+    bookingAddonService.sumForBooking = originalAddonSum;
     whatsappService.sendDocument = originalSendDocument;
   }
 });
@@ -584,9 +734,12 @@ test('selects the invoice for an explicitly dated session', async () => {
   const originalInvoiceFindUnique = prisma.invoice.findUnique;
   const originalInvoiceFindFirst = prisma.invoice.findFirst;
   const originalInvoiceUpdate = prisma.invoice.update;
+  const originalRefreshInvoice = invoiceService.createOrRefreshForBooking;
+  const originalAddonSum = bookingAddonService.sumForBooking;
   const originalSendDocument = whatsappService.sendDocument;
   let selectedBooking = '';
   let sentFileName = '';
+  let sentSummary = '';
 
   (prisma.booking.findFirst as any) = async ({ where }: any) => {
     assert.equal(where.dateTime.gte.toISOString(), '2026-09-24T21:00:00.000Z');
@@ -607,8 +760,23 @@ test('selects the invoice for an explicitly dated session', async () => {
   };
   (prisma.invoice.findFirst as any) = async () => null;
   (prisma.invoice.update as any) = async () => ({});
-  (whatsappService.sendDocument as any) = async (_customerId: string, _data: Buffer, fileName: string) => {
+  (invoiceService.createOrRefreshForBooking as any) = async () => ({
+    id: 'september-25-invoice',
+    invoiceNumber: 'INV-2026-004',
+    bookingId: 'september-25-booking',
+    total: 38500,
+    depositPaid: 10,
+    balanceDue: 38490,
+    pdfData: Buffer.from('refreshed-pdf'),
+    booking: { service: 'THE ICON', dateTime: new Date('2026-09-25T10:00:00.000Z') },
+  });
+  (bookingAddonService.sumForBooking as any) = async () => ({
+    addonsTotal: 3500,
+    lineItems: [{ name: 'Extra professional makeup', quantity: 1, unitPrice: 3500, totalPrice: 3500 }],
+  });
+  (whatsappService.sendDocument as any) = async (_customerId: string, _data: Buffer, fileName: string, summary: string) => {
     sentFileName = fileName;
+    sentSummary = summary;
     return {};
   };
 
@@ -622,12 +790,17 @@ test('selects the invoice for an explicitly dated session', async () => {
 
     assert.equal(selectedBooking, 'september-25-booking');
     assert.equal(sentFileName, 'INV-2026-004.pdf');
+    assert.match(sentSummary, /Add-ons:\nExtra professional makeup: KSh 3,500/);
+    assert.match(sentSummary, /Total: KSh 38,500/);
+    assert.match(sentSummary, /Balance Due: KSh 38,490/);
     assert.equal(reply, 'I’ve sent your invoice as a PDF to WhatsApp.');
   } finally {
     prisma.booking.findFirst = originalBookingFindFirst;
     prisma.invoice.findUnique = originalInvoiceFindUnique;
     prisma.invoice.findFirst = originalInvoiceFindFirst;
     prisma.invoice.update = originalInvoiceUpdate;
+    invoiceService.createOrRefreshForBooking = originalRefreshInvoice;
+    bookingAddonService.sumForBooking = originalAddonSum;
     whatsappService.sendDocument = originalSendDocument;
   }
 });

@@ -15,6 +15,7 @@ import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
@@ -523,11 +524,25 @@ export class AgentService {
     return { start: start.toDate(), end: start.add(1, 'day').toDate() };
   }
 
-  private shouldUseInvoiceRequestReply(userMessage: string): boolean {
+  private shouldUseInvoiceRequestReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): boolean {
     const text = userMessage.toLowerCase();
     const invoiceKeywords = /(invoice|receipt|payment summary)/.test(text);
     const actionKeywords = /(send|sent|share|download|get|give(?: me)?|provide|view|need|can you|could you)/.test(text);
-    return invoiceKeywords && actionKeywords;
+    if (invoiceKeywords && actionKeywords) return true;
+
+    const resendRequest = /\b(send|resend|forward|share|get|deliver)\b/.test(text)
+      && /\b(it|that|this|again|another time)\b/.test(text);
+    if (!resendRequest) return false;
+
+    const refersToInvoice = history.slice(-6).some((message) =>
+      message.role === 'assistant' && /\binvoice\b|\bINV-\d{4}-\d{3}\b|pdf.{0,20}(?:whatsapp|sent|attached)/i.test(message.content)
+    );
+    const reportsNotReceived = /\b(not|haven't|have not|never)\s+(?:received|got|get)\b/.test(text)
+      || /\bdidn't\s+(?:receive|get)\b/.test(text);
+    return refersToInvoice && (reportsNotReceived || resendRequest);
   }
 
   private async sendStoredInvoiceToCustomer(
@@ -596,7 +611,14 @@ export class AgentService {
       return 'I could not find a saved invoice for your account yet. Please confirm the booking or ask the team to generate one.';
     }
 
-    const summary = `Invoice ${invoice.invoiceNumber}\n\nService: ${invoice.booking.service}\nDate: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}\nTotal: KSh ${invoice.total.toLocaleString()}\nDeposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\nBalance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\nYour invoice is attached here as a PDF.`;
+    const refreshedInvoice = await invoiceService.createOrRefreshForBooking(invoice.bookingId);
+    if (refreshedInvoice) invoice = refreshedInvoice;
+
+    const { lineItems: addonLines } = await bookingAddonService.sumForBooking(invoice.bookingId);
+    const addonSummary = addonLines.length > 0
+      ? `\nAdd-ons:\n${addonLines.map((line) => `${line.name}: ${line.totalPrice > 0 ? `KSh ${line.totalPrice.toLocaleString()}` : 'Quoted'}`).join('\n')}\n`
+      : '';
+    const summary = `Invoice ${invoice.invoiceNumber}\n\nService: ${invoice.booking.service}\nDate: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}${addonSummary}\nTotal: KSh ${invoice.total.toLocaleString()}\nDeposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\nBalance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\nYour invoice is attached here as a PDF.`;
 
     try {
       if (!invoice.pdfData) {
@@ -788,11 +810,27 @@ export class AgentService {
     return `Your previously selected add-ons are: ${sessionSummaries.join('; ')}.`;
   }
 
-  private getSelectedAddon(userMessage: string): AddonCatalogItem | null {
+  private getSelectedAddon(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): AddonCatalogItem | null {
     const text = userMessage.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
     const selectionSignal = /\b(want|would like|add|include|choose|go with|take|prefer)\b/.test(text);
-    if (!selectionSignal) return null;
-    return ADDON_CATALOG.find((item) => item.match.test(text)) || null;
+    const explicitSelection = selectionSignal
+      ? ADDON_CATALOG.find((item) => item.match.test(text))
+      : null;
+    if (explicitSelection) return explicitSelection;
+
+    const affirmative = /^(?:yes+|yeah+|yep+|yup|sure|okay|ok)(?:\s*,?\s*(?:that's|that is|thats)\s+(?:what\s+i\s+want|what\s+i'd\s+like))?[.! ]*$/i;
+    if (!affirmative.test(text.trim())) return null;
+
+    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistant || !/\bif\s+you(?:'|’)d\s+like\b[\s\S]{0,160}\b(?:we|i)\s+can\s+(?:add|include)\b/i.test(lastAssistant.content)) {
+      return null;
+    }
+
+    const offeredAddons = ADDON_CATALOG.filter((item) => item.match.test(lastAssistant.content));
+    return offeredAddons.length === 1 ? offeredAddons[0] : null;
   }
 
   private getAddonSelectionReply(addon: AddonCatalogItem): string {
@@ -2446,7 +2484,7 @@ ${contextString}`;
       return mixedIntentReply;
     }
 
-    if (this.shouldUseInvoiceRequestReply(userMessage)) {
+    if (this.shouldUseInvoiceRequestReply(userMessage, history)) {
       const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
       const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined, history, userMessage);
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -2709,7 +2747,7 @@ ${contextString}`;
       return additionsReply;
     }
 
-    const selectedAddon = this.getSelectedAddon(userMessage);
+    const selectedAddon = this.getSelectedAddon(userMessage, history);
     if (selectedAddon) {
       const noteResult = await this.executeAddNoteTool(
         customerId,
@@ -2721,9 +2759,11 @@ ${contextString}`;
         userMessage,
         platform
       );
-      const addonReply = noteResult.created || noteResult.reason === 'duplicate_pending_note'
+      const addonReply = noteResult.created
         ? this.getAddonSelectionReply(selectedAddon)
-        : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
+        : noteResult.reason === 'duplicate_pending_note'
+          ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
+          : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,

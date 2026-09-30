@@ -69,7 +69,7 @@ export const ADDON_CATALOG: AddonCatalogItem[] = [
     sku: 'extra_makeup',
     name: 'Extra professional makeup',
     unitPrice: 3500,
-    match: /extra\s+(professional\s+)?makeup/i,
+    match: /extra\s+(professional\s+)?make[-\s]?up/i,
   },
   {
     sku: 'power_suit',
@@ -95,7 +95,7 @@ export const ADDON_CATALOG: AddonCatalogItem[] = [
     sku: 'suspending_concept',
     name: 'Suspending Concept',
     unitPrice: 7000,
-    match: /suspending\s+concept/i,
+    match: /suspending\s+concept|suspenind\s+concep(?:t)?/i,
   },
   {
     sku: 'sculpture_set',
