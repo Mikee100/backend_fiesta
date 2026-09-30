@@ -4,6 +4,7 @@ import axios from 'axios';
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
@@ -17,7 +18,7 @@ test('keeps all 27 policy identifiers while omitting unrelated price tables', ()
   const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
   const pricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 27);
+  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 28);
   assert.match(fullPrompt, /THE BLOOM: Ksh 15,000/);
   assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
   assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
@@ -252,6 +253,58 @@ test('confirms the original booking after a withdrawal follow-up', () => {
   assert.equal(agent.shouldConfirmRescheduleWithdrawal('What time is it?', history), false);
 });
 
+test('returns reschedule confirmation without waiting for Google Calendar', { timeout: 1000 }, async () => {
+  const originals = {
+    bookingDraftFindUnique: prisma.bookingDraft.findUnique,
+    bookingFindUnique: prisma.booking.findUnique,
+    bookingUpdate: prisma.booking.update,
+    bookingDraftDelete: prisma.bookingDraft.delete,
+    updateCalendarEvent: googleCalendarService.updateEvent,
+    notifyRescheduleAdmin: agent.notifyRescheduleAdmin,
+  };
+  let bookingUpdated = false;
+  let draftCleared = false;
+  (prisma.bookingDraft.findUnique as any) = async () => ({
+    step: 'reschedule_confirm',
+    bookingId: 'booking-123',
+    date: '2026-10-04',
+    time: '15:00',
+    dateTimeIso: '2026-10-04T15:00:00',
+  });
+  (prisma.booking.findUnique as any) = async () => ({
+    id: 'booking-123',
+    service: 'THE ICON',
+    dateTime: new Date('2026-10-03T11:00:00.000Z'),
+    googleEventId: 'calendar-event-123',
+    customer: { name: 'Joan' },
+  });
+  (prisma.booking.update as any) = async () => {
+    bookingUpdated = true;
+    return {};
+  };
+  (prisma.bookingDraft.delete as any) = async () => {
+    draftCleared = true;
+    return {};
+  };
+  (googleCalendarService.updateEvent as any) = () => new Promise(() => {});
+  agent.notifyRescheduleAdmin = () => new Promise(() => {});
+
+  try {
+    const reply = await agent.tryImmediateConfirmation('customer-123');
+
+    assert.match(reply, /session has been moved/i);
+    assert.equal(bookingUpdated, true);
+    assert.equal(draftCleared, true);
+  } finally {
+    prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
+    prisma.booking.findUnique = originals.bookingFindUnique;
+    prisma.booking.update = originals.bookingUpdate;
+    prisma.bookingDraft.delete = originals.bookingDraftDelete;
+    googleCalendarService.updateEvent = originals.updateCalendarEvent;
+    agent.notifyRescheduleAdmin = originals.notifyRescheduleAdmin;
+  }
+});
+
 test('recognizes acknowledgements after completed actions', () => {
   const history = [{
     role: 'assistant' as const,
@@ -459,6 +512,44 @@ test('persists the common Suspending Concept misspelling as its priced add-on', 
     prisma.bookingAddon.findFirst = originalFindFirst;
     prisma.bookingAddon.create = originalCreate;
   }
+});
+
+test('links to the dedicated Suspending Concept gallery after a contextual visual question', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'The Suspending Concept is a dreamy, ethereal add-on.'
+  }];
+  const reply = agent.getSuspendingConceptGalleryReply('Where can I see this idea?', history);
+
+  assert.match(reply, /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/);
+  assert.equal(agent.getSuspendingConceptGalleryReply('Where can I see this idea?', []), null);
+});
+
+test('links review and testimonial page requests to the reviews page', () => {
+  const reply = agent.getReviewPageReply('Is there a reviews page I can see these?');
+
+  assert.match(reply, /https:\/\/www\.fiestahousematernity\.com\/reviews/);
+  assert.equal(agent.getReviewPageReply('What do clients say about the studio?'), null);
+});
+
+test('sanitizes unverified Fiesta House URLs in model replies', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'The Suspending Concept is one of our add-ons.'
+  }];
+
+  assert.match(
+    agent.formatCustomerReply('See our testimonials: https://www.fiestahousematernity.com/testimonials'),
+    /https:\/\/www\.fiestahousematernity\.com\/reviews/
+  );
+  assert.match(
+    agent.formatCustomerReply('View it here: https://www.fiestahousematernity.com/gallery', 'Where can I see this?', history),
+    /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/
+  );
+  assert.match(
+    agent.formatCustomerReply('See this page: https://www.fiestahousematernity.com/fake-page'),
+    /https:\/\/www\.fiestahousematernity\.com\/$/
+  );
 });
 
 test('resolves an affirmative reply to a single offered paid add-on', () => {
