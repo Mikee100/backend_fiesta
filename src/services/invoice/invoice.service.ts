@@ -1,5 +1,7 @@
 import PDFDocument from 'pdfkit';
 import dayjs from 'dayjs';
+import prisma from '../../config/prisma';
+import { bookingAddonService } from '../booking/booking-addon.service';
 
 interface InvoicePdfData {
   invoiceNumber: string;
@@ -32,6 +34,86 @@ const MARGIN = 50;
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 
 export class InvoiceService {
+  /** Creates an invoice or refreshes its totals and PDF from current booking data. */
+  async createOrRefreshForBooking(bookingId: string) {
+    const booking = await prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { customer: true },
+    });
+    if (!booking) return null;
+
+    const existing = await prisma.invoice.findUnique({ where: { bookingId } });
+    const pkg = await prisma.package.findFirst({
+      where: { name: { contains: booking.service, mode: 'insensitive' } },
+    });
+    const packagePrice = pkg?.price || 0;
+    const { addonsTotal, lineItems: addonLines } = await bookingAddonService.sumForBooking(bookingId);
+    const subtotal = packagePrice + addonsTotal;
+    const tax = existing?.tax || 0;
+    const discount = existing?.discount || 0;
+    const total = subtotal + tax - discount;
+    const payments = await prisma.payment.findMany({ where: { bookingId, status: 'success' } });
+    const depositPaid = payments.reduce((sum, payment) => sum + payment.amount, 0);
+    const depositReceipts = payments.map((payment) => payment.mpesaReceipt).filter((receipt): receipt is string => !!receipt);
+    const balanceDue = Math.max(total - depositPaid, 0);
+    const year = new Date().getFullYear();
+    const invoiceCountThisYear = existing
+      ? 0
+      : await prisma.invoice.count({ where: { invoiceNumber: { startsWith: `INV-${year}-` } } });
+    const invoiceNumber = existing?.invoiceNumber || this.buildInvoiceNumber(year, invoiceCountThisYear + 1);
+    const createdAt = existing?.createdAt || new Date();
+    const pdfData = await this.generatePdf({
+      invoiceNumber,
+      customerName: booking.customer.name,
+      customerPhone: booking.customer.phone,
+      service: booking.service,
+      bookingDateTime: booking.dateTime,
+      subtotal: packagePrice,
+      addonLines,
+      tax,
+      discount,
+      total,
+      depositPaid,
+      depositReceipts,
+      balanceDue,
+      createdAt,
+    });
+
+    const status = existing?.status === 'paid' && balanceDue > 0
+      ? (existing.sentAt ? 'sent' : 'pending')
+      : existing?.status || 'pending';
+    const data = {
+      subtotal,
+      tax,
+      discount,
+      total,
+      depositPaid,
+      balanceDue,
+      status,
+      paidAt: balanceDue > 0 ? null : existing?.paidAt,
+      pdfData,
+    };
+
+    const invoice = existing
+      ? await prisma.invoice.update({
+          where: { id: existing.id },
+          data,
+          include: { customer: true, booking: true },
+        })
+      : await prisma.invoice.create({
+          data: {
+            ...data,
+            invoiceNumber,
+            bookingId,
+            customerId: booking.customerId,
+          },
+          include: { customer: true, booking: true },
+        });
+
+    await bookingAddonService.markInvoiced(bookingId);
+    return invoice;
+  }
+
   /** Renders a professional one-page invoice as a PDF buffer. */
   async generatePdf(data: InvoicePdfData): Promise<Buffer> {
     return new Promise((resolve, reject) => {

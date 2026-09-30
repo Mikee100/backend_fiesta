@@ -15,6 +15,7 @@ import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 
 // Groq's API is OpenAI-compatible, so the 'openai' SDK works unmodified against its endpoint.
@@ -29,6 +30,11 @@ const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process
 const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
 const MAX_RAG_CONTEXT_CHUNKS = 3;
 const MAX_HISTORY_MESSAGES = 6;
+const OFFICIAL_WEBSITE_URLS = {
+  home: 'https://www.fiestahousematernity.com/',
+  reviews: 'https://www.fiestahousematernity.com/reviews',
+  suspendingConcept: 'https://www.fiestahousematernity.com/gallery/suspending-concept',
+} as const;
 
 // --- Hybrid Booking Extractor ---
 type BookingDetails = {
@@ -199,8 +205,38 @@ export class AgentService {
     return this.naturalAssistantMode;
   }
 
-  private formatCustomerReply(reply: string): string {
-    return formatCustomerReply(reply);
+  private formatCustomerReply(
+    reply: string,
+    userMessage = '',
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): string {
+    const formattedReply = formatCustomerReply(reply);
+    const aboutSuspendingConcept = /suspending\s+concept/i.test(userMessage)
+      || history.slice(-6).some((message) => /suspending\s+concept/i.test(message.content));
+
+    return formattedReply.replace(
+      /https?:\/\/(?:www\.)?fiestahousematernity\.com(?:\/[^\s<>"'()[\]{}]*)?/gi,
+      (matchedUrl) => {
+        const trailingPunctuation = matchedUrl.match(/[.,!?;:]+$/)?.[0] || '';
+        const urlWithoutPunctuation = trailingPunctuation
+          ? matchedUrl.slice(0, -trailingPunctuation.length)
+          : matchedUrl;
+        const path = new URL(urlWithoutPunctuation).pathname.replace(/\/+$/, '') || '/';
+
+        if (path === '/reviews' || path === '/gallery/suspending-concept' || path === '/') {
+          return path === '/reviews'
+            ? OFFICIAL_WEBSITE_URLS.reviews + trailingPunctuation
+            : path === '/gallery/suspending-concept'
+              ? OFFICIAL_WEBSITE_URLS.suspendingConcept + trailingPunctuation
+              : OFFICIAL_WEBSITE_URLS.home + trailingPunctuation;
+        }
+        if (path === '/testimonials') return OFFICIAL_WEBSITE_URLS.reviews + trailingPunctuation;
+        if (path === '/gallery' && aboutSuspendingConcept) {
+          return OFFICIAL_WEBSITE_URLS.suspendingConcept + trailingPunctuation;
+        }
+        return OFFICIAL_WEBSITE_URLS.home + trailingPunctuation;
+      }
+    );
   }
 
   private normalizeToolName(rawName: string): string {
@@ -523,11 +559,25 @@ export class AgentService {
     return { start: start.toDate(), end: start.add(1, 'day').toDate() };
   }
 
-  private shouldUseInvoiceRequestReply(userMessage: string): boolean {
+  private shouldUseInvoiceRequestReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): boolean {
     const text = userMessage.toLowerCase();
     const invoiceKeywords = /(invoice|receipt|payment summary)/.test(text);
     const actionKeywords = /(send|sent|share|download|get|give(?: me)?|provide|view|need|can you|could you)/.test(text);
-    return invoiceKeywords && actionKeywords;
+    if (invoiceKeywords && actionKeywords) return true;
+
+    const resendRequest = /\b(send|resend|forward|share|get|deliver)\b/.test(text)
+      && /\b(it|that|this|again|another time)\b/.test(text);
+    if (!resendRequest) return false;
+
+    const refersToInvoice = history.slice(-6).some((message) =>
+      message.role === 'assistant' && /\binvoice\b|\bINV-\d{4}-\d{3}\b|pdf.{0,20}(?:whatsapp|sent|attached)/i.test(message.content)
+    );
+    const reportsNotReceived = /\b(not|haven't|have not|never)\s+(?:received|got|get)\b/.test(text)
+      || /\bdidn't\s+(?:receive|get)\b/.test(text);
+    return refersToInvoice && (reportsNotReceived || resendRequest);
   }
 
   private async sendStoredInvoiceToCustomer(
@@ -596,7 +646,14 @@ export class AgentService {
       return 'I could not find a saved invoice for your account yet. Please confirm the booking or ask the team to generate one.';
     }
 
-    const summary = `Invoice ${invoice.invoiceNumber}\n\nService: ${invoice.booking.service}\nDate: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}\nTotal: KSh ${invoice.total.toLocaleString()}\nDeposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\nBalance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\nYour invoice is attached here as a PDF.`;
+    const refreshedInvoice = await invoiceService.createOrRefreshForBooking(invoice.bookingId);
+    if (refreshedInvoice) invoice = refreshedInvoice;
+
+    const { lineItems: addonLines } = await bookingAddonService.sumForBooking(invoice.bookingId);
+    const addonSummary = addonLines.length > 0
+      ? `\nAdd-ons:\n${addonLines.map((line) => `${line.name}: ${line.totalPrice > 0 ? `KSh ${line.totalPrice.toLocaleString()}` : 'Quoted'}`).join('\n')}\n`
+      : '';
+    const summary = `Invoice ${invoice.invoiceNumber}\n\nService: ${invoice.booking.service}\nDate: ${invoice.booking.dateTime.toLocaleDateString('en-KE', { timeZone: 'Africa/Nairobi' })}${addonSummary}\nTotal: KSh ${invoice.total.toLocaleString()}\nDeposit Paid: KSh ${invoice.depositPaid.toLocaleString()}\nBalance Due: KSh ${invoice.balanceDue.toLocaleString()}\n\nYour invoice is attached here as a PDF.`;
 
     try {
       if (!invoice.pdfData) {
@@ -788,11 +845,27 @@ export class AgentService {
     return `Your previously selected add-ons are: ${sessionSummaries.join('; ')}.`;
   }
 
-  private getSelectedAddon(userMessage: string): AddonCatalogItem | null {
+  private getSelectedAddon(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): AddonCatalogItem | null {
     const text = userMessage.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
     const selectionSignal = /\b(want|would like|add|include|choose|go with|take|prefer)\b/.test(text);
-    if (!selectionSignal) return null;
-    return ADDON_CATALOG.find((item) => item.match.test(text)) || null;
+    const explicitSelection = selectionSignal
+      ? ADDON_CATALOG.find((item) => item.match.test(text))
+      : null;
+    if (explicitSelection) return explicitSelection;
+
+    const affirmative = /^(?:yes+|yeah+|yep+|yup|sure|okay|ok)(?:\s*,?\s*(?:that's|that is|thats)\s+(?:what\s+i\s+want|what\s+i'd\s+like))?[.! ]*$/i;
+    if (!affirmative.test(text.trim())) return null;
+
+    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistant || !/\bif\s+you(?:'|’)d\s+like\b[\s\S]{0,160}\b(?:we|i)\s+can\s+(?:add|include)\b/i.test(lastAssistant.content)) {
+      return null;
+    }
+
+    const offeredAddons = ADDON_CATALOG.filter((item) => item.match.test(lastAssistant.content));
+    return offeredAddons.length === 1 ? offeredAddons[0] : null;
   }
 
   private getAddonSelectionReply(addon: AddonCatalogItem): string {
@@ -1550,6 +1623,28 @@ export class AgentService {
     return 'You can see our maternity, newborn and family sessions in the portfolio here: https://www.fiestahousematernity.com/. Have a look and tell me which style feels most like you.';
   }
 
+  private getSuspendingConceptGalleryReply(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): string | null {
+    const asksToSeeExample = /\b(where\s+(?:can|could|do)\s+i\s+(?:see|view)|can\s+i\s+see|show\s+me|see\s+this\s+(?:idea|concept))\b/i.test(userMessage);
+    if (!asksToSeeExample) return null;
+
+    const mentionsConcept = /suspending\s+concept/i.test(userMessage)
+      || history.slice(-6).some((message) => /suspending\s+concept/i.test(message.content));
+    if (!mentionsConcept) return null;
+
+    return 'You can see the Suspending Concept gallery here: https://www.fiestahousematernity.com/gallery/suspending-concept';
+  }
+
+  private getReviewPageReply(userMessage: string): string | null {
+    const asksAboutReviews = /\b(reviews?|testimonials?|client feedback)\b/i.test(userMessage);
+    const asksForPage = /\b(page|website|where|see|read|view|link)\b/i.test(userMessage);
+    if (!asksAboutReviews || !asksForPage) return null;
+
+    return 'You can read Fiesta House Maternity client reviews here: https://www.fiestahousematernity.com/reviews';
+  }
+
   private getWebsiteReply(): string {
     return 'You can find us here: https://www.fiestahousematernity.com/. It has our portfolio, current packages and more about the studio.';
   }
@@ -1734,6 +1829,7 @@ A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History 
 A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done.
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
+A9. VERIFIED WEBSITE LINKS: Use only these exact Fiesta House website URLs: ${Object.values(OFFICIAL_WEBSITE_URLS).join(', ')}. Never guess or construct a page path. The reviews page is /reviews; the Suspending Concept gallery is /gallery/suspending-concept. If no verified link fits, share the homepage or offer to check with the team.
 
 [B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
 B1. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
@@ -2208,7 +2304,7 @@ ${contextString}`;
     return {
       content: emptyResponse
         ? 'Sorry, I lost the thread there. Could you tell me a little more about what you need?'
-        : this.formatCustomerReply(modelContent),
+        : this.formatCustomerReply(modelContent, userMessage, history),
       tokensUsed: usage.totalTokens,
       ...(emptyResponse ? { failureType: 'empty_model_response' } : {}),
     };
@@ -2446,7 +2542,7 @@ ${contextString}`;
       return mixedIntentReply;
     }
 
-    if (this.shouldUseInvoiceRequestReply(userMessage)) {
+    if (this.shouldUseInvoiceRequestReply(userMessage, history)) {
       const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
       const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined, history, userMessage);
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
@@ -2552,6 +2648,36 @@ ${contextString}`;
     // In natural assistant mode, keep critical guardrails deterministic but
     // let low-risk informational replies be generated naturally by the LLM.
     const informationalFlow = this.conversationFlowHandler.resolveInformationalFlow(userMessage, history);
+
+    const suspendingConceptGalleryReply = this.getSuspendingConceptGalleryReply(userMessage, history);
+    if (suspendingConceptGalleryReply) {
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: suspendingConceptGalleryReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return suspendingConceptGalleryReply;
+    }
+
+    const reviewPageReply = this.getReviewPageReply(userMessage);
+    if (reviewPageReply) {
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: reviewPageReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return reviewPageReply;
+    }
 
     if (informationalFlow === 'business_introduction' && allowDeterministicInfoReplies) {
       const businessIntroductionReply = this.getBusinessIntroductionReply();
@@ -2709,7 +2835,7 @@ ${contextString}`;
       return additionsReply;
     }
 
-    const selectedAddon = this.getSelectedAddon(userMessage);
+    const selectedAddon = this.getSelectedAddon(userMessage, history);
     if (selectedAddon) {
       const noteResult = await this.executeAddNoteTool(
         customerId,
@@ -2721,9 +2847,11 @@ ${contextString}`;
         userMessage,
         platform
       );
-      const addonReply = noteResult.created || noteResult.reason === 'duplicate_pending_note'
+      const addonReply = noteResult.created
         ? this.getAddonSelectionReply(selectedAddon)
-        : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
+        : noteResult.reason === 'duplicate_pending_note'
+          ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
+          : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
       await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
       await this.logConversationLearning({
         customerId,
@@ -2980,10 +3108,33 @@ ${contextString}`;
       this.isExplicitConfirmation(userMessage) &&
       this.previousMessageRequestsConfirmation(history)
     ) {
-      const immediate = await this.tryImmediateConfirmation(customerId);
+      let immediate: string | null;
+      try {
+        immediate = await this.tryImmediateConfirmation(customerId);
+      } catch (error: any) {
+        console.error('[AGENT_FLOW] Immediate confirmation failed:', error);
+        const reply = 'I could not complete that change just now. Your booking has not been confirmed as rescheduled; please try again or contact the studio team.';
+        void this.logAiJobMetric({
+          customerId,
+          platform,
+          success: false,
+          failureReason: String(error?.message || error).slice(0, 200),
+          latencyMs: Date.now() - startedAt,
+        });
+        void this.logConversationLearning({
+          customerId,
+          userMessage,
+          aiResponse: reply,
+          platform,
+          latencyMs: Date.now() - startedAt,
+          wasSuccessful: false,
+          isFallback: true,
+        });
+        return reply;
+      }
       if (immediate) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
+        void this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+        void this.logConversationLearning({
           customerId,
           userMessage,
           aiResponse: immediate,
@@ -3185,7 +3336,7 @@ ${contextString}`;
 
     if (draft.step === 'reschedule_confirm') {
       const result = await this.executeConfirmRescheduleTool(customerId, 'reschedule_confirm');
-      await this.notifyRescheduleAdmin({
+      void this.notifyRescheduleAdmin({
         customerId,
         event: 'confirmed',
         service: result.service,
@@ -3661,11 +3812,24 @@ ${contextString}`;
       const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k)) || 'standard';
       const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
 
-      await googleCalendarService.updateEvent(upcomingBooking.googleEventId, {
+      void googleCalendarService.updateEvent(upcomingBooking.googleEventId, {
         service: upcomingBooking.service,
         dateTime: newDateTime,
         customerName: upcomingBooking.customer.name,
         durationMinutes: duration
+      }).then((updated) => {
+        if (!updated) {
+          void this.notifyRescheduleAdmin({
+            customerId,
+            event: 'failed',
+            service: upcomingBooking.service,
+            newDate: draft.date || undefined,
+            newTime: draft.time || undefined,
+            reason: 'The booking was rescheduled, but Google Calendar did not update.',
+          });
+        }
+      }).catch((error) => {
+        console.error('Google Calendar reschedule sync failed:', error);
       });
     }
 

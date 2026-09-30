@@ -2,7 +2,6 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import { invoiceService } from '../services/invoice/invoice.service';
 import { whatsappService } from '../services/messaging/whatsapp.service';
-import { bookingAddonService } from '../services/booking/booking-addon.service';
 
 // Fields safe to send to the frontend - excludes the binary pdfData blob,
 // which is only ever served directly via the download endpoint.
@@ -64,71 +63,17 @@ export class InvoiceController {
   async generateInvoice(req: Request, res: Response) {
     try {
       const bookingId = req.params.bookingId as string;
-
-      const existing = await prisma.invoice.findUnique({ where: { bookingId }, select: INVOICE_LIST_SELECT });
-      if (existing) {
-        return res.status(200).json(existing); // idempotent - one invoice per booking
-      }
-
-      const booking = await prisma.booking.findUnique({ where: { id: bookingId }, include: { customer: true } });
-      if (!booking) {
+      const existing = await prisma.invoice.findUnique({ where: { bookingId }, select: { id: true } });
+      const invoice = await invoiceService.createOrRefreshForBooking(bookingId);
+      if (!invoice) {
         return res.status(404).json({ error: 'Booking not found' });
       }
-
-      const pkg = await prisma.package.findFirst({ where: { name: { contains: booking.service, mode: 'insensitive' } } });
-      const packagePrice = pkg?.price || 0;
-      const { addonsTotal, lineItems: addonLines } = await bookingAddonService.sumForBooking(bookingId);
-      const subtotal = packagePrice + addonsTotal;
-      const tax = 0;
-      const discount = 0;
-      const total = subtotal + tax - discount;
-
-      const payments = await prisma.payment.findMany({ where: { bookingId, status: 'success' } });
-      const depositPaid = payments.reduce((sum, p) => sum + p.amount, 0);
-      const depositReceipts = payments.map((p) => p.mpesaReceipt).filter((r): r is string => !!r);
-      const balanceDue = Math.max(total - depositPaid, 0);
-
-      const year = new Date().getFullYear();
-      const invoiceCountThisYear = await prisma.invoice.count({ where: { invoiceNumber: { startsWith: `INV-${year}-` } } });
-      const invoiceNumber = invoiceService.buildInvoiceNumber(year, invoiceCountThisYear + 1);
-
-      const pdfBuffer = await invoiceService.generatePdf({
-        invoiceNumber,
-        customerName: booking.customer.name,
-        customerPhone: booking.customer.phone,
-        service: booking.service,
-        bookingDateTime: booking.dateTime,
-        subtotal: packagePrice,
-        addonLines,
-        tax,
-        discount,
-        total,
-        depositPaid,
-        depositReceipts,
-        balanceDue,
-        createdAt: new Date(),
-      });
-
-      const invoice = await prisma.invoice.create({
-        data: {
-          invoiceNumber,
-          bookingId,
-          customerId: booking.customerId,
-          subtotal,
-          tax,
-          discount,
-          total,
-          depositPaid,
-          balanceDue,
-          status: 'pending',
-          pdfData: pdfBuffer,
-        },
+      const response = await prisma.invoice.findUnique({
+        where: { id: invoice.id },
         select: INVOICE_LIST_SELECT,
       });
 
-      await bookingAddonService.markInvoiced(bookingId);
-
-      return res.status(201).json(invoice);
+      return res.status(existing ? 200 : 201).json(response);
     } catch (error: any) {
       return res.status(500).json({ error: error.message });
     }

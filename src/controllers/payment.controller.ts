@@ -10,67 +10,10 @@ import { bookingAddonService } from '../services/booking/booking-addon.service';
 
 export class PaymentController {
   /**
-   * Creates an invoice for a confirmed booking if one doesn't exist yet.
-   * Safe to call multiple times (idempotent by unique bookingId).
+   * Ensures the confirmed booking has an up-to-date invoice snapshot.
    */
   private async ensureInvoiceForBooking(bookingId: string): Promise<void> {
-    const existing = await prisma.invoice.findUnique({ where: { bookingId }, select: { id: true } });
-    if (existing) return;
-
-    const booking = await prisma.booking.findUnique({ where: { id: bookingId }, include: { customer: true } });
-    if (!booking) return;
-
-    const pkg = await prisma.package.findFirst({ where: { name: { contains: booking.service, mode: 'insensitive' } } });
-    const packagePrice = pkg?.price || 0;
-    const { addonsTotal, lineItems: addonLines } = await bookingAddonService.sumForBooking(bookingId);
-    const subtotal = packagePrice + addonsTotal;
-    const tax = 0;
-    const discount = 0;
-    const total = subtotal + tax - discount;
-
-    const payments = await prisma.payment.findMany({ where: { bookingId, status: 'success' } });
-    const depositPaid = payments.reduce((sum, p) => sum + p.amount, 0);
-    const depositReceipts = payments.map((p) => p.mpesaReceipt).filter((r): r is string => !!r);
-    const balanceDue = Math.max(total - depositPaid, 0);
-
-    const year = new Date().getFullYear();
-    const invoiceCountThisYear = await prisma.invoice.count({ where: { invoiceNumber: { startsWith: `INV-${year}-` } } });
-    const invoiceNumber = invoiceService.buildInvoiceNumber(year, invoiceCountThisYear + 1);
-
-    const pdfBuffer = await invoiceService.generatePdf({
-      invoiceNumber,
-      customerName: booking.customer.name,
-      customerPhone: booking.customer.phone,
-      service: booking.service,
-      bookingDateTime: booking.dateTime,
-      subtotal: packagePrice,
-      addonLines,
-      tax,
-      discount,
-      total,
-      depositPaid,
-      depositReceipts,
-      balanceDue,
-      createdAt: new Date(),
-    });
-
-    await prisma.invoice.create({
-      data: {
-        invoiceNumber,
-        bookingId,
-        customerId: booking.customerId,
-        subtotal,
-        tax,
-        discount,
-        total,
-        depositPaid,
-        balanceDue,
-        status: 'pending',
-        pdfData: pdfBuffer,
-      }
-    });
-
-    await bookingAddonService.markInvoiced(bookingId);
+    await invoiceService.createOrRefreshForBooking(bookingId);
   }
 
   /**
