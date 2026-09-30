@@ -1015,6 +1015,7 @@ export class AgentService {
 
   private shouldUseUpcomingAppointmentDetailsReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
+    if (this.shouldUseBookingProcessReply(userMessage)) return false;
     if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) return false;
     if (this.shouldUseLastAppointmentDetailsReply(userMessage)) return false;
     if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
