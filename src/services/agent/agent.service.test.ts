@@ -205,6 +205,13 @@ test('answers upcoming session details naturally and acknowledges repeat questio
   }
 });
 
+test('does not mistake a general booking-process question for personal session details', () => {
+  const question = 'what is the booking process of the studio';
+
+  assert.equal(agent.shouldUseBookingProcessReply(question), true);
+  assert.equal(agent.shouldUseUpcomingAppointmentDetailsReply(question), false);
+});
+
 test('answers last-session questions from the most recent past booking', async () => {
   const originalFindFirst = prisma.booking.findFirst;
   (prisma.booking.findFirst as any) = async () => ({
