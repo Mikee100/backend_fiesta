@@ -3,6 +3,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import chatRoutes from './src/routes/chat.routes';
+import authRoutes from './src/routes/auth.routes';
 import whatsappRoutes from './src/routes/whatsapp.routes';
 import instagramRoutes from './src/routes/instagram.routes';
 import bookingRoutes from './src/routes/booking.routes';
@@ -21,6 +22,8 @@ import dotenv from 'dotenv';
 import { validateStartupEnv } from './src/config/env-validation';
 import { knowledgeRetrieval } from './src/services/knowledge/retrieval.service';
 import { agentService } from './src/services/agent/agent.service';
+import { requireApiAuthentication } from './src/middleware/auth';
+import { readAccessToken } from './src/services/auth/auth.service';
 
 // Load .env only if it exists (for local dev)
 dotenv.config();
@@ -93,8 +96,26 @@ io.on('connection', (socket) => {
   // The dashboard (Navbar, MessengerPage, etc.) already emits 'join' with a
   // platform name on connect, expecting to be put in that room - this was
   // never actually handled server-side, so those joins were silently no-ops.
-  socket.on('join', ({ platform }: { platform?: string }) => {
-    if (platform) socket.join(platform);
+  socket.on('join', async ({ platform }: { platform?: string }) => {
+    if (!platform) return;
+    if (platform !== 'admin') {
+      socket.join(platform);
+      return;
+    }
+
+    const token = socket.handshake.auth?.token;
+    const userId = typeof token === 'string' ? readAccessToken(token) : null;
+    if (!userId) return;
+
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { isActive: true, role: true },
+      });
+      if (user?.isActive && user.role === 'admin' && socket.connected) socket.join('admin');
+    } catch (err) {
+      console.error('Failed to authorize admin socket room:', err);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -125,6 +146,8 @@ app.use((req: any, _res, next) => {
 });
 
 // Main Routes
+app.use('/api/auth', authRoutes);
+app.use('/api', requireApiAuthentication);
 app.use('/api', chatRoutes);
 app.use('/webhooks/whatsapp', whatsappRoutes);
 app.use('/webhooks/instagram', instagramRoutes);

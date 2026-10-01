@@ -10,13 +10,6 @@ import { bookingAddonService } from '../services/booking/booking-addon.service';
 
 export class PaymentController {
   /**
-   * Ensures the confirmed booking has an up-to-date invoice snapshot.
-   */
-  private async ensureInvoiceForBooking(bookingId: string): Promise<void> {
-    await invoiceService.createOrRefreshForBooking(bookingId);
-  }
-
-  /**
    * Handles M-Pesa Callback
    */
   async handleMpesaCallback(req: Request, res: Response) {
@@ -138,7 +131,21 @@ export class PaymentController {
               console.error('Failed to sync booking to Google Calendar:', calErr?.message || calErr);
             }
 
-            // Notify customer via WhatsApp
+            // Generate the invoice before notifying the customer so the PDF can
+            // be delivered with the successful payment confirmation.
+            let invoiceNumber: string | null = null;
+            let invoicePdf: Buffer | null = null;
+            let balanceDue: number | null = null;
+            try {
+              const invoice = await invoiceService.createOrRefreshForBooking(targetBooking.id);
+              invoiceNumber = invoice?.invoiceNumber || null;
+              invoicePdf = invoice?.pdfData ? Buffer.from(invoice.pdfData) : null;
+              balanceDue = invoice?.balanceDue ?? null;
+            } catch (invoiceErr: any) {
+              console.error(`Failed to auto-generate invoice for booking ${targetBooking.id}:`, invoiceErr?.message || invoiceErr);
+            }
+
+            // Notify customer via WhatsApp with payment details and the invoice.
             try {
               const appointmentDate = targetBooking.dateTime.toLocaleDateString('en-KE', {
                 weekday: 'long',
@@ -152,17 +159,35 @@ export class PaymentController {
                 minute: '2-digit',
                 timeZone: 'Africa/Nairobi',
               });
-              const message = `Payment received. Your ${targetBooking.service} session is confirmed.\n\n${appointmentDate} at ${appointmentTime}\n\nWe'll send you a reminder before your session. We look forward to welcoming you.`;
-              await whatsappService.sendMessage(targetBooking.customer.id, message);
-            } catch (waErr: any) {
-              console.error('Failed to send WhatsApp booking confirmation:', waErr?.message || waErr);
-            }
+              const paymentDetails = [
+                `Payment received successfully. Your ${targetBooking.service} session is confirmed.`,
+                '',
+                `Amount paid: KSh ${payment.amount.toLocaleString()}`,
+                `M-Pesa receipt: ${mpesaReceipt || 'Available in your payment record'}`,
+                invoiceNumber ? `Invoice: ${invoiceNumber}` : null,
+                balanceDue !== null ? `Balance due: KSh ${balanceDue.toLocaleString()}` : null,
+                '',
+                `Session: ${appointmentDate} at ${appointmentTime}`,
+                '',
+                invoicePdf ? 'Your invoice is attached to this message. We will send you a reminder before your session.' : 'We will send your invoice shortly. We will also send you a reminder before your session.',
+                'We look forward to welcoming you.'
+              ].filter((line): line is string => line !== null).join('\n');
 
-            // Best-effort auto invoice generation right after successful payment.
-            try {
-              await this.ensureInvoiceForBooking(targetBooking.id);
-            } catch (invoiceErr: any) {
-              console.error(`Failed to auto-generate invoice for booking ${targetBooking.id}:`, invoiceErr?.message || invoiceErr);
+              if (invoicePdf && invoiceNumber) {
+                await whatsappService.sendDocument(targetBooking.customer.id, invoicePdf, `${invoiceNumber}.pdf`, paymentDetails);
+              } else {
+                await whatsappService.sendMessage(targetBooking.customer.id, paymentDetails);
+              }
+            } catch (waErr: any) {
+              console.error('Failed to send WhatsApp booking confirmation or invoice:', waErr?.message || waErr);
+              try {
+                await whatsappService.sendMessage(
+                  targetBooking.customer.id,
+                  `Payment received successfully for ${targetBooking.service}. Your session is confirmed. M-Pesa receipt: ${mpesaReceipt || 'recorded'}. We will send your invoice shortly.`
+                );
+              } catch (fallbackErr: any) {
+                console.error('Failed to send WhatsApp payment confirmation fallback:', fallbackErr?.message || fallbackErr);
+              }
             }
 
             try {

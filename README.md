@@ -33,6 +33,25 @@ Core entrypoint:
 Core AI orchestrator:
 - [backend 2.0/src/services/agent/agent.service.ts](src/services/agent/agent.service.ts)
 
+## Admin Authentication
+
+The admin API uses bearer tokens signed with `AUTH_JWT_SECRET`. Set a unique secret of at least 32 characters in the backend environment. Generate one with:
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+```
+
+Create the first admin by setting `ADMIN_EMAIL`, `ADMIN_PASSWORD` (at least 12 characters), and optionally `ADMIN_NAME`, then run this from the `backend` directory:
+
+```powershell
+$env:ADMIN_EMAIL = "admin@example.com"
+$env:ADMIN_PASSWORD = "use-a-unique-password-of-at-least-12-chars"
+$env:ADMIN_NAME = "Fiesta House Admin"
+npm run admin:seed
+```
+
+The seed command creates the account or updates the matching email's password and admin role. It never prints the password. Configure `AUTH_JWT_SECRET` in both local backend configuration and the Render backend environment; configure `VITE_API_URL` in the frontend deployment to point to the backend origin.
+
 ## 2) High-Level Architecture
 
 ```mermaid
