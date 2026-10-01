@@ -13,12 +13,12 @@ import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.se
 const agent = new AgentService() as any;
 const conversationFlows = new ConversationFlowMatcher();
 
-test('keeps all 27 policy identifiers while omitting unrelated price tables', () => {
+test('keeps all policy identifiers while omitting unrelated price tables', () => {
   const fullPrompt = agent.getInstructionGuide();
   const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
   const pricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 28);
+  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 29);
   assert.match(fullPrompt, /THE BLOOM: Ksh 15,000/);
   assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
   assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
@@ -530,6 +530,11 @@ test('links to the dedicated Suspending Concept gallery after a contextual visua
 
   assert.match(reply, /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/);
   assert.equal(agent.getSuspendingConceptGalleryReply('Where can I see this idea?', []), null);
+  assert.equal(agent.getSuspendingConceptGalleryReply('Show me the packages', history), null);
+  assert.match(
+    agent.getSuspendingConceptGalleryReply('Show me some pictures', history),
+    /https:\/\/www\.fiestahousematernity\.com\/gallery\/suspending-concept/
+  );
 });
 
 test('links review and testimonial page requests to the reviews page', () => {

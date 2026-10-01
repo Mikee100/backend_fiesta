@@ -362,7 +362,7 @@
   {
     "id": "cmo8l2zif001010wyicc3cjiq",
     "question": "How do I book?",
-    "answer": "Choose your package and date, then pay deposit to Till number 670241. Share Mpesa confirmation to confirm booking.",
+    "answer": "Choose your package and date. Once you confirm the booking details, an M-Pesa STK push will be sent to your phone to pay the required deposit and secure your slot.",
     "category": "Booking",
     "embedding": "[]",
     "mediaUrls": "[]",

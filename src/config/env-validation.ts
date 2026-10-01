@@ -1,6 +1,7 @@
 const REQUIRED_ENV_VARS = [
   'DATABASE_URL',
   'GROQ_API_KEY',
+  'AUTH_JWT_SECRET',
 ] as const;
 
 const PLACEHOLDER_PATTERNS: RegExp[] = [
@@ -66,6 +67,11 @@ export function validateStartupEnv(): void {
   const groqKey = process.env.GROQ_API_KEY;
   if (groqKey && !groqKey.startsWith('gsk_')) {
     errors.push('GROQ_API_KEY must start with gsk_');
+  }
+
+  const authJwtSecret = process.env.AUTH_JWT_SECRET;
+  if (authJwtSecret && authJwtSecret.length < 32) {
+    errors.push('AUTH_JWT_SECRET must be at least 32 characters long');
   }
 
   const pineconeKey = process.env.PINECONE_API_KEY;
