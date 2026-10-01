@@ -18,6 +18,22 @@ function parseQuantity(note: string, fallback = 1): number {
 }
 
 export class BookingAddonService {
+  private async getBookingAddonScope(bookingId: string) {
+    const sessionNotes = await prisma.customerSessionNote.findMany({
+      where: { bookingId },
+      select: { id: true },
+    });
+
+    return {
+      OR: [
+        { bookingId },
+        ...(sessionNotes.length > 0
+          ? [{ sessionNoteId: { in: sessionNotes.map((note) => note.id) } }]
+          : []),
+      ],
+    };
+  }
+
   /**
    * Detect priced add-ons mentioned in a free-text note and persist them
    * as BookingAddon line items linked to the customer (and booking when known).
@@ -97,9 +113,10 @@ export class BookingAddonService {
     addonsTotal: number;
     lineItems: { name: string; quantity: number; unitPrice: number; totalPrice: number }[];
   }> {
+    const bookingAddonScope = await this.getBookingAddonScope(bookingId);
     const addons = await prisma.bookingAddon.findMany({
       where: {
-        bookingId,
+        ...bookingAddonScope,
         status: { in: ['pending', 'confirmed', 'invoiced'] },
       },
       orderBy: { createdAt: 'asc' },
@@ -117,8 +134,9 @@ export class BookingAddonService {
   }
 
   async markInvoiced(bookingId: string): Promise<void> {
+    const bookingAddonScope = await this.getBookingAddonScope(bookingId);
     await prisma.bookingAddon.updateMany({
-      where: { bookingId, status: { in: ['pending', 'confirmed'] } },
+      where: { ...bookingAddonScope, status: { in: ['pending', 'confirmed'] } },
       data: { status: 'invoiced' },
     });
   }

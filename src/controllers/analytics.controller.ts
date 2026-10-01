@@ -1,8 +1,68 @@
 import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import dayjs from 'dayjs';
+import { getGroqCooldownUntil } from '../services/agent/agent.service';
 
 export class AnalyticsController {
+
+  async getModelUsage(req: Request, res: Response) {
+    try {
+      const daysRaw = Number(req.query.days || 7);
+      const days = Number.isInteger(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 30) : 7;
+      const since = new Date();
+      since.setUTCHours(0, 0, 0, 0);
+      since.setUTCDate(since.getUTCDate() - days + 1);
+
+      const [rows, customerTotals, customers] = await Promise.all([
+        prisma.aiModelUsage.findMany({
+          where: { createdAt: { gte: since } },
+          select: { createdAt: true, provider: true, model: true, inputTokens: true, outputTokens: true, totalTokens: true, status: true, failover: true, errorCode: true },
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.customer.aggregate({ _sum: { totalTokensUsed: true } }),
+        prisma.customer.findMany({
+          where: { totalTokensUsed: { gt: 0 } },
+          select: { id: true, name: true, totalTokensUsed: true, dailyTokenUsage: true, tokenResetDate: true },
+          orderBy: { totalTokensUsed: 'desc' },
+          take: 20,
+        }),
+      ]);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const customerUsage = customers.map((customer) => ({
+        id: customer.id,
+        name: customer.name,
+        totalTokens: customer.totalTokensUsed,
+        todayTokens: customer.tokenResetDate && customer.tokenResetDate >= today ? customer.dailyTokenUsage : 0,
+      }));
+      const summary = {
+        groq: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
+        gemini: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
+      };
+      const daily = Array.from({ length: days }, (_, index) => {
+        const date = new Date(since);
+        date.setUTCDate(date.getUTCDate() + index);
+        return { date: date.toISOString().slice(0, 10), groq: 0, gemini: 0 };
+      });
+      const byDate = new Map(daily.map((day) => [day.date, day]));
+
+      for (const row of rows) {
+        if (row.provider !== 'groq' && row.provider !== 'gemini') continue;
+        const totals = summary[row.provider];
+        totals.calls++;
+        if (row.status !== 'success') totals.failures++;
+        totals.inputTokens += row.inputTokens;
+        totals.outputTokens += row.outputTokens;
+        totals.totalTokens += row.totalTokens;
+        const day = byDate.get(row.createdAt.toISOString().slice(0, 10));
+        if (day) day[row.provider] += row.totalTokens;
+      }
+
+      return res.json({ days, allTimeTokens: customerTotals._sum.totalTokensUsed || 0, customerUsage, summary, daily, recent: rows.slice(0, 12), groqCooldownUntil: getGroqCooldownUntil() });
+    } catch (error: any) {
+      return res.status(500).json({ error: 'Unable to load model usage' });
+    }
+  }
 
   /**
    * Get AI performance metrics from persisted observability data

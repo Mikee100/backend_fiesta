@@ -23,9 +23,97 @@ import { whatsappService } from '../messaging/whatsapp.service';
 const openai = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: 'https://api.groq.com/openai/v1',
+  maxRetries: 0,
 });
 
 const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant';
+const GEMINI_CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash';
+const gemini = process.env.GEMINI_API_KEY ? new OpenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+  maxRetries: 0,
+}) : null;
+type ChatProvider = 'groq' | 'gemini';
+const groqCooldownUntil = new WeakMap<Pick<OpenAI, 'chat'>, number>();
+
+export function getGroqCooldownUntil(client: Pick<OpenAI, 'chat'> = openai): string | null {
+  const until = groqCooldownUntil.get(client) || 0;
+  return until > Date.now() ? new Date(until).toISOString() : null;
+}
+
+function noteGroqRateLimit(error: any, client: Pick<OpenAI, 'chat'>): void {
+  const headers = error?.headers ?? error?.response?.headers;
+  const retryAfter = headers?.get?.('retry-after') ?? headers?.['retry-after'];
+  const seconds = Number(retryAfter);
+  const fromHeader = Number.isFinite(seconds) && seconds > 0
+    ? seconds * 1000
+    : retryAfter ? Date.parse(String(retryAfter)) - Date.now() : NaN;
+  const fallback = classifyProviderRateLimit(error) === 'daily_tpd_exhausted' ? 60 * 60_000 : 60_000;
+  const duration = Number.isFinite(fromHeader) && fromHeader > 0 ? fromHeader : fallback;
+  groqCooldownUntil.set(client, Math.max(groqCooldownUntil.get(client) || 0, Date.now() + Math.min(duration, 24 * 60 * 60_000)));
+}
+
+async function recordModelUsage(
+  provider: ChatProvider,
+  model: string,
+  response?: any,
+  error?: any,
+  failover = false
+): Promise<void> {
+  try {
+    await prisma.aiModelUsage.create({ data: {
+      provider,
+      model,
+      inputTokens: response?.usage?.prompt_tokens || 0,
+      outputTokens: response?.usage?.completion_tokens || 0,
+      totalTokens: response?.usage?.total_tokens || 0,
+      status: error ? 'failed' : 'success',
+      failover,
+      errorCode: error ? String(error?.status || error?.code || 'unknown') : null,
+    } });
+  } catch (storageError) {
+    console.error('Failed to record model usage:', storageError);
+  }
+}
+
+export async function createChatCompletion(
+  params: any,
+  preferredProvider: ChatProvider = 'groq',
+  clients: { groq: Pick<OpenAI, 'chat'>; gemini: Pick<OpenAI, 'chat'> | null } = { groq: openai, gemini }
+): Promise<{ response: any; provider: ChatProvider; completionCalls: number }> {
+  if (preferredProvider === 'gemini' || (clients.gemini && Date.now() < (groqCooldownUntil.get(clients.groq) || 0))) {
+    if (!clients.gemini) throw new Error('Gemini fallback is not configured');
+    try {
+      const response = await clients.gemini.chat.completions.create({ ...params, model: GEMINI_CHAT_MODEL });
+      await recordModelUsage('gemini', GEMINI_CHAT_MODEL, response, undefined, true);
+      return { response, provider: 'gemini', completionCalls: 1 };
+    } catch (error) {
+      await recordModelUsage('gemini', GEMINI_CHAT_MODEL, undefined, error, true);
+      throw error;
+    }
+  }
+
+  try {
+    const response = await clients.groq.chat.completions.create(params);
+    await recordModelUsage('groq', params.model, response);
+    return { response, provider: 'groq', completionCalls: 1 };
+  } catch (error: any) {
+    await recordModelUsage('groq', params.model, undefined, error);
+    const status = error?.status ?? error?.response?.status;
+    if (status === 429) noteGroqRateLimit(error, clients.groq);
+    const transientNetworkError = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED'].includes(error?.code);
+    if (!clients.gemini || !(status === 429 || status === 408 || status >= 500 || transientNetworkError)) throw error;
+    console.warn('Groq unavailable; switching chat completion to Gemini:', { status: status || error?.code });
+    try {
+      const response = await clients.gemini.chat.completions.create({ ...params, model: GEMINI_CHAT_MODEL });
+      await recordModelUsage('gemini', GEMINI_CHAT_MODEL, response, undefined, true);
+      return { response, provider: 'gemini', completionCalls: 2 };
+    } catch (fallbackError) {
+      await recordModelUsage('gemini', GEMINI_CHAT_MODEL, undefined, fallbackError, true);
+      throw fallbackError;
+    }
+  }
+}
 const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process.env.AI_MAX_COMPLETION_TOKENS) || 1500));
 const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
 const MAX_RAG_CONTEXT_CHUNKS = 3;
@@ -127,7 +215,7 @@ export class BookingExtractor {
   // ðŸ¤– STEP 3: AI Extraction (STRICT JSON)
   private async aiExtract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
-    const response = await openai.chat.completions.create({
+    const { response } = await createChatCompletion({
       model: CHAT_MODEL,
       messages: [
         {
@@ -265,32 +353,39 @@ export class AgentService {
   private async createCompletionWithToolNameGuard(
     params: any,
     allowedToolNames: string[],
-    fallbackTools?: OpenAI.Chat.Completions.ChatCompletionTool[]
-  ): Promise<{ response: any; completionCalls: number }> {
+    fallbackTools?: OpenAI.Chat.Completions.ChatCompletionTool[],
+    preferredProvider: ChatProvider = 'groq'
+  ): Promise<{ response: any; completionCalls: number; provider: ChatProvider }> {
+    let provider = preferredProvider;
+    let completionCalls = 0;
+    const request = async (requestParams: any) => {
+      const result = await createChatCompletion(requestParams, provider);
+      provider = result.provider;
+      completionCalls += result.completionCalls;
+      return result.response;
+    };
     try {
-      return { response: await openai.chat.completions.create(params), completionCalls: 1 };
+      return { response: await request(params), completionCalls, provider };
     } catch (error: any) {
       if (this.isToolCallWithoutToolsError(error)) {
         console.warn('Retrying completion after tool call was emitted with no tools exposed.');
         if (fallbackTools && fallbackTools.length > 0) {
           try {
-            return {
-              response: await openai.chat.completions.create({
+            const response = await request({
                 ...params,
                 tools: fallbackTools,
                 tool_choice: 'auto',
-              }),
-              completionCalls: 2,
-            };
+              });
+            return { response, completionCalls, provider };
           } catch (toolRetryError: any) {
+            if (isProviderRateLimitError(toolRetryError)) throw toolRetryError;
             console.warn('Retry with fallback tools failed:', toolRetryError?.message);
           }
         }
 
         try {
           const { tools: _tools, tool_choice: _toolChoice, ...toollessParams } = params;
-          return {
-            response: await openai.chat.completions.create({
+          const response = await request({
               ...toollessParams,
               messages: [
                 ...params.messages,
@@ -300,10 +395,10 @@ export class AgentService {
                 }
               ],
               temperature: 0,
-            }),
-            completionCalls: 2,
-          };
+            });
+          return { response, completionCalls, provider };
         } catch (textRetryError: any) {
+          if (isProviderRateLimitError(textRetryError)) throw textRetryError;
           console.error('Toolless retry failed after model emitted tool call:', textRetryError?.message);
           throw error;
         }
@@ -341,14 +436,12 @@ export class AgentService {
         }
       ];
 
-      return {
-        response: await openai.chat.completions.create({
+      const response = await request({
           ...params,
           messages: retryMessages,
           temperature: 0,
-        }),
-        completionCalls: 2,
-      };
+        });
+      return { response, completionCalls, provider };
     }
   }
 
@@ -749,6 +842,15 @@ export class AgentService {
     return value.replace(/[\u2010-\u2015\u2212]/g, '-');
   }
 
+  private isDecliningOptionalAddons(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const lastAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /^(?:no(?:\s*,?\s*i\s+(?:do(?:n't| not)\s+want|don't need))?.*|none|skip|no thanks|no thank you)\s*[.!]*$/i.test(userMessage.trim())
+      && /optional (?:add-ons|extras)|(?:add-ons|extras).*(?:optional|include|like)/i.test(lastAssistantMessage);
+  }
+
   private shouldExposeTools(
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[],
@@ -761,6 +863,9 @@ export class AgentService {
     }
 
     const text = userMessage.toLowerCase();
+    if (this.isDecliningOptionalAddons(userMessage, history)) {
+      return true;
+    }
     const explicitAction = /\b(book|schedule|reschedule|change|move|postpone|cancel|confirm|check\s+(?:availability|available\s+(?:slots|times))|availability|available\s+slots|reserve|hold\s+(?:a\s+)?(?:date|slot)|resend|send\s+(?:the\s+)?(?:payment|m-?pesa)|pay\s+(?:the\s+)?(?:deposit|balance)|add\s+(?:an?\s+)?(?:add-on|extra)|bringing|coming\s+with)\b/.test(text);
     const deliveryPreferenceAction = /\b(?:prefer|save|set|use|send|receive|deliver)\b.{0,35}\b(?:email|whatsapp|download\s+link|delivery)\b/.test(text);
     if (explicitAction || deliveryPreferenceAction) {
@@ -2286,7 +2391,7 @@ ${contextString}`;
       completion = await this.createCompletionWithToolNameGuard({
         ...completionParams,
         messages,
-      }, allowedToolNames, availableTools);
+      }, allowedToolNames, availableTools, completion.provider);
       currentResponse = completion.response;
       addUsage(usage, usageFromCompletion(currentResponse, completion.completionCalls));
     }
@@ -3218,7 +3323,11 @@ ${contextString}`;
       }));
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
-      const fallbackReply = isOutage
+      const pendingExtrasDecline = isOutage && (platform === 'whatsapp' || platform === 'web')
+        && this.isDecliningOptionalAddons(userMessage, history);
+      const fallbackReply = pendingExtrasDecline
+        ? 'Noted, no optional extras. Our booking assistant is temporarily unavailable, so I have not sent a deposit proposal or M-Pesa prompt. A team member will follow up to finish your booking.'
+        : isOutage
         ? PROVIDER_OUTAGE_MESSAGE
         : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
       await this.logAiJobMetric({
@@ -3243,6 +3352,9 @@ ${contextString}`;
         await this.escalate(customerId, 'error', `AI PROVIDER RATE LIMIT: requests are being limited. No automatic retry was attempted. Original error: ${error.message}`);
       } else if (justTripped && !isOutage) {
         await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
+      }
+      if (pendingExtrasDecline) {
+        await this.escalate(customerId, 'booking', 'Customer declined optional extras, but the AI provider is unavailable before the deposit proposal. Review the recent conversation, recheck slot availability, and send the booking proposal manually. No payment prompt was sent.');
       }
       return fallbackReply;
     }
