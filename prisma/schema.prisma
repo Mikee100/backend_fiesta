@@ -319,6 +319,23 @@ model AiJobMetric {
   @@index([strategyUsed])
 }
 
+model AiModelUsage {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+  provider     String
+  model        String
+  inputTokens  Int      @default(0)
+  outputTokens Int      @default(0)
+  totalTokens  Int      @default(0)
+  status       String   @default("success")
+  failover     Boolean  @default(false)
+  errorCode    String?
+
+  @@map("ai_model_usage")
+  @@index([createdAt])
+  @@index([provider, createdAt])
+}
+
 model PhotoLink {
   id         String   @id @default(cuid())
   link       String

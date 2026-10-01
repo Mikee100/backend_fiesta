@@ -564,6 +564,7 @@ app.get('/api/statistics/package-popularity', analyticsController.getPackagePopu
 app.get('/api/statistics/customer-emotions', analyticsController.getSentimentAnalysis.bind(analyticsController));
 app.get('/api/statistics/comprehensive', analyticsController.getBusinessKpis.bind(analyticsController));
 app.get('/api/statistics/ai-performance', analyticsController.getAiPerformance.bind(analyticsController));
+app.get('/api/statistics/model-usage', analyticsController.getModelUsage.bind(analyticsController));
 app.get('/api/statistics/personalized-responses', analyticsController.getPersonalizedResponses.bind(analyticsController));
 app.get('/api/statistics/system', (req, res) => res.json({ customers: { total: 0, active: 0 }, messages: { total: 0, responseRate: 100 }, bookings: { total: 0, completionRate: 100 } }));
 

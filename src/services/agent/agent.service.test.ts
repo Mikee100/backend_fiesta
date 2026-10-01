@@ -6,12 +6,101 @@ import prisma from '../../config/prisma';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
-import { AgentService, BookingExtractor } from './agent.service';
+import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
 
 const agent = new AgentService() as any;
 const conversationFlows = new ConversationFlowMatcher();
+
+test('falls back to Gemini on a Groq quota error and keeps later tool rounds on Gemini', async () => {
+  const calls: string[] = [];
+  const saved: any[] = [];
+  const originalCreate = prisma.aiModelUsage.create;
+  (prisma.aiModelUsage.create as any) = async ({ data }: any) => { saved.push(data); };
+  const clients = {
+    groq: { chat: { completions: { create: async () => {
+      calls.push('groq');
+      throw Object.assign(new Error('tokens per day'), { status: 429 });
+    } } } },
+    gemini: { chat: { completions: { create: async (params: any) => {
+      calls.push(params.model);
+      return { choices: [{ message: { content: 'Ready' } }], usage: { prompt_tokens: 30, completion_tokens: 12, total_tokens: 42 } };
+    } } } },
+  } as any;
+  const params = { model: 'openai/gpt-oss-20b', messages: [{ role: 'user', content: 'Book my session' }] };
+  try {
+    const first = await createChatCompletion(params, 'groq', clients);
+    assert.equal(first.provider, 'gemini');
+    assert.equal(first.completionCalls, 2);
+    const next = await createChatCompletion(params, first.provider, clients);
+    assert.equal(next.provider, 'gemini');
+    const geminiModel = process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash';
+    assert.deepEqual(calls, ['groq', geminiModel, geminiModel]);
+    assert.deepEqual(saved.map(({ provider, status, totalTokens, failover }) => ({ provider, status, totalTokens, failover })), [
+      { provider: 'groq', status: 'failed', totalTokens: 0, failover: false },
+      { provider: 'gemini', status: 'success', totalTokens: 42, failover: true },
+      { provider: 'gemini', status: 'success', totalTokens: 42, failover: true },
+    ]);
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
+test('skips Groq during its Retry-After cooldown and retries it after expiry', async () => {
+  const originalCreate = prisma.aiModelUsage.create;
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  let groqCalls = 0;
+  let geminiCalls = 0;
+  Date.now = () => now;
+  (prisma.aiModelUsage.create as any) = async () => ({});
+  const response = { choices: [{ message: { content: 'Ready' } }] };
+  const clients = {
+    groq: { chat: { completions: { create: async () => {
+      groqCalls++;
+      if (groqCalls === 1) {
+        throw Object.assign(new Error('tokens per day'), { status: 429, headers: new Headers({ 'retry-after': '120' }) });
+      }
+      return response;
+    } } } },
+    gemini: { chat: { completions: { create: async () => { geminiCalls++; return response; } } } },
+  } as any;
+  const params = { model: 'openai/gpt-oss-20b', messages: [{ role: 'user', content: 'Hello' }] };
+
+  try {
+    assert.equal((await createChatCompletion(params, 'groq', clients)).provider, 'gemini');
+    assert.equal(getGroqCooldownUntil(clients.groq), new Date(now + 120_000).toISOString());
+    assert.equal((await createChatCompletion(params, 'groq', clients)).completionCalls, 1);
+    assert.equal(groqCalls, 1);
+    assert.equal(geminiCalls, 2);
+    now += 120_001;
+    assert.equal(getGroqCooldownUntil(clients.groq), null);
+    assert.equal((await createChatCompletion(params, 'groq', clients)).provider, 'groq');
+    assert.equal(groqCalls, 2);
+  } finally {
+    Date.now = originalNow;
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
+test('does not route invalid Groq credentials to Gemini', async () => {
+  let fallbackCalled = false;
+  const originalCreate = prisma.aiModelUsage.create;
+  (prisma.aiModelUsage.create as any) = async () => ({});
+  const clients = {
+    groq: { chat: { completions: { create: async () => {
+      throw Object.assign(new Error('unauthorized'), { status: 401 });
+    } } } },
+    gemini: { chat: { completions: { create: async () => { fallbackCalled = true; } } } },
+  } as any;
+  try {
+    await assert.rejects(createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients), /unauthorized/);
+    assert.equal(fallbackCalled, false);
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
 
 test('keeps all policy identifiers while omitting unrelated price tables', () => {
   const fullPrompt = agent.getInstructionGuide();
@@ -798,6 +887,51 @@ test('refreshes an existing invoice with newly selected priced add-ons', async (
     bookingAddonService.sumForBooking = originals.sumForBooking;
     bookingAddonService.markInvoiced = originals.markInvoiced;
     invoiceService.generatePdf = originals.generatePdf;
+  }
+});
+
+test('includes add-ons linked through a booking session note when invoicing', async () => {
+  const originals = {
+    sessionNoteFindMany: prisma.customerSessionNote.findMany,
+    addonFindMany: prisma.bookingAddon.findMany,
+    addonUpdateMany: prisma.bookingAddon.updateMany,
+  };
+  let addonFindWhere: any;
+  let addonUpdateWhere: any;
+
+  (prisma.customerSessionNote.findMany as any) = async () => [{ id: 'note-1' }];
+  (prisma.bookingAddon.findMany as any) = async ({ where }: any) => {
+    addonFindWhere = where;
+    return [{ name: 'Suspending Concept', quantity: 1, unitPrice: 7000, totalPrice: 7000 }];
+  };
+  (prisma.bookingAddon.updateMany as any) = async ({ where }: any) => {
+    addonUpdateWhere = where;
+    return { count: 1 };
+  };
+
+  try {
+    const result = await bookingAddonService.sumForBooking('booking-1');
+    await bookingAddonService.markInvoiced('booking-1');
+
+    const expectedScope = {
+      OR: [
+        { bookingId: 'booking-1' },
+        { sessionNoteId: { in: ['note-1'] } },
+      ],
+    };
+    assert.equal(result.addonsTotal, 7000);
+    assert.deepEqual(addonFindWhere, {
+      ...expectedScope,
+      status: { in: ['pending', 'confirmed', 'invoiced'] },
+    });
+    assert.deepEqual(addonUpdateWhere, {
+      ...expectedScope,
+      status: { in: ['pending', 'confirmed'] },
+    });
+  } finally {
+    prisma.customerSessionNote.findMany = originals.sessionNoteFindMany;
+    prisma.bookingAddon.findMany = originals.addonFindMany;
+    prisma.bookingAddon.updateMany = originals.addonUpdateMany;
   }
 });
 
