@@ -283,6 +283,7 @@ export class AgentService {
               completionCalls: 2,
             };
           } catch (toolRetryError: any) {
+            if (isProviderRateLimitError(toolRetryError)) throw toolRetryError;
             console.warn('Retry with fallback tools failed:', toolRetryError?.message);
           }
         }
@@ -304,6 +305,7 @@ export class AgentService {
             completionCalls: 2,
           };
         } catch (textRetryError: any) {
+          if (isProviderRateLimitError(textRetryError)) throw textRetryError;
           console.error('Toolless retry failed after model emitted tool call:', textRetryError?.message);
           throw error;
         }
@@ -749,6 +751,15 @@ export class AgentService {
     return value.replace(/[\u2010-\u2015\u2212]/g, '-');
   }
 
+  private isDecliningOptionalAddons(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const lastAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /^(?:no(?:\s*,?\s*i\s+(?:do(?:n't| not)\s+want|don't need))?.*|none|skip|no thanks|no thank you)\s*[.!]*$/i.test(userMessage.trim())
+      && /optional (?:add-ons|extras)|(?:add-ons|extras).*(?:optional|include|like)/i.test(lastAssistantMessage);
+  }
+
   private shouldExposeTools(
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[],
@@ -761,6 +772,9 @@ export class AgentService {
     }
 
     const text = userMessage.toLowerCase();
+    if (this.isDecliningOptionalAddons(userMessage, history)) {
+      return true;
+    }
     const explicitAction = /\b(book|schedule|reschedule|change|move|postpone|cancel|confirm|check\s+(?:availability|available\s+(?:slots|times))|availability|available\s+slots|reserve|hold\s+(?:a\s+)?(?:date|slot)|resend|send\s+(?:the\s+)?(?:payment|m-?pesa)|pay\s+(?:the\s+)?(?:deposit|balance)|add\s+(?:an?\s+)?(?:add-on|extra)|bringing|coming\s+with)\b/.test(text);
     const deliveryPreferenceAction = /\b(?:prefer|save|set|use|send|receive|deliver)\b.{0,35}\b(?:email|whatsapp|download\s+link|delivery)\b/.test(text);
     if (explicitAction || deliveryPreferenceAction) {
@@ -3218,7 +3232,11 @@ ${contextString}`;
       }));
       const justTripped = circuitBreaker.recordFailure();
       const isOutage = isProviderRateLimitError(error);
-      const fallbackReply = isOutage
+      const pendingExtrasDecline = isOutage && (platform === 'whatsapp' || platform === 'web')
+        && this.isDecliningOptionalAddons(userMessage, history);
+      const fallbackReply = pendingExtrasDecline
+        ? 'Noted, no optional extras. Our booking assistant is temporarily unavailable, so I have not sent a deposit proposal or M-Pesa prompt. A team member will follow up to finish your booking.'
+        : isOutage
         ? PROVIDER_OUTAGE_MESSAGE
         : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
       await this.logAiJobMetric({
@@ -3243,6 +3261,9 @@ ${contextString}`;
         await this.escalate(customerId, 'error', `AI PROVIDER RATE LIMIT: requests are being limited. No automatic retry was attempted. Original error: ${error.message}`);
       } else if (justTripped && !isOutage) {
         await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
+      }
+      if (pendingExtrasDecline) {
+        await this.escalate(customerId, 'booking', 'Customer declined optional extras, but the AI provider is unavailable before the deposit proposal. Review the recent conversation, recheck slot availability, and send the booking proposal manually. No payment prompt was sent.');
       }
       return fallbackReply;
     }

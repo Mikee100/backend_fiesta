@@ -105,6 +105,10 @@ test('omits tool schemas for ordinary informational turns', () => {
   assert.equal(agent.shouldExposeTools('I want THE ICON next Saturday at 10 AM', [], 'whatsapp'), true);
   assert.equal(agent.shouldExposeTools('I want THE ICON next Saturday at 10 AM', [], 'instagram'), false);
   assert.equal(agent.shouldExposeTools('How much is the deposit?', [], 'whatsapp'), false);
+  const extrasQuestion = [{ role: 'assistant' as const, content: 'Would you like to add any optional extras to the ICON package? It is completely optional.' }];
+  assert.equal(agent.shouldExposeTools("No I don't want those", extrasQuestion, 'whatsapp'), true);
+  assert.equal(agent.shouldExposeTools("No I don't want those", extrasQuestion, 'instagram'), false);
+  assert.equal(agent.shouldExposeTools("No I don't want those", [], 'whatsapp'), false);
   assert.equal(agent.shouldExposeTools('Does my husband have to pay extra?', [{
     role: 'assistant', content: 'What time would work for you?'
   }], 'whatsapp'), false);
@@ -115,6 +119,37 @@ test('omits tool schemas for ordinary informational turns', () => {
   assert.equal(agent.shouldExposeTools('3rd?', [], 'whatsapp'), true);
   assert.equal(agent.shouldExposeTools('Saturday?', [], 'whatsapp'), true);
   assert.equal(agent.shouldExposeTools('2pm?', [], 'whatsapp'), true);
+});
+
+test('hands off a declined-extras booking when the provider daily limit is exhausted', async () => {
+  const originals = {
+    checkTokenBudget: agent.checkTokenBudget,
+    trackSentiment: agent.trackSentiment,
+    runAgent: agent.runAgent,
+    logAiJobMetric: agent.logAiJobMetric,
+    logConversationLearning: agent.logConversationLearning,
+    escalate: agent.escalate,
+  };
+  const escalations: string[] = [];
+  agent.checkTokenBudget = async () => true;
+  agent.trackSentiment = async () => {};
+  agent.runAgent = async () => {
+    throw Object.assign(new Error('tokens per day (TPD) limit reached'), { status: 429, code: 'rate_limit_exceeded' });
+  };
+  agent.logAiJobMetric = async () => {};
+  agent.logConversationLearning = async () => {};
+  agent.escalate = async (_customerId: string, _type: string, description: string) => { escalations.push(description); };
+
+  try {
+    const reply = await agent.handleMessage('customer-123', "No I don't want those", [{
+      role: 'assistant', content: 'Would you like to add any optional extras to the ICON package? It is completely optional.'
+    }], 'whatsapp');
+    assert.match(reply, /no optional extras/i);
+    assert.match(reply, /have not sent a deposit proposal or M-Pesa prompt/i);
+    assert.ok(escalations.some((description) => /declined optional extras.*recheck slot availability/i.test(description)));
+  } finally {
+    Object.assign(agent, originals);
+  }
 });
 
 test('skips the extractor completion for normal package selections', async () => {
