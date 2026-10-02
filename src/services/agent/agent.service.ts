@@ -455,6 +455,41 @@ export class AgentService {
     return this.messageContainsExplicitDateSignal(message) && this.messageContainsExplicitTimeSignal(message);
   }
 
+  /** Customers often give the date and time across separate messages ("8th at 6pm" then "lets do 3pm"). */
+  private hasRescheduleDateTimeSignal(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const hasDate = this.messageContainsExplicitDateSignal(userMessage);
+    const hasTime = this.messageContainsExplicitTimeSignal(userMessage);
+    if (hasDate && hasTime) return true;
+    if (!hasDate && !hasTime) return false;
+    const recentUserMessages = history.filter((m) => m.role === 'user').slice(-3).map((m) => m.content);
+    return hasDate
+      ? recentUserMessages.some((m) => this.messageContainsExplicitTimeSignal(m))
+      : recentUserMessages.some((m) => this.messageContainsExplicitDateSignal(m));
+  }
+
+  private getUnverifiedActionReply(
+    reply: string,
+    done: { rescheduled: boolean; cancelled: boolean; noteSaved: boolean }
+  ): string | null {
+    const claimsRescheduled = /\b(?:has been|have been|is now|i've|i have|successfully)\s+(?:rescheduled|moved)\b/i.test(reply);
+    if (claimsRescheduled && !done.rescheduled) {
+      return "Sorry, I haven't been able to apply that reschedule yet, so your booking is still on its original date and time. Please send the new date and time together (e.g. \"8th October at 3pm\") and I'll confirm it.";
+    }
+    const claimsCancelled = /\b(?:has been|have been|i've|i have|successfully)\s+cancell?ed\b/i.test(reply);
+    if (claimsCancelled && !done.cancelled) {
+      return "Sorry, I haven't been able to cancel that booking yet - it is still active. Please tell me the date of the session you'd like to cancel.";
+    }
+    const claimsAddonSaved = /\b(?:i've|i have)\s+(?:added|noted|included|recorded)\b|\bhas been added\b/i.test(reply)
+      && (/add-?on|extra/i.test(reply) || ADDON_CATALOG.some((item) => item.match.test(reply)));
+    if (claimsAddonSaved && !done.noteSaved) {
+      return "Sorry, I couldn't save that add-on just yet. Please tell me the add-on and quantity (e.g. \"2 extra outfits\") and I'll record it.";
+    }
+    return null;
+  }
+
   private messageContainsExplicitDateSignal(message: string): boolean {
     const text = message.toLowerCase();
     return /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(st|nd|rd|th)?\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
@@ -1127,10 +1162,17 @@ export class AgentService {
       : null;
     if (explicitSelection) return explicitSelection;
 
+    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
+
+    // "I want 2 of them" right after explaining a single add-on.
+    if (selectionSignal && lastAssistant && /\b(it|them|that|those|this|one|ones)\b/.test(text)) {
+      const discussed = ADDON_CATALOG.filter((item) => item.match.test(lastAssistant.content));
+      if (discussed.length === 1) return discussed[0];
+    }
+
     const affirmative = /^(?:yes+|yeah+|yep+|yup|sure|okay|ok)(?:\s*,?\s*(?:that's|that is|thats)\s+(?:what\s+i\s+want|what\s+i'd\s+like))?[.! ]*$/i;
     if (!affirmative.test(text.trim())) return null;
 
-    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
     if (!lastAssistant || !/\bif\s+you(?:'|’)d\s+like\b[\s\S]{0,160}\b(?:we|i)\s+can\s+(?:add|include)\b/i.test(lastAssistant.content)) {
       return null;
     }
@@ -1139,11 +1181,27 @@ export class AgentService {
     return offeredAddons.length === 1 ? offeredAddons[0] : null;
   }
 
-  private getAddonSelectionReply(addon: AddonCatalogItem): string {
+  private getRequestedAddonQuantity(userMessage: string, addon: AddonCatalogItem): number {
+    if (!addon.quantityFromNote) return 1;
+    const text = userMessage.toLowerCase();
+    const digits = text.match(/\b(\d{1,2})\b/);
+    if (digits) {
+      const qty = Number(digits[1]);
+      if (qty > 0 && qty <= 20) return qty;
+    }
+    const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, both: 2, couple: 2 };
+    const word = Object.keys(words).find((w) => new RegExp(`\\b${w}\\b`).test(text));
+    return word ? words[word] : 1;
+  }
+
+  private getAddonSelectionReply(addon: AddonCatalogItem, quantity = 1): string {
     const price = addon.unitPrice > 0
-      ? `Ksh ${addon.unitPrice.toLocaleString()}${addon.quantityFromNote ? ' each' : ''}`
+      ? quantity > 1
+        ? `${quantity} x Ksh ${addon.unitPrice.toLocaleString()} = Ksh ${(addon.unitPrice * quantity).toLocaleString()}`
+        : `Ksh ${addon.unitPrice.toLocaleString()}${addon.quantityFromNote ? ' each' : ''}`
       : 'quoted by package tier';
-    return `Noted: ${addon.name} (${price}). It will be added to the session balance, not the deposit. I have not changed your package or date. What would you like to confirm next?`;
+    const label = quantity > 1 ? `${quantity} x ${addon.name}` : addon.name;
+    return `Noted: ${label} (${price}). It will be added to the session balance, not the deposit. I have not changed your package or date. What would you like to confirm next?`;
   }
 
   private shouldUseBespokeReply(userMessage: string): boolean {
@@ -2175,7 +2233,13 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
 
     const customerName = customer?.name && customer.name !== 'WhatsApp User' ? customer.name : 'Unknown';
     const now2 = dayjs();
-    const upcomingBooking = customer?.bookings.find(b => dayjs(b.dateTime).isAfter(now2) && b.status !== 'cancelled');
+    const upcomingBookings = (customer?.bookings || [])
+      .filter(b => dayjs(b.dateTime).isAfter(now2) && b.status !== 'cancelled')
+      .sort((a, b) => a.dateTime.getTime() - b.dateTime.getTime());
+    const upcomingBooking = upcomingBookings[0];
+    const otherUpcomingBookings = upcomingBookings.slice(1)
+      .map(b => `${b.service} on ${inBusinessTimezone(b.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${b.status})`)
+      .join('; ') || 'None';
     const upcomingAddons = upcomingBooking?.bookingAddons || [];
     const upcomingNotes = upcomingBooking?.sessionNotes || [];
     const recipientSummary = upcomingBooking?.recipientName
@@ -2232,6 +2296,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
     const fullContext = `Customer Name: ${customerName}
   Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
 Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
+Other Upcoming Bookings: ${otherUpcomingBookings}
 Payment Status: ${paymentSummary}
 Past Bookings: ${pastBookings}
 Customer Memory: ${memorySummary}
@@ -2348,8 +2413,13 @@ ${contextString}`;
           type: 'function',
           function: {
             name: 'cancel_booking',
-            description: 'Cancels the customer\'s next upcoming confirmed appointment. Use this only when they explicitly ask to cancel. This actually updates the booking status and removes the Google Calendar event when present.',
-            parameters: { type: 'object', properties: {} }
+            description: 'Cancels one of the customer\'s upcoming appointments. Use this only when they explicitly ask to cancel. Pass the date of the specific appointment they mean (e.g. the one just discussed for "cancel that"). This actually updates the booking status and removes the Google Calendar event when present.',
+            parameters: {
+              type: 'object',
+              properties: {
+                date: { type: 'string', description: 'Date (YYYY-MM-DD) of the appointment to cancel. Required when the customer has more than one upcoming appointment.' }
+              }
+            }
           }
         },
         {
@@ -2399,6 +2469,8 @@ ${contextString}`;
     let proposedThisTurn = false; // blocks confirm_booking if propose_booking (even a re-propose with changed details) ran earlier in this same turn
     let confirmedActionThisTurn = false; // once a booking/reschedule is confirmed, blocks ALL further booking tool calls this turn - the model has looped and re-proposed unasked-for changes after a successful confirm before
     let rescheduleAppliedThisTurn = false;
+    let cancelledThisTurn = false;
+    let noteSavedThisTurn = false;
     while (currentResponse.choices[0].message.tool_calls && rounds < MAX_TOOL_ROUNDS) {
       rounds++;
       const responseMessage = currentResponse.choices[0].message;
@@ -2445,7 +2517,7 @@ ${contextString}`;
               }
             }
             else if (functionName === 'propose_reschedule') {
-              if (!extracted.date || !extracted.time || !this.messageContainsExplicitDateTimeSignal(userMessage)) {
+              if (!args.newDate || !args.newTime || !this.hasRescheduleDateTimeSignal(userMessage, history)) {
                 toolResponse = `ERROR: The customer has not actually stated a specific new date and time in their OWN message this turn. Do NOT invent one, and do NOT reuse the date/time from their existing upcoming booking as if it were a new request - ask them what date and time they'd like to reschedule to.`;
               } else {
                 const result = await this.executeProposeRescheduleTool(customerId, args.newDate, args.newTime);
@@ -2485,8 +2557,9 @@ ${contextString}`;
               }
             }
             else if (functionName === 'cancel_booking') {
-              const result = await this.executeCancelBookingTool(customerId);
+              const result = await this.executeCancelBookingTool(customerId, args.date);
               confirmedActionThisTurn = true;
+              cancelledThisTurn = true;
               toolResponse = `SUCCESS: Cancelled ${result.service} on ${dayjs(result.dateTime).format('YYYY-MM-DD HH:mm')}. Refund policy: ${result.refundEligible ? 'Eligible for refund (more than 72 hours before appointment).' : 'Not eligible for automatic refund (within 72 hours).'} This is DONE - do not call any more booking tools this turn.`;
             }
             else if (functionName === 'save_delivery_preference') {
@@ -2502,6 +2575,7 @@ ${contextString}`;
             else if (functionName === 'add_session_note') {
               const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type, args.category, args.priority, userMessage, platform);
               if (noteResult.created) {
+                noteSavedThisTurn = true;
                 toolResponse = `SUCCESS: Note added to session as ${noteResult.type}.`;
               } else {
                 toolResponse = `INFO: Note not queued (${noteResult.reason || 'non-actionable'}).`;
@@ -2586,7 +2660,18 @@ ${contextString}`;
       failureType: emptyResponse ? 'empty_model_response' : null,
     }));
 
-    const safeModelContent = this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
+    const unverifiedActionReply = this.getUnverifiedActionReply(modelContent, {
+      rescheduled: rescheduleAppliedThisTurn,
+      cancelled: cancelledThisTurn,
+      noteSaved: noteSavedThisTurn,
+    });
+    if (unverifiedActionReply) {
+      console.warn('[AGENT_FLOW] Blocked unverified action claim:', JSON.stringify({ customerRef: this.customerReference(customerId), reply: modelContent.slice(0, 200) }));
+    }
+
+    const safeModelContent = unverifiedActionReply
+      ? unverifiedActionReply
+      : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
       && !rescheduleAppliedThisTurn
       ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
       : this.formatCustomerReply(modelContent, userMessage, history);
@@ -3157,10 +3242,11 @@ ${contextString}`;
 
     const selectedAddon = this.getSelectedAddon(userMessage, history);
     if (selectedAddon) {
+      const addonQuantity = this.getRequestedAddonQuantity(userMessage, selectedAddon);
       const noteResult = await this.executeAddNoteTool(
         customerId,
         '',
-        selectedAddon.name,
+        addonQuantity > 1 ? `${addonQuantity} x ${selectedAddon.name}` : selectedAddon.name,
         'special_request',
         'addon',
         'normal',
@@ -3168,7 +3254,7 @@ ${contextString}`;
         platform
       );
       const addonReply = noteResult.created
-        ? this.getAddonSelectionReply(selectedAddon)
+        ? this.getAddonSelectionReply(selectedAddon, addonQuantity)
         : noteResult.reason === 'duplicate_pending_note'
           ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
           : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
@@ -4240,19 +4326,35 @@ ${contextString}`;
    * Cancels the next upcoming confirmed booking and removes its Google
    * Calendar event if linked.
    */
-  private async executeCancelBookingTool(customerId: string) {
-    const booking = await prisma.booking.findFirst({
-      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+  private async executeCancelBookingTool(customerId: string, date?: string) {
+    const upcoming = await prisma.booking.findMany({
+      where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
       orderBy: { dateTime: 'asc' }
     });
 
-    if (!booking) {
-      throw new Error('No upcoming confirmed booking found to cancel.');
+    if (upcoming.length === 0) {
+      throw new Error('No upcoming booking found to cancel.');
     }
 
+    const describe = (b: { service: string; dateTime: Date }) =>
+      `${b.service} on ${inBusinessTimezone(b.dateTime).format('YYYY-MM-DD h:mm A')}`;
+    const requestedDate = date?.trim();
+    const matches = requestedDate
+      ? upcoming.filter((b) => inBusinessTimezone(b.dateTime).format('YYYY-MM-DD') === requestedDate)
+      : upcoming;
+
+    if (matches.length === 0) {
+      throw new Error(`No upcoming booking on ${requestedDate}. Upcoming bookings: ${upcoming.map(describe).join('; ')}. Ask the customer which one to cancel.`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`Multiple upcoming bookings match: ${matches.map(describe).join('; ')}. Nothing was cancelled - ask the customer which one to cancel, then call cancel_booking with that date.`);
+    }
+
+    const booking = matches[0];
+    let calendarEventRemoved = !booking.googleEventId;
     if (booking.googleEventId) {
-      const deleted = await googleCalendarService.deleteEvent(booking.googleEventId);
-      if (!deleted) {
+      calendarEventRemoved = await googleCalendarService.deleteEvent(booking.googleEventId);
+      if (!calendarEventRemoved) {
         console.warn('Google Calendar delete failed during cancellation:', booking.googleEventId);
       }
     }
@@ -4261,7 +4363,8 @@ ${contextString}`;
       where: { id: booking.id },
       data: {
         status: 'cancelled',
-        googleEventId: null,
+        // Keep the id when deletion failed so the stale calendar event can still be found and removed.
+        ...(calendarEventRemoved ? { googleEventId: null } : {}),
       }
     });
 
@@ -4549,20 +4652,22 @@ ${contextString}`;
     // first, and fall back to the nearest upcoming booking when there's no
     // usable date, so the note still lands somewhere instead of crashing the tool call.
     const parsedDate = bookingDate ? dayjs(bookingDate) : null;
-    const booking = parsedDate?.isValid()
+    const bookingOnDate = parsedDate?.isValid()
       ? await prisma.booking.findFirst({
           where: {
             customerId: customerId,
+            status: { not: 'cancelled' },
             dateTime: {
               gte: parsedDate.startOf('day').toDate(),
               lte: parsedDate.endOf('day').toDate()
             }
           }
         })
-      : await prisma.booking.findFirst({
-          where: { customerId, dateTime: { gte: new Date() } },
-          orderBy: { dateTime: 'asc' }
-        });
+      : null;
+    const booking = bookingOnDate ?? await prisma.booking.findFirst({
+      where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' }
+    });
 
     const createdNote = await prisma.customerSessionNote.create({
       data: {
