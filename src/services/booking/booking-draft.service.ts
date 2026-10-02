@@ -1,5 +1,5 @@
-import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
+import { inBusinessTimezone } from '../../utils/time';
 
 export class BookingDraftService {
   async saveBookingProposal(input: {
@@ -8,7 +8,7 @@ export class BookingDraftService {
     dateTime: string;
     customerName: string;
   }) {
-    const dateTime = dayjs(input.dateTime);
+    const dateTime = inBusinessTimezone(input.dateTime);
     return prisma.bookingDraft.upsert({
       where: { customerId: input.customerId },
       update: {

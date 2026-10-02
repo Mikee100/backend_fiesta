@@ -2,11 +2,12 @@ import { Request, Response } from 'express';
 import prisma from '../config/prisma';
 import { googleCalendarService } from '../services/calendar/calendar.service';
 import { whatsappService } from '../services/messaging/whatsapp.service';
-import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
+import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT } from '../config/constants';
 import { notifyAdmin } from '../services/notifications/notification.service';
 import { invoiceService } from '../services/invoice/invoice.service';
 import { customerReplyTemplates } from '../services/messaging/customer-reply.templates';
 import { bookingAddonService } from '../services/booking/booking-addon.service';
+import { bookingService } from '../services/booking/booking.service';
 
 export class PaymentController {
   /**
@@ -50,6 +51,40 @@ export class PaymentController {
         if (ResultCode === 0) {
           // Success
           const mpesaReceipt = CallbackMetadata?.Item?.find((item: any) => item.Name === 'MpesaReceiptNumber')?.Value;
+
+          const isProductionMpesa = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase() === 'production';
+          if (isProductionMpesa && payment.amount < MINIMUM_BOOKING_DEPOSIT) {
+            await prisma.payment.update({
+              where: { id: payment.id },
+              data: {
+                status: 'success',
+                mpesaReceipt: mpesaReceipt || null,
+                bookingId: payment.booking?.id || null,
+              },
+            });
+            if (payment.bookingDraft) {
+              await prisma.bookingDraft.delete({ where: { id: payment.bookingDraft.id } });
+            }
+            try {
+              await notifyAdmin(
+                'booking',
+                `Under-minimum booking payment for ${payment.phone}`,
+                `M-Pesa received KSh ${payment.amount.toLocaleString()} (receipt ${mpesaReceipt || 'not provided'}), below the KSh ${MINIMUM_BOOKING_DEPOSIT.toLocaleString()} minimum. No new booking was confirmed.`,
+                { customerId: payment.bookingDraft?.customerId || payment.booking?.customerId, event: 'under_minimum_payment', mpesaReceipt }
+              );
+            } catch (notificationError: any) {
+              console.error('Failed to notify the team about an under-minimum payment:', notificationError?.message || notificationError);
+            }
+            try {
+              await whatsappService.sendMessage(
+                payment.phone,
+                `We received your M-Pesa payment of KSh ${payment.amount.toLocaleString()}${mpesaReceipt ? ` (receipt ${mpesaReceipt})` : ''}, but it is below the KSh ${MINIMUM_BOOKING_DEPOSIT.toLocaleString()} minimum deposit. We have not confirmed a new booking. The studio team will follow up about your payment.`
+              );
+            } catch (messageError: any) {
+              console.error('Failed to notify the customer about an under-minimum payment:', messageError?.message || messageError);
+            }
+            return;
+          }
           
           let targetBooking;
 
@@ -58,6 +93,37 @@ export class PaymentController {
             const draft = payment.bookingDraft;
             const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'bloom';
             const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+
+            const slotsResult = draft.date && draft.time
+              ? await bookingService.getAvailableSlots(draft.date, duration, undefined, draft.id)
+              : [];
+            const currentSlots = Array.isArray(slotsResult) ? slotsResult : [];
+            if (!currentSlots.includes(draft.time || '')) {
+              await prisma.payment.update({
+                where: { id: payment.id },
+                data: { status: 'success', mpesaReceipt: mpesaReceipt || null, bookingId: null },
+              });
+              await prisma.bookingDraft.delete({ where: { id: draft.id } });
+              try {
+                await notifyAdmin(
+                  'booking',
+                  `Paid booking slot conflict for ${payment.phone}`,
+                  `M-Pesa payment succeeded, but the requested slot ${draft.date || 'unknown date'} ${draft.time || 'unknown time'} was no longer available. No overlapping booking was created. Receipt: ${mpesaReceipt || 'not provided'}.`,
+                  { customerId: draft.customerId, event: 'paid_slot_conflict', draftId: draft.id, mpesaReceipt }
+                );
+              } catch (notificationError: any) {
+                console.error('Failed to notify the team about a paid booking slot conflict:', notificationError?.message || notificationError);
+              }
+              try {
+                await whatsappService.sendMessage(
+                  payment.phone,
+                  `We received your M-Pesa payment${mpesaReceipt ? ` (receipt ${mpesaReceipt})` : ''}, but ${draft.date || 'the requested date'} at ${draft.time || 'the requested time'} was no longer available when payment completed. We have not created an overlapping booking. The studio team will follow up with you about the booking and payment.`
+                );
+              } catch (messageError: any) {
+                console.error('Failed to notify the customer about a paid booking slot conflict:', messageError?.message || messageError);
+              }
+              return;
+            }
 
             targetBooking = await prisma.booking.create({
               data: {

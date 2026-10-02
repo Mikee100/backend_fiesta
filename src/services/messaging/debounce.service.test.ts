@@ -51,3 +51,36 @@ test('scheduleTurn: different customers get independent timers', () => {
     mock.timers.reset();
   }
 });
+
+test('scheduleTurn: serializes turns for the same customer when a flush is still running', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const flushed: string[] = [];
+    let releaseFirst!: () => void;
+    let finishSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondFinished = new Promise<void>((resolve) => { finishSecond = resolve; });
+
+    scheduleTurn('customer-e', async () => {
+      flushed.push('first-start');
+      await firstGate;
+      flushed.push('first-end');
+    });
+    mock.timers.tick(6000);
+    await Promise.resolve();
+
+    scheduleTurn('customer-e', async () => {
+      flushed.push('second');
+      finishSecond();
+    });
+    mock.timers.tick(6000);
+    await Promise.resolve();
+
+    assert.deepEqual(flushed, ['first-start']);
+    releaseFirst();
+    await secondFinished;
+    assert.deepEqual(flushed, ['first-start', 'first-end', 'second']);
+  } finally {
+    mock.timers.reset();
+  }
+});

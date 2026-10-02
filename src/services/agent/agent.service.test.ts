@@ -4,12 +4,14 @@ import axios from 'axios';
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { bookingDraftService } from '../booking/booking-draft.service';
+import { bookingService } from '../booking/booking.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
-
+import { inBusinessTimezone } from '../../utils/time';
 const agent = new AgentService() as any;
 const conversationFlows = new ConversationFlowMatcher();
 
@@ -258,6 +260,178 @@ test('recognizes a time-only reschedule request and time response', () => {
   assert.equal(conversationFlows.parseTimeOnly('25pm'), null);
 });
 
+test('stores a reschedule proposal as an explicit Nairobi-time instant', async () => {
+  const originals = {
+    bookingFindFirst: prisma.booking.findFirst,
+    bookingDraftUpsert: prisma.bookingDraft.upsert,
+    getAvailableSlots: bookingService.getAvailableSlots,
+  };
+  let savedDraft: any;
+  (prisma.booking.findFirst as any) = async () => ({
+    id: 'booking-123',
+    service: 'THE ICON',
+    dateTime: new Date('2026-10-04T12:00:00.000Z'),
+  });
+  (bookingService.getAvailableSlots as any) = async () => ['13:00'];
+  (prisma.bookingDraft.upsert as any) = async ({ update }: any) => {
+    savedDraft = update;
+    return update;
+  };
+
+  try {
+    await agent.executeProposeRescheduleTool('customer-123', '2026-10-06', '13:00');
+
+    assert.equal(savedDraft.dateTimeIso, '2026-10-06T10:00:00.000Z');
+    assert.equal(inBusinessTimezone(savedDraft.dateTimeIso).format('YYYY-MM-DD HH:mm'), '2026-10-06 13:00');
+  } finally {
+    prisma.booking.findFirst = originals.bookingFindFirst;
+    prisma.bookingDraft.upsert = originals.bookingDraftUpsert;
+    bookingService.getAvailableSlots = originals.getAvailableSlots;
+  }
+});
+
+test('rejects a booking proposal when the requested slot is occupied', async () => {
+  const originals = {
+    customerFindUnique: prisma.customer.findUnique,
+    bookingDraftFindUnique: prisma.bookingDraft.findUnique,
+    getAvailableSlots: bookingService.getAvailableSlots,
+    saveBookingProposal: bookingDraftService.saveBookingProposal,
+  };
+  let draftSaved = false;
+  (prisma.customer.findUnique as any) = async () => ({ id: 'customer-123', name: 'Joan' });
+  (prisma.bookingDraft.findUnique as any) = async () => ({ id: 'miriam-draft', isForSomeoneElse: true });
+  (bookingService.getAvailableSlots as any) = async () => ['15:00', '17:00'];
+  (bookingDraftService.saveBookingProposal as any) = async () => { draftSaved = true; };
+
+  try {
+    await assert.rejects(
+      agent.executeProposeBookingTool('customer-123', 'Joan', 'THE ICON', '2026-10-06T16:00'),
+      /unavailable on 2026-10-06/i
+    );
+    assert.equal(draftSaved, false);
+  } finally {
+    prisma.customer.findUnique = originals.customerFindUnique;
+    prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
+    bookingService.getAvailableSlots = originals.getAvailableSlots;
+    bookingDraftService.saveBookingProposal = originals.saveBookingProposal;
+  }
+});
+
+test('uses the customer-stated day over a conflicting model-proposed date', () => {
+  assert.equal(
+    agent.getAuthoritativeRequestedDate(
+      'she would want on 6th at 4pm',
+      '2026-10-07',
+      '2026-10-06'
+    ),
+    '2026-10-06'
+  );
+});
+
+test('allows low-value sandbox deposits but rejects them in production', () => {
+  const originalEnvironment = process.env.MPESA_ENVIRONMENT;
+  try {
+    process.env.MPESA_ENVIRONMENT = 'sandbox';
+    assert.equal(agent.getConfiguredBookingDeposit(10), 10);
+
+    process.env.MPESA_ENVIRONMENT = 'production';
+    assert.equal(agent.getConfiguredBookingDeposit(2000), 2000);
+    assert.throws(() => agent.getConfiguredBookingDeposit(10), /below the KSh 2,000 minimum/i);
+  } finally {
+    if (originalEnvironment === undefined) delete process.env.MPESA_ENVIRONMENT;
+    else process.env.MPESA_ENVIRONMENT = originalEnvironment;
+  }
+});
+
+test('rejects an unsupported all-set claim while collecting a new booking time', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'What date and time would work best for Miriam? I will check availability.',
+  }];
+
+  assert.equal(
+    agent.isUnverifiedBookingConfirmation(
+      'Your session is all set for Tuesday, 6 Oct at 4 pm. The payment has gone through.',
+      'she would want on 6th at 4pm',
+      history
+    ),
+    true
+  );
+  assert.equal(agent.isUnverifiedBookingConfirmation('Wonderful choice!', 'Lets go with the Icon', history), false);
+});
+
+test('handles a session mix-up correction without changing the existing booking', async () => {
+  const originals = {
+    getDraft: bookingDraftService.get,
+    getAvailableSlots: bookingService.getAvailableSlots,
+  };
+  bookingDraftService.get = async () => null as any;
+  (bookingService.getAvailableSlots as any) = async (date: string, duration: number) => {
+    assert.equal(date, '2026-10-06');
+    assert.equal(duration, 150);
+    return ['15:00', '17:00'];
+  };
+  const history = [
+    { role: 'user' as const, content: 'I want the separate session for Miriam.' },
+    { role: 'user' as const, content: 'Lets go with the Icon' },
+    { role: 'assistant' as const, content: 'Could you let me know a date and time that works best for Miriam?' },
+    { role: 'user' as const, content: 'she would want on 6th at 4pm' },
+  ];
+
+  try {
+    assert.equal(agent.isBookingIdentityCorrection('you are mixing two different sessions, that is mine and we are creating a new one'), true);
+    const reply = await agent.getBookingIdentityCorrectionReply('customer-123', history);
+    assert.match(reply, /existing appointment is unchanged/i);
+    assert.match(reply, /separate THE ICON session for Miriam/i);
+    assert.match(reply, /not available/i);
+    assert.match(reply, /not created another booking/i);
+  } finally {
+    bookingDraftService.get = originals.getDraft;
+    bookingService.getAvailableSlots = originals.getAvailableSlots;
+  }
+});
+
+test('availability excludes occupied appointments and competing booking drafts', async () => {
+  const originals = {
+    bookingFindMany: prisma.booking.findMany,
+    bookingDraftFindMany: prisma.bookingDraft.findMany,
+    getEvents: googleCalendarService.getEvents,
+  };
+  let bookings: any[] = [{
+    id: 'existing-booking',
+    dateTime: new Date('2026-10-06T10:00:00.000Z'),
+    durationMinutes: 150,
+  }];
+  let drafts: any[] = [];
+  (prisma.booking.findMany as any) = async () => bookings;
+  (prisma.bookingDraft.findMany as any) = async ({ where }: any) => {
+    assert.deepEqual(where.step.in, ['awaiting_confirmation', 'payment_pending']);
+    return drafts.filter((draft) => draft.id !== where.id?.not);
+  };
+  (googleCalendarService.getEvents as any) = async () => [];
+
+  try {
+    let slots = await bookingService.getAvailableSlots('2026-10-06', 150);
+    assert.equal(slots.includes('13:00'), false);
+
+    bookings = [];
+    drafts = [{
+      id: 'competing-draft',
+      service: 'THE ICON',
+      dateTimeIso: '2026-10-06T10:00:00.000Z',
+    }];
+    slots = await bookingService.getAvailableSlots('2026-10-06', 150);
+    assert.equal(slots.includes('13:00'), false);
+
+    slots = await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft');
+    assert.equal(slots.includes('13:00'), true);
+  } finally {
+    prisma.booking.findMany = originals.bookingFindMany;
+    prisma.bookingDraft.findMany = originals.bookingDraftFindMany;
+    googleCalendarService.getEvents = originals.getEvents;
+  }
+});
+
 test('recognizes a time reply following a time-only reschedule prompt', () => {
   const history = [{
     role: 'assistant' as const,
@@ -355,6 +529,58 @@ test('answers last-session questions from the most recent past booking', async (
     assert.doesNotMatch(reply, /upcoming session is on/);
   } finally {
     prisma.booking.findFirst = originalFindFirst;
+  }
+});
+
+test('routes plural previous-appointment requests to a past-only booking list', async () => {
+  const originalFindMany = prisma.booking.findMany;
+  let query: any;
+  (prisma.booking.findMany as any) = async (args: any) => {
+    query = args;
+    return [
+      { service: 'THE ICON', dateTime: new Date('2026-09-27T07:00:00.000Z'), status: 'confirmed' },
+      { service: 'THE MUSE', dateTime: new Date('2026-09-19T07:00:00.000Z'), status: 'confirmed' },
+    ];
+  };
+
+  try {
+    assert.equal(agent.shouldUsePastAppointmentsListReply('Could you show me the previous appointments I have had in the studio?'), true);
+    const reply = await agent.getPastAppointmentsListReply('customer-123');
+    assert.ok(query.where.dateTime.lt instanceof Date);
+    assert.ok(query.where.dateTime.lt.getTime() <= Date.now());
+    assert.match(reply, /Sunday, 27 September 2026/);
+    assert.match(reply, /Saturday, 19 September 2026/);
+    assert.match(reply, /doesn't confirm whether each session took place/i);
+  } finally {
+    prisma.booking.findMany = originalFindMany;
+  }
+});
+
+test('does not claim payment was received without a successful payment record', async () => {
+  const originals = {
+    bookingFindFirst: prisma.booking.findFirst,
+    paymentFindFirst: prisma.payment.findFirst,
+  };
+  let payment: any = null;
+  (prisma.booking.findFirst as any) = async () => ({
+    id: 'confirmed-booking',
+    service: 'THE ICON',
+    dateTime: new Date('2026-10-06T10:00:00.000Z'),
+  });
+  (prisma.payment.findFirst as any) = async () => payment;
+
+  try {
+    const unpaidStatusReply = await agent.getBookingStatusReply('customer-123');
+    assert.match(unpaidStatusReply || '', /session is confirmed/i);
+    assert.match(unpaidStatusReply || '', /can't verify a successful payment/i);
+    assert.doesNotMatch(unpaidStatusReply || '', /payment is received/i);
+
+    payment = { mpesaReceipt: 'ABC123' };
+    const paidStatusReply = await agent.getBookingStatusReply('customer-123');
+    assert.match(paidStatusReply || '', /payment is received and confirmed.*ABC123/i);
+  } finally {
+    prisma.booking.findFirst = originals.bookingFindFirst;
+    prisma.payment.findFirst = originals.paymentFindFirst;
   }
 });
 
@@ -805,6 +1031,8 @@ test('routes invoice requests to stored PDF delivery instead of a fabricated inv
     agent.extractInvoiceSessionDateRange('Give me the invoice for the 25th sep session'),
     { start: new Date('2026-09-24T21:00:00.000Z'), end: new Date('2026-09-25T21:00:00.000Z') }
   );
+  assert.equal(agent.shouldDeclineConsolidatedInvoiceRequest('Could you send me the full invoice for all sessions in one?'), true);
+  assert.equal(agent.shouldDeclineConsolidatedInvoiceRequest('Could you send me the invoice for the 25th sep session?'), false);
 });
 
 test('routes a not-received invoice follow-up to stored invoice delivery', () => {
@@ -813,8 +1041,52 @@ test('routes a not-received invoice follow-up to stored invoice delivery', () =>
     content: 'Your updated invoice has just been sent to your WhatsApp.'
   }];
 
+  assert.equal(agent.shouldUseInvoiceRequestReply('I have not received it', history), true);
   assert.equal(agent.shouldUseInvoiceRequestReply('I have not received it..send it to me', history), true);
   assert.equal(agent.shouldUseInvoiceRequestReply('I have not received it..send it to me', []), false);
+});
+
+test('keeps the selected session date when retrying an invoice delivery', () => {
+  const history = [
+    { role: 'assistant' as const, content: 'Please tell me which session date you need for the invoice.' },
+    { role: 'user' as const, content: 'the one on 19th september' },
+    { role: 'assistant' as const, content: 'I will pull up the invoice for your THE ICON session on 19 Sep 2026 and send it to you.' },
+  ];
+
+  assert.deepEqual(agent.getInvoiceSessionDateFromHistory(history), {
+    start: new Date('2026-09-18T21:00:00.000Z'),
+    end: new Date('2026-09-19T21:00:00.000Z'),
+  });
+});
+
+test('routes a selected session date to invoice delivery after asking which invoice is needed', () => {
+  const history = [{
+    role: 'assistant' as const,
+    content: 'Invoices are issued per booking. Please tell me which session date you need.',
+  }];
+
+  assert.equal(agent.shouldUseInvoiceRequestReply('the one on 19th september', history), true);
+  assert.equal(agent.shouldUseInvoiceRequestReply('the one on 19th september', []), false);
+});
+
+test('does not send a single booking invoice for a consolidated invoice request', async () => {
+  const originalInvoiceFindFirst = prisma.invoice.findFirst;
+  (prisma.invoice.findFirst as any) = async () => {
+    throw new Error('A consolidated request must not select one saved invoice');
+  };
+
+  try {
+    const reply = await agent.sendStoredInvoiceToCustomer(
+      'customer-123',
+      undefined,
+      [],
+      'Could you send me the full invoice for all sessions just in one?'
+    );
+    assert.match(reply, /cannot combine multiple sessions into one invoice/i);
+    assert.match(reply, /I have not sent an invoice/i);
+  } finally {
+    prisma.invoice.findFirst = originalInvoiceFindFirst;
+  }
 });
 
 test('refreshes an existing invoice with newly selected priced add-ons', async () => {

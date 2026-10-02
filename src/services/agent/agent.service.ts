@@ -6,7 +6,7 @@ import dayjs from 'dayjs';
 import { bookingService } from '../booking/booking.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
-import { SERVICE_DURATIONS, DEFAULT_DURATION, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
+import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT, PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION, ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
 import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, classifyProviderRateLimit, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
@@ -661,10 +661,15 @@ export class AgentService {
     const actionKeywords = /(send|sent|share|download|get|give(?: me)?|provide|view|need|can you|could you)/.test(text);
     if (invoiceKeywords && actionKeywords) return true;
 
+    const selectedSessionDate = this.extractInvoiceSessionDateRange(userMessage);
+    const assistantAskedForInvoiceDate = history.slice(-6).some((message) =>
+      message.role === 'assistant'
+      && /\binvoices?\b[\s\S]{0,300}\bwhich session date\b/i.test(message.content)
+    );
+    if (selectedSessionDate && assistantAskedForInvoiceDate) return true;
+
     const resendRequest = /\b(send|resend|forward|share|get|deliver)\b/.test(text)
       && /\b(it|that|this|again|another time)\b/.test(text);
-    if (!resendRequest) return false;
-
     const refersToInvoice = history.slice(-6).some((message) =>
       message.role === 'assistant' && /\binvoice\b|\bINV-\d{4}-\d{3}\b|pdf.{0,20}(?:whatsapp|sent|attached)/i.test(message.content)
     );
@@ -673,13 +678,174 @@ export class AgentService {
     return refersToInvoice && (reportsNotReceived || resendRequest);
   }
 
+  private getInvoiceSessionDateFromHistory(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): { start: Date; end: Date } | null {
+    let latestInvoiceDeliveryIndex = -1;
+    history.forEach((message, index) => {
+      if (
+        message.role === 'assistant'
+        && /\binvoice\b/i.test(message.content)
+        && /\b(send|sent|deliver|forward|pull up|email|attached)\b/i.test(message.content)
+      ) {
+        latestInvoiceDeliveryIndex = index;
+      }
+    });
+
+    if (latestInvoiceDeliveryIndex < 0) return null;
+    const selectedDate = history
+      .slice(0, latestInvoiceDeliveryIndex)
+      .reverse()
+      .find((message) => message.role === 'user' && this.extractInvoiceSessionDateRange(message.content));
+    return selectedDate ? this.extractInvoiceSessionDateRange(selectedDate.content) : null;
+  }
+
+  private shouldDeclineConsolidatedInvoiceRequest(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    const asksForInvoice = /\b(invoice|receipt|payment summary)\b/.test(text);
+    const asksForMultiple = /\b(all|every|each|combined|consolidated)\b/.test(text)
+      || /\b(?:one|single)\s+(?:combined\s+|consolidated\s+)?invoice\b/.test(text)
+      || /\bin one\b/.test(text);
+    return asksForInvoice && asksForMultiple;
+  }
+
+  private shouldUsePastAppointmentsListReply(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /\b(previous|past|earlier|prior)\s+(appointments|bookings|sessions|shoots)\b/.test(text)
+      || /\b(show|list)\b.*\b(previous|past|earlier|prior)\b.*\b(appointments|bookings|sessions|shoots)\b/.test(text)
+      || /\bwhat\s+(appointments|bookings|sessions|shoots)\s+have\s+i\s+had\b/.test(text);
+  }
+
+  private isUnverifiedBookingConfirmation(
+    reply: string,
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const claimsConfirmed = /\b(?:session is all set|booking is confirmed|session is confirmed|successfully booked|payment has gone through|payment is received and confirmed)\b/i.test(reply);
+    if (!claimsConfirmed) return false;
+
+    const bookingFlowInProgress = /\b(book|booking|reserve|package|new session|new appointment)\b/i.test(userMessage)
+      || history.slice(-6).some((message) =>
+        message.role === 'assistant'
+        && /\b(?:which|what|share|tell me|let me know).{0,80}\b(?:package|date|time|slot)\b|check availability/i.test(message.content)
+      );
+    return bookingFlowInProgress;
+  }
+
+  private isBookingIdentityCorrection(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    return /\b(mixing|mixed up)\b.{0,100}\b(session|booking)s?\b/.test(text)
+      || /\bthat(?:'s| is) mine\b.{0,100}\b(new|another|separate)\b/.test(text)
+      || /\bcreating a new one\b/.test(text);
+  }
+
+  private getRequestedBookingFromHistory(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): { recipient: string | null; service: string | null; date: string; time: string } | null {
+    const userMessages = history.filter((message) => message.role === 'user');
+    const requestedDateTimeMessage = [...userMessages].reverse().find((message) =>
+      /\b\d{1,2}(?:st|nd|rd|th)?\b[\s\S]{0,24}\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i.test(message.content)
+    );
+    if (!requestedDateTimeMessage) return null;
+
+    const match = requestedDateTimeMessage.content.match(
+      /\b(?:on\s+)?(\d{1,2})(?:st|nd|rd|th)?(?:\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?))?(?:,?\s+(\d{4}))?[\s\S]{0,24}?\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i
+    );
+    if (!match) return null;
+
+    const day = Number(match[1]);
+    const monthName = match[2]?.slice(0, 3).toLowerCase();
+    const monthIndex = monthName
+      ? ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(monthName)
+      : nowInBusinessTimezone().month();
+    const explicitYear = match[3] ? Number(match[3]) : null;
+    let requestedDate = nowInBusinessTimezone()
+      .year(explicitYear || nowInBusinessTimezone().year())
+      .month(monthIndex)
+      .date(day);
+    if (!requestedDate.isValid() || requestedDate.date() !== day || requestedDate.month() !== monthIndex) return null;
+    if (!explicitYear && requestedDate.isBefore(nowInBusinessTimezone(), 'day')) {
+      requestedDate = monthName ? requestedDate.add(1, 'year') : nowInBusinessTimezone().add(1, 'month').date(day);
+    }
+
+    const rawHour = Number(match[4]);
+    const minute = Number(match[5] || 0);
+    if (rawHour < 1 || rawHour > 12 || minute > 59) return null;
+    const hour = rawHour % 12 + (match[6].toLowerCase() === 'pm' ? 12 : 0);
+    const service = PACKAGE_NAMES_FOR_EXTRACTION.find((packageName) =>
+      userMessages.some((message) => message.content.toLowerCase().includes(packageName.toLowerCase()))
+    ) || null;
+    const recipientFromCustomer = [...userMessages].reverse()
+      .map((message) => message.content.match(/\bfor\s+(?:my\s+(?:sister|brother|friend|husband|wife|partner|mother|father|daughter|son)\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/))
+      .find(Boolean)?.[1] || null;
+
+    return {
+      recipient: recipientFromCustomer,
+      service,
+      date: requestedDate.format('YYYY-MM-DD'),
+      time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    };
+  }
+
+  private async getBookingIdentityCorrectionReply(
+    customerId: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): Promise<string> {
+    const request = this.getRequestedBookingFromHistory(history);
+    const draft = await bookingDraftService.get(customerId);
+    const recipient = draft?.recipientName || request?.recipient;
+    if (!request?.service || !request.date || !request.time || !recipient) {
+      return 'You’re right, I mixed up the sessions. Your existing appointment will remain unchanged, and I will not treat the separate booking as confirmed. Please confirm the recipient, package, date, and time for the new session.';
+    }
+
+    const duration = SERVICE_DURATIONS[request.service.toLowerCase()];
+    const slotsResult = await bookingService.getAvailableSlots(request.date, duration || DEFAULT_DURATION);
+    if (slotsResult?.status === 'closed') {
+      return `You’re right, I mixed up the sessions. Your existing appointment is unchanged. The separate ${request.service} request for ${recipient} is not booked; the studio is closed on ${inBusinessTimezone(request.date).format('dddd, D MMMM')}. Please choose another date.`;
+    }
+
+    const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
+    if (!availableSlots.includes(request.time)) {
+      const alternatives = availableSlots.slice(0, 4)
+        .map((time) => dayjs(`2000-01-01T${time}`).format('h:mm A'))
+        .join(', ');
+      return `You’re right, I mixed up the sessions. Your existing appointment is unchanged. The separate ${request.service} session for ${recipient} on ${inBusinessTimezone(request.date).format('dddd, D MMMM')} at ${dayjs(`2000-01-01T${request.time}`).format('h:mm A')} is not available, so I have not created another booking. Available times are ${alternatives || 'none'}. Which would work?`;
+    }
+
+    return `You’re right, I mixed up the sessions. Your existing appointment is unchanged. I understand this is a separate ${request.service} booking for ${recipient}. ${inBusinessTimezone(request.date).format('dddd, D MMMM')} at ${dayjs(`2000-01-01T${request.time}`).format('h:mm A')} is available, but it is not booked yet. What is ${recipient}’s full name so I can prepare the booking correctly?`;
+  }
+
+  private async getPastAppointmentsListReply(customerId: string): Promise<string> {
+    const bookings = await prisma.booking.findMany({
+      where: {
+        customerId,
+        status: { not: 'cancelled' },
+        dateTime: { lt: new Date() },
+      },
+      orderBy: { dateTime: 'desc' },
+      select: { service: true, dateTime: true, status: true },
+    });
+
+    if (bookings.length === 0) return "I don't see any past bookings on record yet.";
+
+    const entries = bookings.map((booking) =>
+      `${booking.service} - ${inBusinessTimezone(booking.dateTime).format('dddd, D MMMM YYYY')} (booking status: ${booking.status})`
+    );
+    return `Here are the past booking records I can see. The booking record doesn't confirm whether each session took place:\n${entries.join('\n')}`;
+  }
+
   private async sendStoredInvoiceToCustomer(
     customerId: string,
     requestedInvoiceNumber?: string,
     history: { role: 'user' | 'assistant'; content: string }[] = [],
     userMessage = ''
   ): Promise<string> {
-    const requestedSessionDate = this.extractInvoiceSessionDateRange(userMessage);
+    if (this.shouldDeclineConsolidatedInvoiceRequest(userMessage)) {
+      return 'Invoices are issued per booking, and I cannot combine multiple sessions into one invoice here. I have not sent an invoice, so I do not send the wrong session by mistake. Please tell me which session date you need, or ask the studio team about a consolidated statement.';
+    }
+
+    const requestedSessionDate = this.extractInvoiceSessionDateRange(userMessage)
+      || this.getInvoiceSessionDateFromHistory(history);
     const refersToPastAppointment = !requestedInvoiceNumber && [...history].reverse()
       .find((message) => message.role === 'assistant')?.content
       .includes('The most recent past booking I have on record is');
@@ -1816,7 +1982,10 @@ export class AgentService {
         orderBy: { updatedAt: 'desc' },
       });
       const receiptNote = successfulPayment?.mpesaReceipt ? ` (M-Pesa receipt: ${successfulPayment.mpesaReceipt})` : '';
-      return `Yes, your payment is received and confirmed${receiptNote}! Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+      const sessionDetails = `Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+      return successfulPayment
+        ? `Your payment is received and confirmed${receiptNote}. ${sessionDetails}`
+        : `${sessionDetails} I can't verify a successful payment from the records I can see; the studio team can confirm the payment status.`;
     }
 
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
@@ -1934,7 +2103,7 @@ A1. PLATFORM CAPABILITY GATE - CHECK THIS BEFORE STARTING ANY BOOKING FLOW: you 
 A2. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
 A3. Never assume, guess, or invent a date or time for a booking, reschedule, or anything else the customer hasn't explicitly stated.
 A4. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel their appointment, call 'cancel_booking' before telling them it is cancelled. Never claim a cancellation succeeded unless this tool returns success.
-A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. If the customer already has a confirmed booking or Payment Status indicates their deposit was paid, NEVER tell the customer that their payment is pending, and never ask them to enter their PIN again. Confirm warmly that their payment has been received and their session is confirmed.
+A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. Only say a deposit was received or paid when Payment Status explicitly says it succeeded/was paid. A confirmed booking status alone does not prove payment was received. If the booking is confirmed but payment status is missing or unclear, confirm only the booking and offer to have the team verify payment. Never state a deposit was forfeited unless a successful reschedule tool result or another verified source explicitly says it was forfeited. Keep payment received, booking confirmed, and deposit forfeited as distinct facts.
 A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done.
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
@@ -2021,7 +2190,9 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
     const upcomingBookingSummary = upcomingBooking
       ? `${upcomingBooking.service} on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')} (status: ${upcomingBooking.status}; duration: ${upcomingBooking.durationMinutes || DEFAULT_DURATION} minutes).${recipientSummary}${addonSummary}${noteSummary}`
       : 'None';
-    const pastBookings = customer?.bookings.map(b =>
+    const pastBookings = customer?.bookings
+      .filter((booking) => dayjs(booking.dateTime).isBefore(now2) && booking.status !== 'cancelled')
+      .map(b =>
       `${b.service} on ${inBusinessTimezone(b.dateTime).format('YYYY-MM-DD')} (${b.status})`
     ).join(', ') || 'No past bookings';
 
@@ -2039,7 +2210,9 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
         where: { bookingId: upcomingBooking.id, status: 'success' },
         orderBy: { updatedAt: 'desc' },
       });
-      paymentSummary = `PAID & CONFIRMED via M-Pesa${paidPayment?.mpesaReceipt ? ` (Receipt: ${paidPayment.mpesaReceipt})` : ''}. The booking is fully secured. Do NOT claim the payment is pending.`;
+      paymentSummary = paidPayment
+        ? `PAYMENT SUCCEEDED via M-Pesa${paidPayment.mpesaReceipt ? ` (Receipt: ${paidPayment.mpesaReceipt})` : ''}. The booking is confirmed. Do NOT claim the payment is pending.`
+        : 'The booking is confirmed, but no successful payment is recorded. Do not say the deposit was paid or received; tell the customer the studio team can verify payment status.';
     } else if (draftBeforeThisTurn?.step === 'payment_pending') {
       paymentSummary = 'Payment pending user M-Pesa PIN entry for booking draft.';
     }
@@ -2225,6 +2398,7 @@ ${contextString}`;
     let rounds = 0;
     let proposedThisTurn = false; // blocks confirm_booking if propose_booking (even a re-propose with changed details) ran earlier in this same turn
     let confirmedActionThisTurn = false; // once a booking/reschedule is confirmed, blocks ALL further booking tool calls this turn - the model has looped and re-proposed unasked-for changes after a successful confirm before
+    let rescheduleAppliedThisTurn = false;
     while (currentResponse.choices[0].message.tool_calls && rounds < MAX_TOOL_ROUNDS) {
       rounds++;
       const responseMessage = currentResponse.choices[0].message;
@@ -2295,6 +2469,7 @@ ${contextString}`;
                 toolResponse = `ERROR: You already called propose_reschedule earlier in this same turn - possibly with different details than what the customer last saw and agreed to. You must stop here and wait for the customer's own separate message explicitly confirming before calling confirm_reschedule.`;
               } else {
                 const result = await this.executeConfirmRescheduleTool(customerId, initialDraftStep);
+                rescheduleAppliedThisTurn = true;
                 await this.notifyRescheduleAdmin({
                   customerId,
                   event: 'confirmed',
@@ -2306,7 +2481,7 @@ ${contextString}`;
                 const policyNotice = result.depositForfeited
                   ? ' The customer was rescheduled within 72 hours, so the deposit was forfeited according to policy.'
                   : '';
-                toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${dayjs(result.newDateTime).format('YYYY-MM-DD HH:mm')}.${policyNotice} This is DONE - do not call any more booking tools this turn.`;
+                toolResponse = `SUCCESS: Booking for ${result.service} rescheduled to ${inBusinessTimezone(result.newDateTime).format('YYYY-MM-DD HH:mm')} Nairobi time.${policyNotice} This is DONE - do not call any more booking tools this turn.`;
               }
             }
             else if (functionName === 'cancel_booking') {
@@ -2411,10 +2586,15 @@ ${contextString}`;
       failureType: emptyResponse ? 'empty_model_response' : null,
     }));
 
+    const safeModelContent = this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
+      && !rescheduleAppliedThisTurn
+      ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
+      : this.formatCustomerReply(modelContent, userMessage, history);
+
     return {
       content: emptyResponse
         ? 'Sorry, I lost the thread there. Could you tell me a little more about what you need?'
-        : this.formatCustomerReply(modelContent, userMessage, history),
+        : safeModelContent,
       tokensUsed: usage.totalTokens,
       ...(emptyResponse ? { failureType: 'empty_model_response' } : {}),
     };
@@ -2500,6 +2680,21 @@ ${contextString}`;
         `Customer hit the daily AI token budget (cap: ${DAILY_TOKEN_CAP}). The bot sent the quota fallback instead of continuing the conversation.`
       );
       return fallbackReply;
+    }
+
+    if (this.isBookingIdentityCorrection(userMessage)) {
+      const correctionReply = await this.getBookingIdentityCorrectionReply(customerId, history);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: correctionReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return correctionReply;
     }
 
     if (this.shouldCaptureRecipientName(userMessage, history)) {
@@ -2603,6 +2798,21 @@ ${contextString}`;
         });
         return appointmentTimeReply;
       }
+    }
+
+    if (this.shouldUsePastAppointmentsListReply(userMessage)) {
+      const pastAppointmentsReply = await this.getPastAppointmentsListReply(customerId);
+      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
+      await this.logConversationLearning({
+        customerId,
+        userMessage,
+        aiResponse: pastAppointmentsReply,
+        platform,
+        latencyMs: Date.now() - startedAt,
+        wasSuccessful: true,
+        isFallback: false,
+      });
+      return pastAppointmentsReply;
     }
 
     if (this.shouldUseLastAppointmentDetailsReply(userMessage)) {
@@ -3755,16 +3965,49 @@ ${contextString}`;
       throw new Error(`"${service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these before booking.`);
     }
 
+    const requestedSlot = date.match(/^(\d{4}-\d{2}-\d{2})T(\d{1,2}):(\d{2})/);
+    if (!requestedSlot) {
+      throw new Error('The requested date and time are invalid. Ask the customer to provide a date and time, then check availability.');
+    }
+    const requestedDate = requestedSlot[1];
+    const hour = Number(requestedSlot[2]);
+    const minute = Number(requestedSlot[3]);
+    const requestedTime = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+    if (hour > 23 || minute > 59) {
+      throw new Error('The requested time is invalid. Ask the customer to choose a valid time.');
+    }
+
+    const slotsResult: any = await bookingService.getAvailableSlots(
+      requestedDate,
+      SERVICE_DURATIONS[serviceKey],
+      undefined,
+      existingDraft?.id
+    );
+    if (slotsResult?.status === 'closed') {
+      throw new Error(`The studio is closed on ${requestedDate}. Ask the customer to select another date.`);
+    }
+    const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
+    if (!availableSlots.includes(requestedTime)) {
+      throw new Error(`That time is unavailable on ${requestedDate}. Available times are: ${availableSlots.join(', ') || 'none'}. Ask the customer to choose an available time.`);
+    }
+
+    const dateTimeIso = businessDay(requestedDate)
+      .hour(hour)
+      .minute(minute)
+      .second(0)
+      .millisecond(0)
+      .toISOString();
+
     // Fetch package to get deposit amount
     const pkg = await prisma.package.findFirst({
       where: { name: { contains: serviceKey, mode: 'insensitive' } }
     });
-    const depositAmount = pkg?.deposit || 2000;
+    const depositAmount = this.getConfiguredBookingDeposit(pkg?.deposit);
 
     await bookingDraftService.saveBookingProposal({
       customerId: customer.id,
       service,
-      dateTime: date,
+      dateTime: dateTimeIso,
       customerName: name,
     });
 
@@ -3789,10 +4032,27 @@ ${contextString}`;
     }
 
     const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
+    if (!draft.date || !draft.time) {
+      throw new Error('The pending booking is missing its date or time. Ask the customer to start the booking again.');
+    }
+    const slotsResult: any = await bookingService.getAvailableSlots(
+      draft.date,
+      SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION,
+      undefined,
+      draft.id
+    );
+    if (slotsResult?.status === 'closed') {
+      throw new Error(`The studio is closed on ${draft.date}. Do not start payment for this booking.`);
+    }
+    const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
+    if (!availableSlots.includes(draft.time)) {
+      throw new Error(`The proposed time ${draft.time} on ${draft.date} is no longer available. Do not start payment; ask the customer to choose another time.`);
+    }
+
     const pkg = await prisma.package.findFirst({
       where: { name: { contains: serviceKey, mode: 'insensitive' } }
     });
-    const depositAmount = pkg?.deposit || 2000;
+    const depositAmount = this.getConfiguredBookingDeposit(pkg?.deposit);
 
     await bookingDraftService.markPaymentPending(customerId);
 
@@ -3833,6 +4093,15 @@ ${contextString}`;
     }
   }
 
+  private getConfiguredBookingDeposit(configuredDeposit?: number | null): number {
+    const depositAmount = configuredDeposit ?? MINIMUM_BOOKING_DEPOSIT;
+    const isProductionMpesa = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase() === 'production';
+    if (!Number.isInteger(depositAmount) || depositAmount < 1 || (isProductionMpesa && depositAmount < MINIMUM_BOOKING_DEPOSIT)) {
+      throw new Error(`The configured booking deposit is below the KSh ${MINIMUM_BOOKING_DEPOSIT.toLocaleString()} minimum. Do not initiate payment; ask the studio team to correct package pricing.`);
+    }
+    return depositAmount;
+  }
+
   /**
    * Step 1 of 2 for rescheduling: validates there's an upcoming confirmed
    * booking and saves the proposed new date/time on the customer's
@@ -3865,7 +4134,14 @@ ${contextString}`;
       throw new Error(`${newTime} on ${newDateLabel} isn't available. Available times that day: ${availableSlots.length > 0 ? availableSlots.join(', ') : 'none'}. Ask the customer to pick one of these instead. Always refer to the date using this exact weekday - do not guess it.`);
     }
 
-    const newDateTimeIso = `${newDate}T${newTime}`;
+    const [hour, minute] = newTime.split(':').map(Number);
+    const newDateTimeIso = businessDay(newDate)
+      .startOf('day')
+      .hour(hour)
+      .minute(minute)
+      .second(0)
+      .millisecond(0)
+      .toISOString();
 
     await prisma.bookingDraft.upsert({
       where: { customerId },
