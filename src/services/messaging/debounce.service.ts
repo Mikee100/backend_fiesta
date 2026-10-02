@@ -8,6 +8,7 @@
 const DEBOUNCE_MS = 6000;
 
 const pendingTimers = new Map<string, NodeJS.Timeout>();
+const activeFlushes = new Map<string, Promise<void>>();
 
 export function scheduleTurn(customerId: string, onFlush: () => void | Promise<void>): void {
   const existing = pendingTimers.get(customerId);
@@ -15,7 +16,16 @@ export function scheduleTurn(customerId: string, onFlush: () => void | Promise<v
 
   const timer = setTimeout(() => {
     pendingTimers.delete(customerId);
-    Promise.resolve(onFlush()).catch(err => console.error(`Debounced turn failed for ${customerId}:`, err));
+    const previousFlush = activeFlushes.get(customerId) || Promise.resolve();
+    const flush = previousFlush
+      .catch(() => undefined)
+      .then(onFlush);
+    activeFlushes.set(customerId, flush);
+    void flush
+      .catch(err => console.error(`Debounced turn failed for ${customerId}:`, err))
+      .finally(() => {
+        if (activeFlushes.get(customerId) === flush) activeFlushes.delete(customerId);
+      });
   }, DEBOUNCE_MS);
 
   pendingTimers.set(customerId, timer);

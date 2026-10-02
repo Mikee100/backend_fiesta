@@ -131,7 +131,8 @@ export class WhatsAppController {
                 platform: 'whatsapp',
                 direction: 'inbound',
                 customerId: from,
-                externalId: msgId
+                externalId: msgId,
+                handledBy: isNonText ? 'system' : 'pending'
               }
             });
           } catch (e: any) {
@@ -189,17 +190,12 @@ export class WhatsAppController {
   private async processPendingTurn(customerId: string): Promise<void> {
     try {
       console.log(`[WHATSAPP_TURN] Starting turn processing for customer ${customerId}`);
-      const lastOutbound = await retryOnPrismaDisconnect(prisma, () => prisma.message.findFirst({
-        where: { customerId, platform: 'whatsapp', direction: 'outbound' },
-        orderBy: { createdAt: 'desc' }
-      }));
-
       const pendingInbound = await retryOnPrismaDisconnect(prisma, () => prisma.message.findMany({
         where: {
           customerId,
           platform: 'whatsapp',
           direction: 'inbound',
-          ...(lastOutbound ? { createdAt: { gt: lastOutbound.createdAt } } : {})
+          handledBy: 'pending'
         },
         orderBy: { createdAt: 'asc' }
       }));
@@ -238,6 +234,11 @@ export class WhatsAppController {
 
       await prisma.message.create({
         data: { content: aiReply, platform: 'whatsapp', direction: 'outbound', customerId, handledBy: 'ai' }
+      });
+
+      await prisma.message.updateMany({
+        where: { id: { in: pendingInbound.map(message => message.id) }, handledBy: 'pending' },
+        data: { handledBy: 'ai' }
       });
 
       await whatsappService.sendMessage(customerId, aiReply);

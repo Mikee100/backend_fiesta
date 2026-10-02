@@ -8,11 +8,13 @@ export class BookingService {
   
   /**
    * Get available time slots for a specific date and duration.
-   * excludeBookingId lets a reschedule check availability without the
+  * excludeBookingId lets a reschedule check availability without the
    * customer's own current booking (still 'confirmed' until the reschedule is
    * applied) falsely counting as a conflict against itself.
+  * excludeDraftId lets a proposal recheck availability without conflicting
+  * with its own temporary slot hold.
    */
-  async getAvailableSlots(date: string, durationMinutes: number, excludeBookingId?: string) {
+  async getAvailableSlots(date: string, durationMinutes: number, excludeBookingId?: string, excludeDraftId?: string) {
     const startOfDay = businessDay(date).startOf('day');
     const endOfDay = businessDay(date).endOf('day');
 
@@ -32,17 +34,16 @@ export class BookingService {
       }
     });
 
-    // 1b. Fetch active booking drafts (pending payment) from last 15 minutes
+    // 1b. Fetch active proposal/payment drafts from last 15 minutes as holds.
     const fifteenMinutesAgo = nowInBusinessTimezone().subtract(15, 'minute').toDate();
     const activeDrafts = await prisma.bookingDraft.findMany({
       where: {
-        step: 'payment_pending',
+        step: { in: ['awaiting_confirmation', 'payment_pending'] },
         updatedAt: {
           gte: fifteenMinutesAgo
         },
-        dateTimeIso: {
-          startsWith: date // Matches the YYYY-MM-DD part
-        }
+        dateTimeIso: { not: null },
+        ...(excludeDraftId ? { id: { not: excludeDraftId } } : {}),
       }
     });
 
@@ -88,6 +89,7 @@ export class BookingService {
         const overlapsDraft = activeDrafts.some(draft => {
           if (!draft.dateTimeIso) return false;
           const dStart = businessDay(draft.dateTimeIso);
+          if (!dStart.isSame(startOfDay, 'day')) return false;
           const dServiceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
           const dDuration = SERVICE_DURATIONS[dServiceKey] || DEFAULT_DURATION;
           const dEnd = dStart.add(dDuration, 'minute');
