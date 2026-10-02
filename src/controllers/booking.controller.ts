@@ -240,15 +240,15 @@ export class BookingController {
         return res.status(404).json({ error: 'Booking not found' });
       }
 
-      if (existing.googleEventId) {
-        await googleCalendarService.deleteEvent(existing.googleEventId);
-      }
+      const calendarEventRemoved = existing.googleEventId
+        ? await googleCalendarService.deleteEvent(existing.googleEventId)
+        : true;
 
       const booking = await prisma.booking.update({
         where: { id },
         data: {
           status: 'cancelled',
-          googleEventId: null,
+          ...(calendarEventRemoved ? { googleEventId: null } : {}),
         }
       });
 
