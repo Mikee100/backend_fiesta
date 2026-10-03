@@ -164,6 +164,7 @@ model BookingDraft {
   step        String   // current step: service, date, time, name, confirm, reschedule, reschedule_confirm
   conflictResolution String? // Tracks user's choice when conflict: 'cancel_existing', 'modify_existing', 'different_time'
   bookingId   String?  // ID of booking being rescheduled (for reschedule flow)
+  cancelProposedAt DateTime? // Fixed start time for cancellation proposal expiry
   version     Int      @default(1) // For optimistic locking
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

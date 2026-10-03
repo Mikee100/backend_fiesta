@@ -118,6 +118,7 @@ const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process
 const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
 const MAX_RAG_CONTEXT_CHUNKS = 3;
 const MAX_HISTORY_MESSAGES = 6;
+const CANCELLATION_PROPOSAL_TTL_MS = 60 * 60 * 1000;
 const OFFICIAL_WEBSITE_URLS = {
   home: 'https://www.fiestahousematernity.com/',
   reviews: 'https://www.fiestahousematernity.com/reviews',
@@ -139,6 +140,30 @@ type TokenUsage = {
   completionCalls: number;
 };
 
+type ReplyContext = {
+  customerId: string;
+  userMessage: string;
+  platform: string;
+  startedAt: number;
+};
+
+type ReplyOutcome = {
+  success?: boolean;
+  isFallback?: boolean;
+  failureReason?: string;
+  circuitBreakerTrip?: boolean;
+  circuitBreakerReason?: string;
+};
+
+type MessageRouteResult = string | { reply: string; outcome?: ReplyOutcome } | null;
+
+type MessageRoute = {
+  name: string;
+  when: () => boolean;
+  handle: () => MessageRouteResult | Promise<MessageRouteResult>;
+  deterministicOnly?: boolean;
+};
+
 function usageFromCompletion(response: any, completionCalls: number = 1): TokenUsage {
   return {
     inputTokens: response?.usage?.prompt_tokens || 0,
@@ -155,8 +180,58 @@ function addUsage(target: TokenUsage, usage: TokenUsage): void {
   target.completionCalls += usage.completionCalls;
 }
 
+const MONTH_NAME_PATTERN = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const MONTH_ABBREVIATIONS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const ISO_DATE_PATTERN = /\b(\d{4}-\d{2}-\d{2})\b/;
+
+/**
+ * Day-of-month only when written as an ordinal ("3rd"), next to a month name
+ * ("3 Oct", "October 3") or inside an ISO date. Bare numbers ("7 months") and
+ * hours ("3pm", "15:00") never count. `month` is 0-based when a month name was given.
+ */
+function findExplicitDate(message: string): { day: number; month: number | null } | null {
+  const text = message.toLowerCase();
+  const iso = text.match(ISO_DATE_PATTERN);
+  if (iso) return { day: Number(iso[1].slice(8, 10)), month: Number(iso[1].slice(5, 7)) - 1 };
+
+  const dayThenMonth = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:of\\s+)?(${MONTH_NAME_PATTERN})\\b`));
+  const monthThenDay = text.match(new RegExp(`\\b(${MONTH_NAME_PATTERN})\\s*(\\d{1,2})(?:st|nd|rd|th)?\\b(?!\\s*(?:am|pm|:\\d|\\.\\d))`));
+  const ordinal = text.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
+
+  let day: number;
+  let monthName: string | null = null;
+  if (dayThenMonth) {
+    day = Number(dayThenMonth[1]);
+    monthName = dayThenMonth[2];
+  } else if (monthThenDay) {
+    day = Number(monthThenDay[2]);
+    monthName = monthThenDay[1];
+  } else if (ordinal) {
+    day = Number(ordinal[1]);
+  } else {
+    return null;
+  }
+  if (day < 1 || day > 31) return null;
+  return { day, month: monthName ? MONTH_ABBREVIATIONS.indexOf(monthName.slice(0, 3)) : null };
+}
+
+function findExplicitDayOfMonth(message: string): number | null {
+  return findExplicitDate(message)?.day ?? null;
+}
+
+function isAvailableSlotList(result: string[] | { status: string; reason: string }): result is string[] {
+  return Array.isArray(result);
+}
+
+// Word-anchored so "exchange" or "remove" no longer read as a reschedule.
+const RESCHEDULE_KEYWORD_PATTERN = /\b(?:reschedul(?:e|ed|es|ing)|chang(?:e|ed|es|ing)|mov(?:e|ed|es|ing)|postpon(?:e|ed|es|ing))\b/;
+
+const PAYMENT_CONFIRMATION_REQUIRED_REPLY = 'Before I send the M-Pesa deposit prompt, please reply yes to confirm the booking.';
+const PAYMENT_PROMPT_UNRECORDED = 'PAYMENT_PROMPT_UNRECORDED';
+const PAYMENT_PROMPT_UNRECORDED_REPLY = 'Please check your phone for an M-Pesa prompt before trying again. If nothing arrives in a few minutes, the studio team can help.';
+
 export class BookingExtractor {
-  // ðŸ§¼ STEP 1: Clean Input
+  // 🧼 STEP 1: Clean Input
   private clean(text: string): string {
     return text
       .replace(/[^ 0-\w\s]/gi, ' ')
@@ -165,7 +240,7 @@ export class BookingExtractor {
       .toLowerCase();
   }
 
-  // âš¡ STEP 2: Regex Extraction
+  // ⚡ STEP 2: Regex Extraction
   private regexExtract(text: string): BookingDetails {
     const cleanText = this.clean(text);
 
@@ -180,7 +255,8 @@ export class BookingExtractor {
     const serviceMatch = cleanText.match(
       new RegExp(`(?:the\\s+)?(${PACKAGE_NAME_PATTERN})(?:\\s+(?:package|edition))?`, 'i')
     );
-    const dateMatch = cleanText.match(/(\d{1,2})(st|nd|rd|th)?/i);
+    const isoDate = text.match(ISO_DATE_PATTERN)?.[1];
+    const explicitDate = isoDate ? null : findExplicitDate(text);
     const timeMatch = cleanText.match(/(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i);
 
     let date;
@@ -189,8 +265,18 @@ export class BookingExtractor {
     if (timeMatch) {
       time = timeMatch[0].toLowerCase().replace(/\s/g, '');
     }
-    if (dateMatch) {
-      const day = Number(dateMatch[1]);
+    if (isoDate && dayjs(isoDate).isValid()) {
+      date = isoDate;
+    } else if (explicitDate && explicitDate.month !== null) {
+      const now = nowInBusinessTimezone();
+      let parsed = now.month(explicitDate.month).date(explicitDate.day);
+      if (parsed.isBefore(now, 'day')) parsed = parsed.add(1, 'year');
+      // dayjs rolls "31 Nov" over into December; treat that as no date.
+      if (parsed.month() === explicitDate.month && parsed.date() === explicitDate.day) {
+        date = parsed.format('YYYY-MM-DD');
+      }
+    } else if (explicitDate) {
+      const day = explicitDate.day;
       const now = nowInBusinessTimezone();
       let parsed = now.date(day);
       // If the resolved date is already in the past, the customer almost
@@ -212,7 +298,7 @@ export class BookingExtractor {
     };
   }
 
-  // ðŸ¤– STEP 3: AI Extraction (STRICT JSON)
+  // 🤖 STEP 3: AI Extraction (STRICT JSON)
   private async aiExtract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     const { response } = await createChatCompletion({
@@ -242,7 +328,7 @@ export class BookingExtractor {
     return { details, usage: usageFromCompletion(response) };
   }
 
-  // ðŸ”¥ FINAL HYBRID METHOD
+  // 🔥 FINAL HYBRID METHOD
   // Skips the expensive AI extraction call when no booking-related signals are
   // present in the message (e.g. pure questions, greetings, complaints) - this
   // avoids the double-LLM-call latency and token burn for ~60% of messages.
@@ -291,6 +377,37 @@ export class AgentService {
 
   private isNaturalAssistantModeEnabled(): boolean {
     return this.naturalAssistantMode;
+  }
+
+  /** Records the turn's metric and learning rows in the background and returns the reply unchanged. */
+  private respond(ctx: ReplyContext, reply: string, outcome: ReplyOutcome = {}): string {
+    const { success = true, isFallback = false, ...failureDetails } = outcome;
+    const latencyMs = Date.now() - ctx.startedAt;
+    this.logInBackground('AI job metric', () => this.logAiJobMetric({
+      customerId: ctx.customerId,
+      platform: ctx.platform,
+      success,
+      latencyMs,
+      ...(isFallback ? { isFallback } : {}),
+      ...failureDetails,
+    }));
+    this.logInBackground('conversation learning', () => this.logConversationLearning({
+      customerId: ctx.customerId,
+      userMessage: ctx.userMessage,
+      aiResponse: reply,
+      platform: ctx.platform,
+      latencyMs,
+      wasSuccessful: success,
+      isFallback,
+    }));
+    return reply;
+  }
+
+  /** Never lets a logging failure (sync throw or rejection) reach the caller or become an unhandled rejection. */
+  private logInBackground(label: string, task: () => Promise<unknown>): void {
+    Promise.resolve()
+      .then(task)
+      .catch((err) => console.error(`Failed to log ${label}:`, err));
   }
 
   private formatCustomerReply(
@@ -492,7 +609,8 @@ export class AgentService {
 
   private messageContainsExplicitDateSignal(message: string): boolean {
     const text = message.toLowerCase();
-    return /\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}(st|nd|rd|th)?\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
+    return findExplicitDayOfMonth(text) !== null
+      || /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/.test(text);
   }
 
   private messageContainsExplicitTimeSignal(message: string): boolean {
@@ -511,7 +629,7 @@ export class AgentService {
     extractedDate?: string | null,
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): string {
-    const hasDayOfMonth = /\b\d{1,2}(st|nd|rd|th)?\b/.test(userMessage.toLowerCase());
+    const hasDayOfMonth = findExplicitDayOfMonth(userMessage) !== null;
     if (!hasDayOfMonth) {
       const weekdayDate = this.getContextualBookingWeekdayDate(userMessage, history);
       return weekdayDate || proposedDate;
@@ -564,7 +682,7 @@ export class AgentService {
 
   private shouldUseRescheduleRequestReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
-    return /(reschedule|change|move|postpone)/.test(text)
+    return RESCHEDULE_KEYWORD_PATTERN.test(text)
       && !this.messageContainsExplicitDateTimeSignal(userMessage)
       && !this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage);
   }
@@ -591,9 +709,9 @@ export class AgentService {
   private inferIntent(userMessage: string): { intent: string; confidence: number; rule: string } {
     const text = userMessage.toLowerCase();
 
-    if (/(reschedule|change|move|postpone)/.test(text)) return { intent: 'reschedule', confidence: 0.92, rule: 'reschedule_keywords' };
-    if (/(book|booking|appointment|session)/.test(text)) return { intent: 'booking', confidence: 0.88, rule: 'booking_keywords' };
-    if (/(pay|paid|payment|mpesa|deposit|receipt|balance)/.test(text)) return { intent: 'payment', confidence: 0.9, rule: 'payment_keywords' };
+    if (RESCHEDULE_KEYWORD_PATTERN.test(text)) return { intent: 'reschedule', confidence: 0.92, rule: 'reschedule_keywords' };
+    if (/(\bbook(?:s|ed|ing)?\b|appointment|session)/.test(text)) return { intent: 'booking', confidence: 0.88, rule: 'booking_keywords' };
+    if (/(\bpa(?:y|ys|ying|id|yment|yments)\b|mpesa|deposit|receipt|balance)/.test(text)) return { intent: 'payment', confidence: 0.9, rule: 'payment_keywords' };
     if (/(price|cost|package|rate|services|service list)/.test(text)) return { intent: 'pricing', confidence: 0.86, rule: 'pricing_keywords' };
     if (/(where|location|located|address)/.test(text)) return { intent: 'location', confidence: 0.9, rule: 'location_keywords' };
     if (/(time|hours|open|close|availability|available|how long|duration)/.test(text)) return { intent: 'availability', confidence: 0.82, rule: 'availability_keywords' };
@@ -835,7 +953,7 @@ export class AgentService {
 
     const duration = SERVICE_DURATIONS[request.service.toLowerCase()];
     const slotsResult = await bookingService.getAvailableSlots(request.date, duration || DEFAULT_DURATION);
-    if (slotsResult?.status === 'closed') {
+    if (!isAvailableSlotList(slotsResult) && slotsResult.status === 'closed') {
       return `You’re right, I mixed up the sessions. Your existing appointment is unchanged. The separate ${request.service} request for ${recipient} is not booked; the studio is closed on ${inBusinessTimezone(request.date).format('dddd, D MMMM')}. Please choose another date.`;
     }
 
@@ -1098,14 +1216,17 @@ export class AgentService {
 
   private shouldUsePreviousAddonReply(
     userMessage: string,
-    history: { role: 'user' | 'assistant'; content: string }[]
+    history: { role: 'user' | 'assistant'; content: string }[] = []
   ): boolean {
     const text = userMessage.toLowerCase();
     if (/\b(package|edition|bloom|muse|icon|legend|queen|empress|goddess|price|cost)\b/.test(text)) return false;
-    const asksAboutPreviousChoice = /\b(which|what)\b.*\b(choose|chosen|picked|selected|add|added|extra|add-on|addon)\b|\b(choose|chosen|picked|selected|add|added)\b.*\b(previously|before|earlier|already)\b/.test(text);
-    if (!asksAboutPreviousChoice) return false;
+    const explicitAddonHistoryQuestion = /\b(which|what)\b[\s\S]{0,50}\b(?:add-?ons?|extras?)\b[\s\S]{0,40}\b(?:did i|have i)\b[\s\S]{0,25}\b(?:choose|chose|chosen|pick|picked|select|selected|add|added|include|included)\b/.test(text)
+      || /\b(which|what)\b[\s\S]{0,50}\b(?:did i|have i)\s+(?:choose|chose|chosen|pick|picked|select|selected|add|added|include|included)\b[\s\S]{0,40}\b(?:add-?ons?|extras?)\b/.test(text)
+      || /\b(?:previously|before|earlier|already)\b[\s\S]{0,40}\b(?:add-?ons?|extras?)\b[\s\S]{0,30}\b(?:choose|chosen|picked|selected|add|added|include|included)\b/.test(text);
+    if (explicitAddonHistoryQuestion) return true;
 
-    return history.slice(-8).some((message) =>
+    const anaphoricHistoryQuestion = /\b(which|what)\s+ones?\b[\s\S]{0,40}\b(?:choose|chose|chosen|pick|picked|select|selected|add|added)\b[\s\S]{0,30}\b(?:previously|before|earlier|already)\b/.test(text);
+    return anaphoricHistoryQuestion && history.slice(-8).some((message) =>
       /(add-on|addon|extra outfit|styled wig|extra edited photo|extra makeup)/i.test(message.content)
     );
   }
@@ -1227,8 +1348,8 @@ export class AgentService {
   private shouldUseMultiPersonBookingReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     const mentionsAnotherPerson = /(my\s+sister|my\s+brother|my\s+friend|my\s+husband|my\s+wife|my\s+partner|my\s+family|also\s+coming|come\s+with\s+her|come\s+with\s+him|joining\s+the\s+shoot|join\s+the\s+shoot)/.test(text);
-    const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
-    const jointSessionSignal = /(with|alongside|together|joining|join|coming\s+with|both\s+of\s+us|each\s+of\s+us)/.test(text);
+    const bookingContext = /(\bbook(?:s|ed|ing)?\b|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
+    const jointSessionSignal = /(\bwith\b|alongside|together|\bjoin(?:s|ed|ing)?\b|coming\s+with\b|both\s+of\s+us|each\s+of\s+us)/.test(text);
     return mentionsAnotherPerson && bookingContext && jointSessionSignal;
   }
 
@@ -1284,7 +1405,7 @@ export class AgentService {
 
   private shouldClarifyBookingForSomeoneElse(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
-    const bookingContext = /(book|booking|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
+    const bookingContext = /(\bbook(?:s|ed|ing)?\b|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
     const bookingForSomeoneElse = /\b(for|on behalf of)\s+my\s+(sister|brother|friend|husband|wife|partner|mother|father|daughter|son|family)\b/.test(text);
     return bookingContext && bookingForSomeoneElse && !this.shouldUseMultiPersonBookingReply(userMessage);
   }
@@ -1345,6 +1466,7 @@ export class AgentService {
   private shouldUseUpcomingAppointmentDetailsReply(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
     if (this.shouldUseBookingProcessReply(userMessage)) return false;
+    if (this.shouldUsePostShootProcessReply(userMessage)) return false;
     if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) return false;
     if (this.shouldUseLastAppointmentDetailsReply(userMessage)) return false;
     if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
@@ -1750,11 +1872,11 @@ export class AgentService {
       return this.getReschedulePolicyMessage();
     }
 
-    const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key)) || 'standard';
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key));
     const bookingDay = inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD');
     const slotsResult = await bookingService.getAvailableSlots(
       bookingDay,
-      SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION,
+      serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION,
       booking.id
     );
     const availableSlots = Array.isArray(slotsResult) ? slotsResult : [];
@@ -1815,7 +1937,7 @@ export class AgentService {
       'Great question. Booking is simple:',
       '1) Choose your package.',
       '2) Share your preferred date and time (we are closed on Mondays).',
-      '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. â€” completely optional!).',
+      '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. — completely optional!).',
       `4) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
       '5) Once deposit is received, your booking is confirmed and reminders are scheduled.',
       `6) Come for your session at ${location}.`,
@@ -2160,9 +2282,9 @@ These are grouped by category. If any two instructions ever seem to conflict, re
 A1. PLATFORM CAPABILITY GATE - CHECK THIS BEFORE STARTING ANY BOOKING FLOW: you are currently talking to the user on "${platform}". If the platform is "instagram" or "facebook", YOU CANNOT MAKE BOOKINGS on this channel at all - do not begin gathering Name/Service/Date/Time here even if the customer offers them. As soon as it becomes clear they want to book, immediately and politely tell them bookings are only accepted via WhatsApp, and instruct them to click the WhatsApp link/button on our profile to continue. If the platform IS "whatsapp" or "web", the booking flow in [B] is fully available.
 A2. We are CLOSED on Mondays. Do NOT allow any bookings on Mondays.
 A3. Never assume, guess, or invent a date or time for a booking, reschedule, or anything else the customer hasn't explicitly stated.
-A4. CANCELLATIONS MUST BE REAL, NOT TEXT-ONLY: if the customer asks to cancel their appointment, call 'cancel_booking' before telling them it is cancelled. Never claim a cancellation succeeded unless this tool returns success.
+A4. CANCELLATIONS MUST BE TWO STEPS AND REAL, NOT TEXT-ONLY: when a customer asks to cancel, identify the exact upcoming session and state its date, time, and refund eligibility, then stop and wait. Only cancel on a later customer message that clearly says yes, yeah, yep, ndio, or confirm, and only after checking that the pending cancellation proposal came from a prior turn and has not expired. "ok", "okay", and "sawa" are not cancellation consent. Never claim a cancellation succeeded unless the cancellation action returns success. If there are multiple upcoming sessions, ask which one and cancel nothing until they identify it. If they say no or keep it, clear the proposal and say the booking is unchanged. If they send an unrelated message, clear the pending cancellation proposal so a later yes cannot act on stale consent. Never replace an existing booking, reschedule, or payment draft to stage a cancellation; explain that the existing step is unchanged. State refund eligibility only; never promise an amount or say money was returned.
 A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. Only say a deposit was received or paid when Payment Status explicitly says it succeeded/was paid. A confirmed booking status alone does not prove payment was received. If the booking is confirmed but payment status is missing or unclear, confirm only the booking and offer to have the team verify payment. Never state a deposit was forfeited unless a successful reschedule tool result or another verified source explicitly says it was forfeited. Keep payment received, booking confirmed, and deposit forfeited as distinct facts.
-A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done.
+A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done. This acknowledgement rule applies only after the action is complete; while a cancellation proposal is pending, only a clear yes/yeah/yep/ndio/confirm confirms it, and no/keep it or an unrelated message clears it.
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
 A9. VERIFIED WEBSITE LINKS: Use only these exact Fiesta House website URLs: ${Object.values(OFFICIAL_WEBSITE_URLS).join(', ')}. Never guess or construct a page path. The reviews page is /reviews; the Suspending Concept gallery is /gallery/suspending-concept. If no verified link fits, share the homepage or offer to check with the team.
@@ -2413,7 +2535,7 @@ ${contextString}`;
           type: 'function',
           function: {
             name: 'cancel_booking',
-            description: 'Cancels one of the customer\'s upcoming appointments. Use this only when they explicitly ask to cancel. Pass the date of the specific appointment they mean (e.g. the one just discussed for "cancel that"). This actually updates the booking status and removes the Google Calendar event when present.',
+            description: 'Two-step cancellation tool. On the first turn, identify the exact upcoming session, state its date/time and whether it is eligible for a refund (never promise an amount or that money was returned), save a cancel_confirm proposal, and STOP. If there are multiple upcoming sessions, ask which one and save no cancellation proposal until the customer identifies one. On a later turn, call this tool to cancel only when initialDraftStep was already cancel_confirm, the customer message clearly says yes/yeah/yep/ndio/confirm, and the immediately preceding assistant message asked them to confirm this cancellation. ok/okay/sawa are not consent. A no/keep response or unrelated message must clear the pending proposal. The actual cancellation updates the booking and removes its Google Calendar event through the existing cancellation action.',
             parameters: {
               type: 'object',
               properties: {
@@ -2471,6 +2593,7 @@ ${contextString}`;
     let rescheduleAppliedThisTurn = false;
     let cancelledThisTurn = false;
     let noteSavedThisTurn = false;
+    let cancellationReply: string | null = null;
     while (currentResponse.choices[0].message.tool_calls && rounds < MAX_TOOL_ROUNDS) {
       rounds++;
       const responseMessage = currentResponse.choices[0].message;
@@ -2510,6 +2633,8 @@ ${contextString}`;
             else if (functionName === 'confirm_booking') {
               if (proposedThisTurn) {
                 toolResponse = `ERROR: You already called propose_booking earlier in this same turn - possibly with different details than what the customer last saw and agreed to. You must stop here and wait for the customer's own separate message explicitly confirming before calling confirm_booking.`;
+              } else if (!this.isPaymentConfirmation(userMessage)) {
+                toolResponse = `ERROR: The customer has not explicitly replied yes, confirm, go ahead, or proceed in this message, so the M-Pesa prompt was NOT sent. Ask them to reply yes to confirm the booking.`;
               } else {
                 const result = await this.executeConfirmBookingTool(customerId, initialDraftStep);
                 confirmedActionThisTurn = true;
@@ -2557,10 +2682,24 @@ ${contextString}`;
               }
             }
             else if (functionName === 'cancel_booking') {
-              const result = await this.executeCancelBookingTool(customerId, args.date);
-              confirmedActionThisTurn = true;
-              cancelledThisTurn = true;
-              toolResponse = `SUCCESS: Cancelled ${result.service} on ${dayjs(result.dateTime).format('YYYY-MM-DD HH:mm')}. Refund policy: ${result.refundEligible ? 'Eligible for refund (more than 72 hours before appointment).' : 'Not eligible for automatic refund (within 72 hours).'} This is DONE - do not call any more booking tools this turn.`;
+              if (proposedThisTurn) {
+                toolResponse = 'ERROR: A cancellation proposal or booking selection was already made this turn. Stop and wait for the customer to respond on a later message.';
+              } else if (initialDraftStep === 'cancel_confirm') {
+                if (!this.isCancellationConfirmation(userMessage) || !this.previousMessageRequestsConfirmation(history)) {
+                  toolResponse = 'ERROR: The customer has not clearly confirmed this pending cancellation in their own message immediately after the cancellation proposal. Do not cancel; ask them to reply yes, yeah, yep, ndio, or confirm.';
+                } else {
+                  const result = await this.executeConfirmCancellationTool(customerId, initialDraftStep);
+                  confirmedActionThisTurn = true;
+                  cancelledThisTurn = true;
+                  cancellationReply = this.getCancellationCompletionReply(result);
+                  toolResponse = `SUCCESS: ${cancellationReply} This is DONE - do not call any more booking tools this turn.`;
+                }
+              } else {
+                const proposal = await this.proposeCancellation(customerId, userMessage, history);
+                proposedThisTurn = true;
+                cancellationReply = proposal.reply;
+                toolResponse = `${proposal.reply} Do not call cancel_booking again this turn; wait for the customer's own next message.`;
+              }
             }
             else if (functionName === 'save_delivery_preference') {
               const result = await this.executeSaveDeliveryPreferenceTool(customerId, args.method, args.email, args.whatsappNumber, args.note, platform);
@@ -2669,12 +2808,12 @@ ${contextString}`;
       console.warn('[AGENT_FLOW] Blocked unverified action claim:', JSON.stringify({ customerRef: this.customerReference(customerId), reply: modelContent.slice(0, 200) }));
     }
 
-    const safeModelContent = unverifiedActionReply
+    const safeModelContent = cancellationReply || (unverifiedActionReply
       ? unverifiedActionReply
       : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
       && !rescheduleAppliedThisTurn
       ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
-      : this.formatCustomerReply(modelContent, userMessage, history);
+      : this.formatCustomerReply(modelContent, userMessage, history));
 
     return {
       content: emptyResponse
@@ -2685,6 +2824,434 @@ ${contextString}`;
     };
   }
 
+  private createMessageRoutes(
+    customerId: string,
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[],
+    platform: string,
+    startedAt: number
+  ): MessageRoute[] {
+    let scopeBoundaryReply: string | null = null;
+    let informationalFlowResolved = false;
+    let informationalFlow: ReturnType<ConversationFlowHandler['resolveInformationalFlow']> | undefined;
+    const getInformationalFlow = () => {
+      if (!informationalFlowResolved) {
+        informationalFlow = this.conversationFlowHandler.resolveInformationalFlow(userMessage, history);
+        informationalFlowResolved = true;
+      }
+      return informationalFlow;
+    };
+
+    return [
+      {
+        name: 'scopeBoundary',
+        when: () => Boolean(scopeBoundaryReply = this.getScopeBoundaryReply(userMessage, history)),
+        handle: () => scopeBoundaryReply,
+      },
+      {
+        name: 'identityCorrection',
+        when: () => this.isBookingIdentityCorrection(userMessage),
+        handle: async () => this.getBookingIdentityCorrectionReply(customerId, history),
+      },
+      {
+        name: 'recipientName',
+        when: () => this.shouldCaptureRecipientName(userMessage, history),
+        handle: async () => {
+          const recipientName = await this.captureRecipientName(customerId, userMessage);
+          return recipientName
+            ? `Thanks, I’ll set the session up for ${recipientName}. Which package would you like, and what date and time would work best?`
+            : null;
+        },
+      },
+      {
+        name: 'ambiguousDeposit',
+        when: () => this.shouldClarifyAmbiguousDeposit(userMessage),
+        handle: () => this.getAmbiguousDepositReply(),
+      },
+      {
+        name: 'rescheduleWithdrawalConfirmation',
+        when: () => this.shouldConfirmRescheduleWithdrawal(userMessage, history),
+        handle: () => 'Yes. Your original session date and time are still booked, and your deposit remains held for it.',
+      },
+      {
+        name: 'postActionAcknowledgement',
+        when: () => this.isPostActionAcknowledgement(userMessage, history),
+        handle: () => this.previousMessageRequestsConfirmation(history)
+          ? 'No rush. Let me know when you are ready to go ahead.'
+          : 'You are welcome. I am here if you need anything else.',
+      },
+      {
+        name: 'cancellationDeclined',
+        when: () => this.hasPendingCancellationProposal(history) && this.isCancellationDecline(userMessage),
+        handle: async () => {
+          await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+          return 'Understood. Your booking is unchanged, and I have not cancelled it.';
+        },
+      },
+      {
+        name: 'staleCancellationProposal',
+        when: () => this.hasPendingCancellationProposal(history)
+          && !this.isCancellationConfirmation(userMessage)
+          && !this.isCancellationDecline(userMessage)
+          && !this.shouldUseCancellationRequest(userMessage, history),
+        handle: async () => {
+          await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+          return null;
+        },
+      },
+      {
+        name: 'cancellationProposal',
+        when: () => (platform === 'whatsapp' || platform === 'web')
+          && this.shouldUseCancellationRequest(userMessage, history),
+        handle: async () => (await this.proposeCancellation(customerId, userMessage, history)).reply,
+      },
+      {
+        name: 'bookingStatus',
+        when: () => this.shouldUseBookingStatusReply(userMessage),
+        handle: async () => this.getBookingStatusReply(customerId),
+      },
+      {
+        name: 'upcomingAppointmentTime',
+        when: () => this.shouldUseUpcomingAppointmentTimeReply(userMessage),
+        handle: async () => this.getUpcomingAppointmentTimeReply(customerId),
+      },
+      {
+        name: 'pastAppointmentsList',
+        when: () => this.shouldUsePastAppointmentsListReply(userMessage),
+        handle: async () => this.getPastAppointmentsListReply(customerId),
+      },
+      {
+        name: 'lastAppointmentDetails',
+        when: () => this.shouldUseLastAppointmentDetailsReply(userMessage),
+        handle: async () => this.getLastAppointmentDetailsReply(customerId),
+      },
+      {
+        name: 'upcomingAppointmentDetails',
+        when: () => this.shouldUseUpcomingAppointmentDetailsReply(userMessage),
+        handle: async () => this.getUpcomingAppointmentDetailsReply(customerId, history),
+      },
+      {
+        name: 'mixedIntent',
+        when: () => this.shouldClarifyMixedIntent(userMessage),
+        handle: () => this.getMixedIntentClarificationReply(),
+      },
+      {
+        name: 'invoice',
+        when: () => this.shouldUseInvoiceRequestReply(userMessage, history),
+        handle: async () => {
+          const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
+          return this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined, history, userMessage);
+        },
+      },
+      {
+        name: 'pastAppointment',
+        when: () => this.shouldUsePastAppointmentReply(userMessage) || this.isPastAppointmentFollowUp(userMessage, history),
+        handle: async () => this.getPastAppointmentReply(customerId),
+      },
+      {
+        name: 'bookingForSomeoneElse',
+        when: () => this.shouldClarifyBookingForSomeoneElse(userMessage),
+        handle: () => this.getBookingForSomeoneElseReply(),
+      },
+      {
+        name: 'multiPersonBooking',
+        when: () => this.shouldUseMultiPersonBookingReply(userMessage),
+        handle: async () => {
+          await this.captureMultiPersonBookingNote(customerId, userMessage).catch((err) => {
+            console.error('Failed to capture multi-person booking note:', err);
+          });
+          return this.getMultiPersonBookingReply();
+        },
+      },
+      {
+        name: 'packageBudget',
+        deterministicOnly: true,
+        when: () => this.shouldUsePackageBudgetReply(userMessage),
+        handle: () => this.getPackageBudgetReply(),
+      },
+      {
+        name: 'paymentResend',
+        when: () => this.shouldHandleResendRequest(userMessage),
+        handle: async () => this.tryHandlePaymentResend(customerId),
+      },
+      {
+        name: 'suspendingConceptGallery',
+        when: () => {
+          getInformationalFlow();
+          return Boolean(this.getSuspendingConceptGalleryReply(userMessage, history));
+        },
+        handle: () => this.getSuspendingConceptGalleryReply(userMessage, history),
+      },
+      {
+        name: 'reviewPage',
+        when: () => Boolean(this.getReviewPageReply(userMessage)),
+        handle: () => this.getReviewPageReply(userMessage),
+      },
+      {
+        name: 'businessIntroduction',
+        deterministicOnly: true,
+        when: () => getInformationalFlow() === 'business_introduction',
+        handle: () => this.getBusinessIntroductionReply(),
+      },
+      {
+        name: 'weekday',
+        deterministicOnly: true,
+        when: () => getInformationalFlow() === 'weekday',
+        handle: () => this.getWeekdayReply(userMessage, history),
+      },
+      {
+        name: 'website',
+        deterministicOnly: true,
+        when: () => getInformationalFlow() === 'website',
+        handle: () => this.getWebsiteReply(),
+      },
+      {
+        name: 'contactDetails',
+        deterministicOnly: true,
+        when: () => getInformationalFlow() === 'contact_details',
+        handle: () => this.getContactDetailsReply(),
+      },
+      {
+        name: 'portfolio',
+        deterministicOnly: true,
+        when: () => getInformationalFlow() === 'portfolio',
+        handle: () => this.getPortfolioReply(),
+      },
+      {
+        name: 'socialMedia',
+        deterministicOnly: true,
+        when: () => this.shouldUseSocialMediaReply(userMessage),
+        handle: () => this.getSocialMediaReply(),
+      },
+      {
+        name: 'rawFiles',
+        deterministicOnly: true,
+        when: () => this.shouldUseRawFilesReply(userMessage),
+        handle: () => this.getRawFilesReply(),
+      },
+      {
+        name: 'previousAddon',
+        when: () => this.shouldUsePreviousAddonReply(userMessage, history),
+        handle: async () => this.getPreviousAddonReply(customerId),
+      },
+      {
+        name: 'clarifyNewAddon',
+        when: () => this.shouldClarifyNewAddon(userMessage, history),
+        handle: () => 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.',
+      },
+      {
+        name: 'addonListFollowUp',
+        when: () => this.isAddonListFollowUp(userMessage, history),
+        handle: () => this.getAdditionsReply(),
+      },
+      {
+        name: 'selectedAddon',
+        when: () => Boolean(this.getSelectedAddon(userMessage, history)),
+        handle: async () => {
+          const selectedAddon = this.getSelectedAddon(userMessage, history);
+          if (!selectedAddon) return null;
+          const addonQuantity = this.getRequestedAddonQuantity(userMessage, selectedAddon);
+          const noteResult = await this.executeAddNoteTool(
+            customerId,
+            '',
+            addonQuantity > 1 ? `${addonQuantity} x ${selectedAddon.name}` : selectedAddon.name,
+            'special_request',
+            'addon',
+            'normal',
+            userMessage,
+            platform
+          );
+          return noteResult.created
+            ? this.getAddonSelectionReply(selectedAddon, addonQuantity)
+            : noteResult.reason === 'duplicate_pending_note'
+              ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
+              : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
+        },
+      },
+      {
+        name: 'additions',
+        deterministicOnly: true,
+        when: () => this.shouldUseAdditionsReply(userMessage),
+        handle: () => this.getAdditionsReply(),
+      },
+      {
+        name: 'bespoke',
+        deterministicOnly: true,
+        when: () => this.shouldUseBespokeReply(userMessage),
+        handle: () => this.getBespokeReply(),
+      },
+      {
+        name: 'travellingMothers',
+        deterministicOnly: true,
+        when: () => this.shouldUseTravellingMothersReply(userMessage),
+        handle: () => this.getTravellingMothersReply(),
+      },
+      {
+        name: 'earliestImageDelivery',
+        deterministicOnly: true,
+        when: () => this.shouldUseEarliestImageDeliveryReply(userMessage),
+        handle: async () => this.getEarliestImageDeliveryReply(customerId),
+      },
+      {
+        name: 'postShootProcess',
+        deterministicOnly: true,
+        when: () => this.shouldUsePostShootProcessReply(userMessage),
+        handle: () => this.getPostShootProcessReply(),
+      },
+      {
+        name: 'bookingProcess',
+        deterministicOnly: true,
+        when: () => this.shouldUseBookingProcessReply(userMessage),
+        handle: async () => this.getBookingProcessReply(),
+      },
+      {
+        name: 'timeOnlyRescheduleSelection',
+        when: () => this.conversationFlows.isTimeOnlyRescheduleSelection(userMessage, history),
+        handle: async () => this.getRescheduleTimeProposalReply(customerId, userMessage),
+      },
+      {
+        name: 'rescheduleWithdrawal',
+        when: () => this.shouldUseRescheduleWithdrawalReply(userMessage, history),
+        handle: async () => {
+          await this.withdrawPendingReschedule(customerId);
+          return 'Understood! We will keep your original session date and time, and your booking remains unchanged. Your deposit is still held for that session. Let us know if you need anything else preparing for your shoot!';
+        },
+      },
+      {
+        name: 'timeOnlyRescheduleRequest',
+        when: () => this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage),
+        handle: async () => this.getRescheduleTimeReply(customerId),
+      },
+      {
+        name: 'rescheduleRequest',
+        when: () => this.shouldUseRescheduleRequestReply(userMessage),
+        handle: async () => this.getRescheduleTimeReply(customerId),
+      },
+      {
+        name: 'sameBookingSlot',
+        when: () => this.conversationFlows.isSameBookingSlotRequest(userMessage),
+        handle: async () => this.getSameBookingSlotReply(customerId, history),
+      },
+      {
+        name: 'packageSelection',
+        deterministicOnly: true,
+        when: () => this.shouldResolvePackageSelectionImmediately(userMessage),
+        handle: async () => this.getPackageSelectionReply(customerId, userMessage),
+      },
+      {
+        name: 'packageAdvice',
+        deterministicOnly: true,
+        when: () => this.conversationFlows.isPackageAdviceRequest(userMessage),
+        handle: async () => this.getPackageAdviceReply(userMessage),
+      },
+      {
+        name: 'packageCatalog',
+        when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history),
+        handle: async () => {
+          const showInclusions = this.conversationFlows.isPackageInclusionFollowUp(userMessage, history);
+          return this.getPackageCatalogReply(showInclusions);
+        },
+      },
+      {
+        name: 'immediateConfirmation',
+        when: () => (platform === 'whatsapp' || platform === 'web')
+          && this.isExplicitConfirmation(userMessage)
+          && this.previousMessageRequestsConfirmation(history),
+        handle: async () => {
+          try {
+            const immediate = await this.tryImmediateConfirmation(customerId, userMessage, history);
+            return immediate;
+          } catch (error: any) {
+            console.error('[AGENT_FLOW] Immediate confirmation failed:', error);
+            return {
+              reply: error?.code === PAYMENT_PROMPT_UNRECORDED
+                ? PAYMENT_PROMPT_UNRECORDED_REPLY
+                : 'Sorry, something went wrong and I couldn’t finish that step just now. Please try again in a moment, or the studio team can help.',
+              outcome: {
+                success: false,
+                isFallback: true,
+                failureReason: String(error?.message || error).slice(0, 200),
+              },
+            };
+          }
+        },
+      },
+      {
+        name: 'runAgent',
+        when: () => true,
+        handle: async () => {
+          try {
+            console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
+            const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
+            console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
+              customerId,
+              tokensUsed,
+              replyPreview: content.slice(0, 200)
+            }));
+            circuitBreaker.recordSuccess();
+            await this.recordTokenUsage(customerId, tokensUsed);
+            if (failureType) {
+              return { reply: content, outcome: { success: false, isFallback: true, failureReason: failureType } };
+            }
+            this.touchCustomerMemory(customerId, userMessage, platform).catch(err => console.error('Customer memory update failed:', err));
+            return content;
+          } catch (error: any) {
+            console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
+            const rateLimitType = classifyProviderRateLimit(error);
+            console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({
+              customerRef: this.customerReference(customerId),
+              errorName: error?.name,
+              status: error?.status,
+              code: error?.code,
+              rateLimitType,
+            }));
+            console.info('[AGENT_USAGE]', JSON.stringify({
+              customerRef: this.customerReference(customerId),
+              model: CHAT_MODEL,
+              completionCalls: null,
+              toolCalls: null,
+              inputTokens: null,
+              outputTokens: null,
+              totalTokens: null,
+              latencyMs: Date.now() - startedAt,
+              rateLimited: rateLimitType !== null,
+              failureType: rateLimitType || 'agent_pipeline_failure',
+            }));
+            const justTripped = circuitBreaker.recordFailure();
+            const isOutage = isProviderRateLimitError(error);
+            const pendingExtrasDecline = isOutage && (platform === 'whatsapp' || platform === 'web')
+              && this.isDecliningOptionalAddons(userMessage, history);
+            const fallbackReply = pendingExtrasDecline
+              ? 'Noted, no optional extras. Our booking assistant is temporarily unavailable, so I have not sent a deposit proposal or M-Pesa prompt. A team member will follow up to finish your booking.'
+              : isOutage
+              ? PROVIDER_OUTAGE_MESSAGE
+              : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
+            if (rateLimitType === 'daily_tpd_exhausted' && shouldNotifyOutage()) {
+              await this.escalate(customerId, 'error', `AI PROVIDER OUTAGE: Groq's daily token limit has been reached - ALL customers are currently getting the fallback message, not just this one. It resets on its own; check console.groq.com/settings/billing if this keeps recurring. Original error: ${error.message}`);
+            } else if (rateLimitType === 'transient_rate_limit' && shouldNotifyOutage()) {
+              await this.escalate(customerId, 'error', `AI PROVIDER RATE LIMIT: requests are being limited. No automatic retry was attempted. Original error: ${error.message}`);
+            } else if (justTripped && !isOutage) {
+              await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
+            }
+            if (pendingExtrasDecline) {
+              await this.escalate(customerId, 'booking', 'Customer declined optional extras, but the AI provider is unavailable before the deposit proposal. Review the recent conversation, recheck slot availability, and send the booking proposal manually. No payment prompt was sent.');
+            }
+            return {
+              reply: fallbackReply,
+              outcome: {
+                success: false,
+                isFallback: true,
+                failureReason: rateLimitType || String(error.message || error).slice(0, 200),
+                circuitBreakerTrip: justTripped,
+                circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
+              },
+            };
+          }
+        },
+      },
+    ];
+  }
+
   /**
    * Handles an incoming message from a customer, with conversation history.
    * Wraps runAgent with a circuit breaker, per-customer daily token budget,
@@ -2693,11 +3260,16 @@ ${contextString}`;
    */
   async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
     const startedAt = Date.now();
+    const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
-    const allowDeterministicInfoReplies = !naturalAssistantMode;
-
-    const scopeBoundaryReply = this.getScopeBoundaryReply(userMessage, history);
-    if (scopeBoundaryReply) return scopeBoundaryReply;
+    const cancellationDraftReply = await this.clearStaleCancellationDraftBeforeRouting(customerId, userMessage, history);
+    if (cancellationDraftReply) return this.respond(ctx, cancellationDraftReply);
+    const routes = this.createMessageRoutes(customerId, userMessage, history, platform, startedAt);
+    const scopeBoundaryRoute = routes[0];
+    if (scopeBoundaryRoute.when()) {
+      console.log(`[AGENT_FLOW] route=${scopeBoundaryRoute.name}`);
+      return await scopeBoundaryRoute.handle() as string;
+    }
 
     console.log('[AGENT_FLOW] handleMessage start:', JSON.stringify({
       customerId,
@@ -2707,34 +3279,20 @@ ${contextString}`;
       naturalAssistantMode
     }));
 
-    // Best-effort frustration flagging - keyword heuristic, no extra AI call/cost.
     this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
 
     if (circuitBreaker.isOpen()) {
       console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
-      const fallbackReply = FALLBACK_MESSAGE;
-      await this.logAiJobMetric({
-        customerId, platform, success: false, isFallback: true,
-        failureReason: 'circuit_open', circuitBreakerTrip: true,
-        circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
-        latencyMs: Date.now() - startedAt
-      });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: fallbackReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: false,
-        isFallback: true,
-      });
-      // Rate-limited to one admin alert per cooldown window - the circuit
-      // stays open across many incoming messages while tripped, and without
-      // this guard each one would raise its own duplicate escalation.
       if (shouldNotifyOutage()) {
         await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
       }
-      return fallbackReply;
+      return this.respond(ctx, FALLBACK_MESSAGE, {
+        success: false,
+        isFallback: true,
+        failureReason: 'circuit_open',
+        circuitBreakerTrip: true,
+        circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
+      });
     }
 
     const withinBudget = await this.checkTokenBudget(customerId);
@@ -2745,915 +3303,25 @@ ${contextString}`;
         dailyTokenCap: DAILY_TOKEN_CAP,
         platform
       });
-      const fallbackReply = FALLBACK_MESSAGE;
-      await this.logAiJobMetric({
-        customerId, platform, success: false, isFallback: true,
-        failureReason: 'daily_token_limit_exceeded', latencyMs: Date.now() - startedAt
-      });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: fallbackReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: false,
-        isFallback: true,
-      });
       await this.escalate(
         customerId,
         'quota',
         `Customer hit the daily AI token budget (cap: ${DAILY_TOKEN_CAP}). The bot sent the quota fallback instead of continuing the conversation.`
       );
-      return fallbackReply;
+      return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
     }
 
-    if (this.isBookingIdentityCorrection(userMessage)) {
-      const correctionReply = await this.getBookingIdentityCorrectionReply(customerId, history);
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: correctionReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return correctionReply;
+    for (const route of routes.slice(1)) {
+      if (route.deterministicOnly && naturalAssistantMode) continue;
+      if (!route.when()) continue;
+      console.log(`[AGENT_FLOW] route=${route.name}`);
+      const result = await route.handle();
+      if (result === null) continue;
+      if (typeof result === 'string') return this.respond(ctx, result);
+      return this.respond(ctx, result.reply, result.outcome);
     }
 
-    if (this.shouldCaptureRecipientName(userMessage, history)) {
-      const recipientName = await this.captureRecipientName(customerId, userMessage);
-      if (recipientName) {
-        const recipientReply = `Thanks, I’ll set the session up for ${recipientName}. Which package would you like, and what date and time would work best?`;
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: recipientReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return recipientReply;
-      }
-    }
-
-    if (this.shouldClarifyAmbiguousDeposit(userMessage)) {
-      const ambiguousDepositReply = this.getAmbiguousDepositReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: ambiguousDepositReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return ambiguousDepositReply;
-    }
-
-    if (this.shouldConfirmRescheduleWithdrawal(userMessage, history)) {
-      const withdrawalConfirmation = 'Yes. Your original session date and time are still booked, and your deposit remains held for it.';
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: withdrawalConfirmation,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return withdrawalConfirmation;
-    }
-
-    if (this.isPostActionAcknowledgement(userMessage, history)) {
-      const acknowledgement = this.previousMessageRequestsConfirmation(history)
-        ? 'No rush. Let me know when you are ready to go ahead.'
-        : 'You are welcome. I am here if you need anything else.';
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: acknowledgement,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return acknowledgement;
-    }
-
-    // Deterministic status reply to prevent contradictions after booking or
-    // reschedule confirmations when the customer asks if it's done.
-    const bookingStatusReply = this.shouldUseBookingStatusReply(userMessage);
-    console.log('[AGENT_FLOW] Booking status route check:', { customerId, bookingStatusReply, naturalAssistantMode });
-    if (bookingStatusReply) {
-      const statusReply = await this.getBookingStatusReply(customerId);
-      if (statusReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: statusReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return statusReply;
-      }
-    }
-
-    if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) {
-      const appointmentTimeReply = await this.getUpcomingAppointmentTimeReply(customerId);
-      if (appointmentTimeReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: appointmentTimeReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return appointmentTimeReply;
-      }
-    }
-
-    if (this.shouldUsePastAppointmentsListReply(userMessage)) {
-      const pastAppointmentsReply = await this.getPastAppointmentsListReply(customerId);
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: pastAppointmentsReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return pastAppointmentsReply;
-    }
-
-    if (this.shouldUseLastAppointmentDetailsReply(userMessage)) {
-      const lastAppointmentReply = await this.getLastAppointmentDetailsReply(customerId);
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: lastAppointmentReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return lastAppointmentReply;
-    }
-
-    if (this.shouldUseUpcomingAppointmentDetailsReply(userMessage)) {
-      const appointmentDetailsReply = await this.getUpcomingAppointmentDetailsReply(customerId, history);
-      if (appointmentDetailsReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: appointmentDetailsReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return appointmentDetailsReply;
-      }
-    }
-
-    if (this.shouldClarifyMixedIntent(userMessage)) {
-      const mixedIntentReply = this.getMixedIntentClarificationReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: mixedIntentReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return mixedIntentReply;
-    }
-
-    if (this.shouldUseInvoiceRequestReply(userMessage, history)) {
-      const requestedInvoiceNumber = this.extractInvoiceNumber(userMessage);
-      const invoiceReply = await this.sendStoredInvoiceToCustomer(customerId, requestedInvoiceNumber ?? undefined, history, userMessage);
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: invoiceReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return invoiceReply;
-    }
-
-      if (this.shouldUsePastAppointmentReply(userMessage) || this.isPastAppointmentFollowUp(userMessage, history)) {
-        const pastAppointmentReply = await this.getPastAppointmentReply(customerId);
-        if (pastAppointmentReply) {
-          await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-          await this.logConversationLearning({
-            customerId,
-            userMessage,
-            aiResponse: pastAppointmentReply,
-            platform,
-            latencyMs: Date.now() - startedAt,
-            wasSuccessful: true,
-            isFallback: false,
-          });
-          return pastAppointmentReply;
-        }
-      }
-
-    // Deterministic multi-person booking clarification to avoid pricing/
-    // scheduling ambiguity before booking confirmation.
-    if (this.shouldClarifyBookingForSomeoneElse(userMessage)) {
-      const bookingForSomeoneElseReply = this.getBookingForSomeoneElseReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: bookingForSomeoneElseReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return bookingForSomeoneElseReply;
-    }
-
-    if (this.shouldUseMultiPersonBookingReply(userMessage)) {
-      await this.captureMultiPersonBookingNote(customerId, userMessage).catch((err) => {
-        console.error('Failed to capture multi-person booking note:', err);
-      });
-
-      const multiPersonReply = this.getMultiPersonBookingReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: multiPersonReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return multiPersonReply;
-    }
-
-    if (this.shouldUsePackageBudgetReply(userMessage) && allowDeterministicInfoReplies) {
-      const packageBudgetReply = this.getPackageBudgetReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: packageBudgetReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return packageBudgetReply;
-    }
-
-    // Deterministic resend handling: only resend payment prompts when there's
-    // an actual pending payment; never offer resend after successful payment.
-    if (this.shouldHandleResendRequest(userMessage)) {
-      const resendReply = await this.tryHandlePaymentResend(customerId);
-      if (resendReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: resendReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return resendReply;
-      }
-    }
-
-    // In natural assistant mode, keep critical guardrails deterministic but
-    // let low-risk informational replies be generated naturally by the LLM.
-    const informationalFlow = this.conversationFlowHandler.resolveInformationalFlow(userMessage, history);
-
-    const suspendingConceptGalleryReply = this.getSuspendingConceptGalleryReply(userMessage, history);
-    if (suspendingConceptGalleryReply) {
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: suspendingConceptGalleryReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return suspendingConceptGalleryReply;
-    }
-
-    const reviewPageReply = this.getReviewPageReply(userMessage);
-    if (reviewPageReply) {
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: reviewPageReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return reviewPageReply;
-    }
-
-    if (informationalFlow === 'business_introduction' && allowDeterministicInfoReplies) {
-      const businessIntroductionReply = this.getBusinessIntroductionReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: businessIntroductionReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return businessIntroductionReply;
-    }
-
-    if (informationalFlow === 'weekday' && allowDeterministicInfoReplies) {
-      const weekdayReply = this.getWeekdayReply(userMessage, history);
-      if (weekdayReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: weekdayReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return weekdayReply;
-      }
-    }
-
-    if (informationalFlow === 'website' && allowDeterministicInfoReplies) {
-      const websiteReply = this.getWebsiteReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: websiteReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return websiteReply;
-    }
-
-    if (informationalFlow === 'contact_details' && allowDeterministicInfoReplies) {
-      const contactDetailsReply = this.getContactDetailsReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: contactDetailsReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return contactDetailsReply;
-    }
-
-    if (informationalFlow === 'portfolio' && allowDeterministicInfoReplies) {
-      const portfolioReply = this.getPortfolioReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: portfolioReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return portfolioReply;
-    }
-
-    // Deterministic social media response for concise, consistent links.
-    if (allowDeterministicInfoReplies && this.shouldUseSocialMediaReply(userMessage)) {
-      const socialReply = this.getSocialMediaReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: socialReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return socialReply;
-    }
-
-    // Deterministic raw-files policy response for direct, accurate answers.
-    if (allowDeterministicInfoReplies && this.shouldUseRawFilesReply(userMessage)) {
-      const rawFilesReply = this.getRawFilesReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: rawFilesReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return rawFilesReply;
-    }
-
-    if (this.shouldUsePreviousAddonReply(userMessage, history)) {
-      const previousAddonReply = await this.getPreviousAddonReply(customerId);
-      if (previousAddonReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: previousAddonReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return previousAddonReply;
-      }
-    }
-
-    if (this.shouldClarifyNewAddon(userMessage, history)) {
-      const addonClarification = 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.';
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: addonClarification,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return addonClarification;
-    }
-
-    if (this.isAddonListFollowUp(userMessage, history)) {
-      const additionsReply = this.getAdditionsReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: additionsReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return additionsReply;
-    }
-
-    const selectedAddon = this.getSelectedAddon(userMessage, history);
-    if (selectedAddon) {
-      const addonQuantity = this.getRequestedAddonQuantity(userMessage, selectedAddon);
-      const noteResult = await this.executeAddNoteTool(
-        customerId,
-        '',
-        addonQuantity > 1 ? `${addonQuantity} x ${selectedAddon.name}` : selectedAddon.name,
-        'special_request',
-        'addon',
-        'normal',
-        userMessage,
-        platform
-      );
-      const addonReply = noteResult.created
-        ? this.getAddonSelectionReply(selectedAddon, addonQuantity)
-        : noteResult.reason === 'duplicate_pending_note'
-          ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
-          : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: addonReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return addonReply;
-    }
-
-    // Deterministic additions & extra services response.
-    if (allowDeterministicInfoReplies && this.shouldUseAdditionsReply(userMessage)) {
-      const additionsReply = this.getAdditionsReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: additionsReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return additionsReply;
-    }
-
-    // Deterministic bespoke experiences response.
-    if (allowDeterministicInfoReplies && this.shouldUseBespokeReply(userMessage)) {
-      const bespokeReply = this.getBespokeReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: bespokeReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return bespokeReply;
-    }
-
-    // Deterministic travelling mothers response.
-    if (allowDeterministicInfoReplies && this.shouldUseTravellingMothersReply(userMessage)) {
-      const travellingReply = this.getTravellingMothersReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: travellingReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return travellingReply;
-    }
-
-    // Deterministic earliest-delivery-date response with plain-text formatting.
-    if (allowDeterministicInfoReplies && this.shouldUseEarliestImageDeliveryReply(userMessage)) {
-      const deliveryReply = await this.getEarliestImageDeliveryReply(customerId);
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: deliveryReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return deliveryReply;
-    }
-
-    // Deterministic post-shoot process response for consistent expectations
-    // and delivery-preference capture CTA.
-    if (allowDeterministicInfoReplies && this.shouldUsePostShootProcessReply(userMessage)) {
-      const postShootReply = this.getPostShootProcessReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: postShootReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return postShootReply;
-    }
-
-    // Deterministic booking process response for consistent policy wording.
-    if (allowDeterministicInfoReplies && this.shouldUseBookingProcessReply(userMessage)) {
-      const processReply = await this.getBookingProcessReply();
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: processReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return processReply;
-    }
-
-    // Deterministic catalog response to avoid unreadable markdown tables and
-    // keep package replies consistent across chat channels.
-    if (this.conversationFlows.isTimeOnlyRescheduleSelection(userMessage, history)) {
-      const rescheduleProposalReply = await this.getRescheduleTimeProposalReply(customerId, userMessage);
-      if (rescheduleProposalReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: rescheduleProposalReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return rescheduleProposalReply;
-      }
-    }
-
-    if (this.shouldUseRescheduleWithdrawalReply(userMessage, history)) {
-      await this.withdrawPendingReschedule(customerId);
-      const withdrawalReply = 'Understood! We will keep your original session date and time, and your booking remains unchanged. Your deposit is still held for that session. Let us know if you need anything else preparing for your shoot!';
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: withdrawalReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      return withdrawalReply;
-    }
-
-    if (this.conversationFlows.isTimeOnlyRescheduleRequest(userMessage)) {
-      const rescheduleTimeReply = await this.getRescheduleTimeReply(customerId);
-      if (rescheduleTimeReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: rescheduleTimeReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return rescheduleTimeReply;
-      }
-    }
-
-    if (this.shouldUseRescheduleRequestReply(userMessage)) {
-      const rescheduleRequestReply = await this.getRescheduleTimeReply(customerId);
-      if (rescheduleRequestReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: rescheduleRequestReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return rescheduleRequestReply;
-      }
-    }
-
-    if (this.conversationFlows.isSameBookingSlotRequest(userMessage)) {
-      const sameSlotReply = await this.getSameBookingSlotReply(customerId, history);
-      if (sameSlotReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: sameSlotReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return sameSlotReply;
-      }
-    }
-
-    if (this.shouldResolvePackageSelectionImmediately(userMessage) && allowDeterministicInfoReplies) {
-      const selectionReply = await this.getPackageSelectionReply(customerId, userMessage);
-      if (selectionReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: selectionReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return selectionReply;
-      }
-    }
-
-    if (this.conversationFlows.isPackageAdviceRequest(userMessage) && allowDeterministicInfoReplies) {
-      const adviceReply = await this.getPackageAdviceReply(userMessage);
-      if (adviceReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: adviceReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return adviceReply;
-      }
-    }
-
-    if (this.conversationFlows.isPackageCatalogRequest(userMessage, history)) {
-      const showInclusions = this.conversationFlows.isPackageInclusionFollowUp(userMessage, history);
-      const catalogReply = await this.getPackageCatalogReply(showInclusions);
-      if (catalogReply) {
-        await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: catalogReply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return catalogReply;
-      }
-    }
-
-    // A short "yes" only confirms a proposal that the customer saw in the
-    // immediately preceding assistant message. This prevents stale drafts
-    // from being applied when the assistant was actually asking for details.
-    if (
-      (platform === 'whatsapp' || platform === 'web') &&
-      this.isExplicitConfirmation(userMessage) &&
-      this.previousMessageRequestsConfirmation(history)
-    ) {
-      let immediate: string | null;
-      try {
-        immediate = await this.tryImmediateConfirmation(customerId);
-      } catch (error: any) {
-        console.error('[AGENT_FLOW] Immediate confirmation failed:', error);
-        const reply = 'I could not complete that change just now. Your booking has not been confirmed as rescheduled; please try again or contact the studio team.';
-        void this.logAiJobMetric({
-          customerId,
-          platform,
-          success: false,
-          failureReason: String(error?.message || error).slice(0, 200),
-          latencyMs: Date.now() - startedAt,
-        });
-        void this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: reply,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: false,
-          isFallback: true,
-        });
-        return reply;
-      }
-      if (immediate) {
-        void this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-        void this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: immediate,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: true,
-          isFallback: false,
-        });
-        return immediate;
-      }
-    }
-
-    try {
-      console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
-      const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
-      console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
-        customerId,
-        tokensUsed,
-        replyPreview: content.slice(0, 200)
-      }));
-      circuitBreaker.recordSuccess();
-      await this.recordTokenUsage(customerId, tokensUsed);
-      if (failureType) {
-        await this.logAiJobMetric({
-          customerId,
-          platform,
-          success: false,
-          isFallback: true,
-          failureReason: failureType,
-          latencyMs: Date.now() - startedAt,
-        });
-        await this.logConversationLearning({
-          customerId,
-          userMessage,
-          aiResponse: content,
-          platform,
-          latencyMs: Date.now() - startedAt,
-          wasSuccessful: false,
-          isFallback: true,
-        });
-        return content;
-      }
-      await this.logAiJobMetric({ customerId, platform, success: true, latencyMs: Date.now() - startedAt });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: content,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: true,
-        isFallback: false,
-      });
-      this.touchCustomerMemory(customerId, userMessage, platform).catch(err => console.error('Customer memory update failed:', err));
-      return content;
-    } catch (error: any) {
-      console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
-      const rateLimitType = classifyProviderRateLimit(error);
-      console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({
-        customerRef: this.customerReference(customerId),
-        errorName: error?.name,
-        status: error?.status,
-        code: error?.code,
-        rateLimitType,
-      }));
-      console.info('[AGENT_USAGE]', JSON.stringify({
-        customerRef: this.customerReference(customerId),
-        model: CHAT_MODEL,
-        completionCalls: null,
-        toolCalls: null,
-        inputTokens: null,
-        outputTokens: null,
-        totalTokens: null,
-        latencyMs: Date.now() - startedAt,
-        rateLimited: rateLimitType !== null,
-        failureType: rateLimitType || 'agent_pipeline_failure',
-      }));
-      const justTripped = circuitBreaker.recordFailure();
-      const isOutage = isProviderRateLimitError(error);
-      const pendingExtrasDecline = isOutage && (platform === 'whatsapp' || platform === 'web')
-        && this.isDecliningOptionalAddons(userMessage, history);
-      const fallbackReply = pendingExtrasDecline
-        ? 'Noted, no optional extras. Our booking assistant is temporarily unavailable, so I have not sent a deposit proposal or M-Pesa prompt. A team member will follow up to finish your booking.'
-        : isOutage
-        ? PROVIDER_OUTAGE_MESSAGE
-        : 'Sorry, I could not process that request right now. Please try again, or a team member will follow up with you.';
-      await this.logAiJobMetric({
-        customerId, platform, success: false, isFallback: true,
-        failureReason: rateLimitType || String(error.message || error).slice(0, 200),
-        circuitBreakerTrip: justTripped,
-        circuitBreakerReason: justTripped ? 'Repeated failures in the reply pipeline' : undefined,
-        latencyMs: Date.now() - startedAt
-      });
-      await this.logConversationLearning({
-        customerId,
-        userMessage,
-        aiResponse: fallbackReply,
-        platform,
-        latencyMs: Date.now() - startedAt,
-        wasSuccessful: false,
-        isFallback: true,
-      });
-      if (rateLimitType === 'daily_tpd_exhausted' && shouldNotifyOutage()) {
-        await this.escalate(customerId, 'error', `AI PROVIDER OUTAGE: Groq's daily token limit has been reached - ALL customers are currently getting the fallback message, not just this one. It resets on its own; check console.groq.com/settings/billing if this keeps recurring. Original error: ${error.message}`);
-      } else if (rateLimitType === 'transient_rate_limit' && shouldNotifyOutage()) {
-        await this.escalate(customerId, 'error', `AI PROVIDER RATE LIMIT: requests are being limited. No automatic retry was attempted. Original error: ${error.message}`);
-      } else if (justTripped && !isOutage) {
-        await this.escalate(customerId, 'error', `Circuit breaker just tripped: ${error.message}`);
-      }
-      if (pendingExtrasDecline) {
-        await this.escalate(customerId, 'booking', 'Customer declined optional extras, but the AI provider is unavailable before the deposit proposal. Review the recent conversation, recheck slot availability, and send the booking proposal manually. No payment prompt was sent.');
-      }
-      return fallbackReply;
-    }
+    return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'no_matching_route' });
   }
 
   private isExplicitConfirmation(userMessage: string): boolean {
@@ -3712,6 +3380,197 @@ ${contextString}`;
     return true;
   }
 
+  /** Sending an M-Pesa prompt needs an explicit yes/yeah/yep/ndio/confirm/go ahead/proceed; "ok" or "sawa" is not enough. */
+  private isPaymentConfirmation(userMessage: string): boolean {
+    const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, ' ').replace(/\s+/g, ' ');
+    if (/\b(no|not|don't|dont|cancel|wait|hold)\b/.test(normalized)) return false;
+    return /\b(?:yes+|yeah|yep|ndio|confirm(?:ed)?|go[\s-]?ahead|proceed)\b/.test(normalized);
+  }
+
+  private isCancellationConfirmation(userMessage: string): boolean {
+    const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, ' ').replace(/\s+/g, ' ').trim();
+    return /^(?:yes+|yeah|yep|ndio|confirm(?:ed)?)(?: please)?$/.test(normalized);
+  }
+
+  private isCancellationDecline(userMessage: string): boolean {
+    const normalized = userMessage.trim().toLowerCase().replace(/[.!?,]/g, '').replace(/\s+/g, ' ');
+    return /^(?:no(?:\s+(?:thanks|thank you|keep it|keep my booking|keep the booking|keep my session|keep the session))?|keep it|keep my booking|keep the booking|keep my session|keep the session|leave it|leave it unchanged|don't cancel|do not cancel)$/.test(normalized);
+  }
+
+  private hasPendingCancellationProposal(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /if you want me to cancel this booking, reply yes to confirm/i.test(previousAssistantMessage);
+  }
+
+  private isCancellationProposalExpired(draft: { cancelProposedAt?: Date | string | null }, now = Date.now()): boolean {
+    const proposedAt = draft.cancelProposedAt ? new Date(draft.cancelProposedAt).getTime() : NaN;
+    return !Number.isFinite(proposedAt) || now - proposedAt >= CANCELLATION_PROPOSAL_TTL_MS;
+  }
+
+  private async clearStaleCancellationDraftBeforeRouting(
+    customerId: string,
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): Promise<string | null> {
+    const previousMessageWasCancellationProposal = this.hasPendingCancellationProposal(history);
+    const isConfirmation = this.isCancellationConfirmation(userMessage);
+    if (!previousMessageWasCancellationProposal) return null;
+
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (draft?.step !== 'cancel_confirm') return null;
+
+    if (this.isCancellationProposalExpired(draft)) {
+      await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+      return isConfirmation
+        ? 'That cancellation proposal expired, so your booking was not changed. If you still want to cancel it, please ask again.'
+        : null;
+    }
+
+    if (isConfirmation || this.isCancellationDecline(userMessage)) return null;
+
+    await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+    return isConfirmation
+      ? 'I could not verify a current cancellation proposal, so your booking was not changed. Please tell me which session you want to cancel.'
+      : null;
+  }
+
+  private hasPendingCancellationSelection(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /which session would you like me to cancel\?/i.test(previousAssistantMessage);
+  }
+
+  private hasCancellationBookingSelector(userMessage: string): boolean {
+    const text = userMessage.toLowerCase();
+    const date = (new BookingExtractor() as any).regexExtract(userMessage).date;
+    const time = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{2}:\d{2}\b/i.test(text);
+    const service = PACKAGE_NAMES_FOR_EXTRACTION.some((packageName) =>
+      text.includes(packageName.toLowerCase().replace(/ package$/i, ''))
+    );
+    return Boolean(date || time || service);
+  }
+
+  private shouldUseCancellationRequest(
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): boolean {
+    const text = userMessage.toLowerCase();
+    const explicitRequest = /^(?:please\s+)?cancel(?:\s+please)?[!. ]*$/.test(text.trim())
+      || /\b(?:please\s+)?cancel\s+(?:my|the|this|that|it|booking|appointment|session|shoot)\b/.test(text)
+      || /\b(?:i want|i need|i'd like|i would like|can i|could i|may i) to? cancel\b/.test(text)
+      || /\b(?:can|could|would) you cancel\b/.test(text);
+    return explicitRequest || (this.hasPendingCancellationSelection(history)
+      && this.hasCancellationBookingSelector(userMessage));
+  }
+
+  private async proposeCancellation(
+    customerId: string,
+    userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): Promise<{ reply: string; proposed: boolean }> {
+    const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (existingDraft?.step && existingDraft.step !== 'cancel_confirm') {
+      const draftDescription = existingDraft.step === 'payment_pending'
+        ? 'An M-Pesa payment prompt is already pending'
+        : existingDraft.step === 'awaiting_confirmation'
+          ? 'A booking proposal is already awaiting your confirmation'
+          : existingDraft.step === 'reschedule_confirm'
+            ? 'A reschedule proposal is already awaiting your confirmation'
+            : 'A booking is already being prepared';
+      return {
+        reply: `${draftDescription}, so I have not changed that request or started a cancellation. Please finish that step or ask the studio team to help.`,
+        proposed: false,
+      };
+    }
+
+    const upcomingBookings = await prisma.booking.findMany({
+      where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
+      orderBy: { dateTime: 'asc' },
+    });
+    if (upcomingBookings.length === 0) {
+      return { reply: 'I could not find an upcoming booking to cancel.', proposed: false };
+    }
+
+    const extractedDate = (new BookingExtractor() as any).regexExtract(userMessage).date as string | null;
+    const timeMatch = userMessage.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
+    let requestedTime: string | null = null;
+    if (timeMatch) {
+      if (timeMatch[4]) {
+        requestedTime = `${timeMatch[4]}:${timeMatch[5]}`;
+      } else {
+        const rawHour = Number(timeMatch[1]);
+        const hour = rawHour % 12 + (timeMatch[3].toLowerCase() === 'pm' ? 12 : 0);
+        requestedTime = `${String(hour).padStart(2, '0')}:${String(Number(timeMatch[2] || 0)).padStart(2, '0')}`;
+      }
+    }
+    const text = userMessage.toLowerCase();
+    const requestedPackage = PACKAGE_NAMES_FOR_EXTRACTION.find((packageName) =>
+      text.includes(packageName.toLowerCase().replace(/ package$/i, ''))
+    );
+    const hasSelector = Boolean(extractedDate || requestedTime || requestedPackage);
+    let matches = upcomingBookings;
+    if (extractedDate) {
+      matches = matches.filter((booking) => inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD') === extractedDate);
+    }
+    if (requestedTime) {
+      matches = matches.filter((booking) => inBusinessTimezone(booking.dateTime).format('HH:mm') === requestedTime);
+    }
+    if (requestedPackage) {
+      matches = matches.filter((booking) => booking.service.toLowerCase().includes(requestedPackage.toLowerCase()));
+    }
+
+    const describeBooking = (booking: { service: string; dateTime: Date }) => {
+      const localDateTime = inBusinessTimezone(booking.dateTime);
+      return `${booking.service} on ${localDateTime.format('dddd, D MMMM YYYY')} at ${localDateTime.format('h:mm A')}`;
+    };
+    if ((!hasSelector && upcomingBookings.length > 1) || matches.length !== 1) {
+      const options = upcomingBookings.map((booking) => `- ${describeBooking(booking)}`).join('\n');
+      const prompt = hasSelector && matches.length === 0
+        ? `I could not match that to an upcoming session. Please choose one of these:\n${options}\nWhich session would you like me to cancel?`
+        : `I found more than one upcoming session:\n${options}\nWhich session would you like me to cancel?`;
+      return { reply: prompt, proposed: false };
+    }
+
+    const booking = matches[0];
+    const localDateTime = inBusinessTimezone(booking.dateTime);
+    const date = localDateTime.format('YYYY-MM-DD');
+    const time = localDateTime.format('HH:mm');
+    await prisma.bookingDraft.upsert({
+      where: { customerId },
+      update: {
+        bookingId: booking.id,
+        service: booking.service,
+        date,
+        time,
+        dateTimeIso: booking.dateTime.toISOString(),
+        cancelProposedAt: new Date(),
+        step: 'cancel_confirm',
+      },
+      create: {
+        customerId,
+        bookingId: booking.id,
+        service: booking.service,
+        date,
+        time,
+        dateTimeIso: booking.dateTime.toISOString(),
+        cancelProposedAt: new Date(),
+        step: 'cancel_confirm',
+      },
+    });
+
+    const refundEligible = booking.dateTime.getTime() - Date.now() > 72 * 60 * 60 * 1000;
+    const refundPosition = refundEligible
+      ? 'It is more than 72 hours away and is eligible for a refund under the policy. Eligibility does not confirm a refund amount or that money has been returned.'
+      : 'It is 72 hours away or less and is not automatically refundable under the policy.';
+    return {
+      reply: `You asked to cancel your ${describeBooking(booking)}. ${refundPosition} If you want me to cancel this booking, reply yes to confirm.`,
+      proposed: true,
+    };
+  }
+
   private shouldConfirmRescheduleWithdrawal(
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
@@ -3727,22 +3586,25 @@ ${contextString}`;
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
     const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-    return /(?:reply\s+["â€œâ€']?yes["â€œâ€']?|if\s+that\s+works\s+for\s+you.*reply\s+["â€œâ€']?yes["â€œâ€']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b)/.test(previousAssistantMessage);
-    // ^ the "reply\s+[quote]?yes[quote]?" alternatives above use literal quote
-    // characters that got corrupted by a prior encoding mishap in this file and
-    // no longer match real curly/smart quotes reliably - reply\W{0,3}yes\b
-    // above is the robust replacement and is what actually matches in practice.
+    return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
   }
 
-  private async tryImmediateConfirmation(customerId: string): Promise<string | null> {
+  private async tryImmediateConfirmation(
+    customerId: string,
+    userMessage = '',
+    history: { role: 'user' | 'assistant'; content: string }[] = []
+  ): Promise<string | null> {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (!draft?.step) return null;
 
     if (draft.step === 'payment_pending') {
-      return `Iâ€™ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and Iâ€™ll confirm the booking as soon as it succeeds.`;
+      return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
     }
 
     if (draft.step === 'awaiting_confirmation') {
+      if (!this.isPaymentConfirmation(userMessage)) {
+        return PAYMENT_CONFIRMATION_REQUIRED_REPLY;
+      }
       const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation');
       return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
@@ -3761,6 +3623,22 @@ ${contextString}`;
         dayjs(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A'),
         result.depositForfeited
       );
+    }
+
+    if (draft.step === 'cancel_confirm') {
+      if (!this.hasPendingCancellationProposal(history)) {
+        await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+        return null;
+      }
+      if (this.isCancellationProposalExpired(draft)) {
+        await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+        return 'That cancellation proposal expired, so your booking was not changed. If you still want to cancel it, please ask again.';
+      }
+      if (!this.isCancellationConfirmation(userMessage)) {
+        return 'Please reply yes, yeah, yep, ndio, or confirm if you want me to cancel this booking. Ok, okay, and sawa do not confirm a cancellation.';
+      }
+      const result = await this.executeConfirmCancellationTool(customerId, draft.step);
+      return this.getCancellationCompletionReply(result);
     }
 
     return null;
@@ -3846,7 +3724,7 @@ ${contextString}`;
     const customer = await prisma.customer.findUnique({ where: { id: customerId } });
     if (!customer) return; // customer doesn't exist yet (e.g. first-ever web chat message)
 
-    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + 'â€¦' : userMessage;
+    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + '…' : userMessage;
     const existing = await prisma.customerMemory.findUnique({ where: { customerId } });
 
     await prisma.customerMemory.upsert({
@@ -4117,13 +3995,16 @@ ${contextString}`;
       throw new Error('No pending booking proposal found. Call propose_booking first.');
     }
 
-    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k)) || 'standard';
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => draft.service?.toLowerCase().includes(k));
+    if (!serviceKey) {
+      throw new Error(`The pending booking's package "${draft.service || 'unknown'}" isn't recognised, so the deposit can't be worked out. Do not start payment; ask the studio team to check the package.`);
+    }
     if (!draft.date || !draft.time) {
       throw new Error('The pending booking is missing its date or time. Ask the customer to start the booking again.');
     }
     const slotsResult: any = await bookingService.getAvailableSlots(
       draft.date,
-      SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION,
+      SERVICE_DURATIONS[serviceKey],
       undefined,
       draft.id
     );
@@ -4143,9 +4024,20 @@ ${contextString}`;
     await bookingDraftService.markPaymentPending(customerId);
 
     // Initiate M-Pesa STK Push using draft ID as reference
+    let mpesaResponse: any;
     try {
-      const mpesaResponse = await mpesaService.initiateStkPush(customerId, depositAmount, draft.id);
+      mpesaResponse = await mpesaService.initiateStkPush(customerId, depositAmount, draft.id);
+    } catch (error: any) {
+      console.error('Failed to initiate M-Pesa STK Push:', error);
+      // No prompt reached the phone, so put the draft back where the customer can confirm again.
+      await prisma.bookingDraft.update({
+        where: { customerId },
+        data: { step: 'awaiting_confirmation' },
+      }).catch((restoreError) => console.error('Failed to restore booking draft after STK push failure:', restoreError));
+      throw new Error(`We couldn't initiate the payment request. Error: ${error.message}`);
+    }
 
+    try {
       // Upsert payment record linked to the draft
       await prisma.payment.upsert({
         where: { bookingDraftId: draft.id },
@@ -4174,8 +4066,11 @@ ${contextString}`;
         checkoutRequestId: mpesaResponse.CheckoutRequestID
       };
     } catch (error: any) {
-      console.error('Failed to initiate M-Pesa STK Push:', error);
-      throw new Error(`We couldn't initiate the payment request. Error: ${error.message}`);
+      console.error('Failed to record M-Pesa payment after STK Push:', error);
+      throw Object.assign(
+        new Error(`An M-Pesa prompt may already have been sent to the customer's phone, but it could not be recorded (${error.message}). Do not send another prompt; ask the customer to check their phone first.`),
+        { code: PAYMENT_PROMPT_UNRECORDED }
+      );
     }
   }
 
@@ -4205,8 +4100,8 @@ ${contextString}`;
 
     // Verify the proposed new slot is actually free before proposing it - this
     // can't be left to the model remembering to call get_available_slots first.
-    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k)) || 'standard';
-    const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+    const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k));
+    const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
     const slotsResult: any = await bookingService.getAvailableSlots(newDate, duration, upcomingBooking.id);
 
     // Spell out the weekday so the model never has to infer it from the raw ISO date.
@@ -4288,8 +4183,8 @@ ${contextString}`;
     });
 
     if (upcomingBooking.googleEventId) {
-      const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k)) || 'standard';
-      const duration = SERVICE_DURATIONS[serviceKey] || DEFAULT_DURATION;
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => upcomingBooking.service.toLowerCase().includes(k));
+      const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
 
       void googleCalendarService.updateEvent(upcomingBooking.googleEventId, {
         service: upcomingBooking.service,
@@ -4326,7 +4221,44 @@ ${contextString}`;
    * Cancels the next upcoming confirmed booking and removes its Google
    * Calendar event if linked.
    */
-  private async executeCancelBookingTool(customerId: string, date?: string) {
+  private async executeConfirmCancellationTool(customerId: string, initialDraftStep: string | undefined) {
+    if (initialDraftStep !== 'cancel_confirm') {
+      throw new Error('No pending cancellation proposal from a prior message. Ask which booking to cancel, propose it, and wait for the customer to explicitly confirm on their own next message.');
+    }
+
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!draft || draft.step !== 'cancel_confirm' || !draft.bookingId || !draft.date) {
+      throw new Error('No pending cancellation proposal found. Ask which booking to cancel and propose it first.');
+    }
+    if (this.isCancellationProposalExpired(draft)) {
+      await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm' } });
+      throw new Error('The cancellation proposal expired. Nothing was cancelled; ask the customer to make a new cancellation request.');
+    }
+
+    return this.executeCancelBookingTool(customerId, draft.date, draft.bookingId);
+  }
+
+  private getCancellationCompletionReply(result: {
+    service: string;
+    dateTime: Date;
+    refundEligible: boolean;
+    depositPaid?: boolean;
+  }): string {
+    const session = `${result.service} on ${inBusinessTimezone(result.dateTime).format('dddd, D MMMM YYYY [at] h:mm A')}`;
+    if (result.refundEligible) {
+      const refundStatus = result.depositPaid
+        ? 'A successful deposit is recorded. The studio team has been notified to review any refund; no refund has been issued.'
+        : 'This is eligibility under the timing policy only; it does not confirm a refund amount or that money has been returned.';
+      return `Your ${session} has been cancelled. It was eligible under the more-than-72-hours refund policy. ${refundStatus}`;
+    }
+
+    const refundStatus = result.depositPaid
+      ? 'A successful deposit is recorded. The studio team has been notified to review the payment; no refund has been issued.'
+      : 'It is not automatically refundable under the timing policy.';
+    return `Your ${session} has been cancelled. It was 72 hours away or less. ${refundStatus}`;
+  }
+
+  private async executeCancelBookingTool(customerId: string, date?: string, bookingId?: string) {
     const upcoming = await prisma.booking.findMany({
       where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
       orderBy: { dateTime: 'asc' }
@@ -4339,9 +4271,11 @@ ${contextString}`;
     const describe = (b: { service: string; dateTime: Date }) =>
       `${b.service} on ${inBusinessTimezone(b.dateTime).format('YYYY-MM-DD h:mm A')}`;
     const requestedDate = date?.trim();
-    const matches = requestedDate
-      ? upcoming.filter((b) => inBusinessTimezone(b.dateTime).format('YYYY-MM-DD') === requestedDate)
-      : upcoming;
+    const matches = bookingId
+      ? upcoming.filter((booking) => booking.id === bookingId)
+      : requestedDate
+        ? upcoming.filter((booking) => inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD') === requestedDate)
+        : upcoming;
 
     if (matches.length === 0) {
       throw new Error(`No upcoming booking on ${requestedDate}. Upcoming bookings: ${upcoming.map(describe).join('; ')}. Ask the customer which one to cancel.`);
@@ -4351,6 +4285,11 @@ ${contextString}`;
     }
 
     const booking = matches[0];
+    const successfulPayment = await prisma.payment.findFirst({
+      where: { bookingId: booking.id, status: 'success' },
+      orderBy: { updatedAt: 'desc' },
+      select: { amount: true, mpesaReceipt: true },
+    });
     let calendarEventRemoved = !booking.googleEventId;
     if (booking.googleEventId) {
       calendarEventRemoved = await googleCalendarService.deleteEvent(booking.googleEventId);
@@ -4376,7 +4315,7 @@ ${contextString}`;
     await notifyAdmin(
       'booking',
       `Booking cancelled for ${customerId}`,
-      `${booking.service} on ${dayjs(booking.dateTime).format('YYYY-MM-DD HH:mm')} was cancelled via AI assistant.`,
+      `${booking.service} on ${dayjs(booking.dateTime).format('YYYY-MM-DD HH:mm')} was cancelled via AI assistant. ${successfulPayment ? `A successful deposit of KSh ${successfulPayment.amount.toLocaleString()} is recorded${successfulPayment.mpesaReceipt ? ` (M-Pesa receipt ${successfulPayment.mpesaReceipt})` : ''}. Studio team: manual refund review is required; no refund was issued by the assistant.` : 'No successful deposit is recorded.'}`,
       {
         customerId,
         event: 'cancel_confirmed',
@@ -4384,6 +4323,11 @@ ${contextString}`;
         service: booking.service,
         dateTime: booking.dateTime.toISOString(),
         refundEligible,
+        successfulDepositRecorded: Boolean(successfulPayment),
+        depositAmount: successfulPayment?.amount,
+        mpesaReceipt: successfulPayment?.mpesaReceipt,
+        manualRefundReviewRequired: Boolean(successfulPayment),
+        refundReviewOwner: successfulPayment ? 'studio_team' : undefined,
       }
     );
 
@@ -4392,6 +4336,7 @@ ${contextString}`;
       service: booking.service,
       dateTime: booking.dateTime,
       refundEligible,
+      depositPaid: Boolean(successfulPayment),
     };
   }
 

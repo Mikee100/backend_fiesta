@@ -411,7 +411,11 @@ test('availability excludes occupied appointments and competing booking drafts',
   (googleCalendarService.getEvents as any) = async () => [];
 
   try {
-    let slots = await bookingService.getAvailableSlots('2026-10-06', 150);
+    const slotList = (result: Awaited<ReturnType<typeof bookingService.getAvailableSlots>>) => {
+      assert.ok(Array.isArray(result), 'expected an open day');
+      return result;
+    };
+    let slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
     assert.equal(slots.includes('13:00'), false);
 
     bookings = [];
@@ -420,10 +424,10 @@ test('availability excludes occupied appointments and competing booking drafts',
       service: 'THE ICON',
       dateTimeIso: '2026-10-06T10:00:00.000Z',
     }];
-    slots = await bookingService.getAvailableSlots('2026-10-06', 150);
+    slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
     assert.equal(slots.includes('13:00'), false);
 
-    slots = await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft');
+    slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft'));
     assert.equal(slots.includes('13:00'), true);
   } finally {
     prisma.booking.findMany = originals.bookingFindMany;
