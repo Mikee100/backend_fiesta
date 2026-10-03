@@ -11,6 +11,7 @@ import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, classifyProviderRateLimit, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
+import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
@@ -124,6 +125,7 @@ const OFFICIAL_WEBSITE_URLS = {
   reviews: 'https://www.fiestahousematernity.com/reviews',
   suspendingConcept: 'https://www.fiestahousematernity.com/gallery/suspending-concept',
 } as const;
+const PACKAGE_PRICING_FALLBACK = 'The Editions are THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 (Most Loved / Signature), and THE GODDESS: Ksh 120,000 (Flagship).';
 
 // --- Hybrid Booking Extractor ---
 type BookingDetails = {
@@ -1437,8 +1439,14 @@ export class AgentService {
     return /\b(10|10000|10k)\s*(sh|k|ksh|kes)?\b.*\bdeposit\b|\bdeposit\b.*\b(10|10000|10k)\s*(sh|k|ksh|kes)?\b/.test(text);
   }
 
-  private getAmbiguousDepositReply(): string {
-    return 'Do you mean a Ksh 10,000 deposit, or an add-on or item costing Ksh 10,000? The THE BLOOM package has a Ksh 2,000 deposit, so I want to make sure I understand what you mean before recommending anything.';
+  private async getAmbiguousDepositReply(): Promise<string> {
+    try {
+      const deposit = this.getDepositForPackage(await this.getPackageForDeposit('THE BLOOM'));
+      return `Do you mean a Ksh 10,000 deposit, or an add-on or item costing Ksh 10,000? THE BLOOM's deposit is Ksh ${deposit.toLocaleString()}, so I want to make sure I understand before recommending anything.`;
+    } catch {
+      console.warn('Unable to resolve Bloom deposit for clarification.');
+      return 'Do you mean a Ksh 10,000 deposit, or an add-on or item costing Ksh 10,000? The studio team can confirm the current package deposit before recommending anything.';
+    }
   }
 
   private async captureRecipientName(customerId: string, userMessage: string): Promise<string | null> {
@@ -1770,7 +1778,7 @@ export class AgentService {
 
   private async getPackageSelectionReply(customerId: string, userMessage: string): Promise<string | null> {
     const text = userMessage.toLowerCase();
-    const packages = await prisma.package.findMany({ select: { name: true } });
+    const packages = await prisma.package.findMany({ select: { name: true, deposit: true } });
     const selectedPackage = packages.find((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
     if (!selectedPackage) return null;
 
@@ -1789,11 +1797,13 @@ export class AgentService {
         return `${selectedPackage.name} needs a different amount of time, and ${draft.time} is not free on ${dayjs(draft.date).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would you prefer?`;
       }
 
-      const selectedPackageDetails = await prisma.package.findUnique({
-        where: { name: selectedPackage.name },
-        select: { deposit: true },
-      });
-      const deposit = selectedPackageDetails?.deposit || 2000;
+      let deposit: number;
+      try {
+        deposit = this.getDepositForPackage(selectedPackage);
+      } catch {
+        console.warn('Unable to resolve package-selection deposit.');
+        return `${selectedPackage.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The studio team will confirm the deposit before any payment prompt is sent.`;
+      }
       await prisma.bookingDraft.update({
         where: { customerId },
         data: { service: selectedPackage.name, step: 'awaiting_confirmation' },
@@ -1814,14 +1824,22 @@ export class AgentService {
       return null;
     }
 
-    const packages = await prisma.package.findMany({ select: { name: true, deposit: true } });
+    const packages = await prisma.package.findMany({ select: { name: true } });
     const selectedPackage = history
       .filter((message) => message.role === 'user')
       .reverse()
       .map((message) => packages.find((pkg) => message.content.toLowerCase().includes(pkg.name.replace(/ package$/i, '').toLowerCase())))
-      .find((pkg): pkg is { name: string; deposit: number } => Boolean(pkg));
+      .find((pkg): pkg is { name: string } => Boolean(pkg));
     const packageToUse = selectedPackage || packages.find((pkg) => pkg.name === draft.service);
     if (!packageToUse) return null;
+
+    let deposit: number;
+    try {
+      deposit = this.getDepositForPackage(await this.getPackageForDeposit(packageToUse.name));
+    } catch {
+      console.warn('Unable to resolve same-slot package deposit.');
+      return 'I have the session details, but the studio team will confirm the deposit before I send a payment proposal.';
+    }
 
     const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => packageToUse.name.toLowerCase().includes(key));
     const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
@@ -1839,7 +1857,7 @@ export class AgentService {
       data: { service: packageToUse.name, step: 'awaiting_confirmation' },
     });
 
-    return `${packageToUse.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${packageToUse.deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+    return `${packageToUse.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
   }
 
   private async getRescheduleTimeReply(customerId: string): Promise<string | null> {
@@ -1899,8 +1917,7 @@ export class AgentService {
   }
 
   private isRescheduleWithin72Hours(bookingDateTime: Date, now = new Date()): boolean {
-    const hoursUntilBooking = bookingDateTime.getTime() - now.getTime();
-    return hoursUntilBooking >= 0 && hoursUntilBooking < 72 * 60 * 60 * 1000;
+    return getBookingPolicyWindow(bookingDateTime, now).rescheduleForfeitsDeposit;
   }
 
   private getReschedulePolicyMessage(): string {
@@ -1908,29 +1925,22 @@ export class AgentService {
   }
 
   private async getBookingProcessReply(): Promise<string> {
-    let startingDeposit = 2000;
+    let startingDeposit: number | null = null;
     let location = '4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi';
 
     try {
-      const [lowestDepositPackage, studioInfo] = await Promise.all([
-        prisma.package.findFirst({
-          orderBy: { deposit: 'asc' },
-          select: { deposit: true },
-        }),
-        prisma.studioInfo.findFirst({
-          orderBy: { createdAt: 'desc' },
-          select: { location: true },
-        }),
-      ]);
-
-      if (lowestDepositPackage?.deposit && lowestDepositPackage.deposit > 0) {
-        startingDeposit = lowestDepositPackage.deposit;
-      }
-      if (studioInfo?.location?.trim()) {
-        location = studioInfo.location.trim();
-      }
-    } catch (err) {
-      console.error('Failed to resolve booking process context:', err);
+      startingDeposit = this.getDepositForPackage(await this.getPackageForDeposit());
+    } catch {
+      console.warn('Unable to resolve starting deposit for booking process reply.');
+    }
+    try {
+      const studioInfo = await prisma.studioInfo.findFirst({
+        orderBy: { createdAt: 'desc' },
+        select: { location: true },
+      });
+      if (studioInfo?.location?.trim()) location = studioInfo.location.trim();
+    } catch (error) {
+      console.error('Failed to resolve booking process location:', error);
     }
 
     return [
@@ -1938,7 +1948,9 @@ export class AgentService {
       '1) Choose your package.',
       '2) Share your preferred date and time (we are closed on Mondays).',
       '3) Choose any optional add-ons if you wish (extra outfit, wig hire, extra photos, etc. — completely optional!).',
-      `4) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
+      startingDeposit === null
+        ? '4) We confirm availability, and the studio team will confirm the deposit amount before any M-Pesa prompt is sent.'
+        : `4) We confirm availability and send an M-Pesa deposit prompt (starting from Ksh ${startingDeposit.toLocaleString()}).`,
       '5) Once deposit is received, your booking is confirmed and reminders are scheduled.',
       `6) Come for your session at ${location}.`,
       '7) Pay the remaining balance after the shoot (M-Pesa or cash).',
@@ -2013,7 +2025,14 @@ export class AgentService {
     ].join('\n');
   }
 
-  private getAdditionsReply(): string {
+  private async getAdditionsReply(): Promise<string> {
+    let deposit: number | null = null;
+    try {
+      deposit = this.getDepositForPackage(await this.getPackageForDeposit());
+    } catch {
+      console.warn('Unable to resolve starting deposit for add-ons reply.');
+    }
+
     const pricedLines = ADDON_CATALOG
       .filter((item) => item.unitPrice > 0)
       .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`);
@@ -2029,7 +2048,9 @@ export class AgentService {
       'Quoted by package tier:',
       ...quotedLines,
       '',
-      'They are optional, are added to the balance, and are not included in the Ksh 2,000 deposit. Nothing has been added yet.',
+      deposit === null
+        ? 'They are optional and are added to the balance, not the deposit. The studio team can confirm the deposit amount. Nothing has been added yet.'
+        : `They are optional, are added to the balance, and are not included in the Ksh ${deposit.toLocaleString()} deposit. Nothing has been added yet.`,
       '',
       'Which, if any, would you like me to note for the session?'
     ].join('\n');
@@ -2249,19 +2270,51 @@ export class AgentService {
     }
   }
 
-  getInstructionGuide(): string {
-    return this.getSystemPrompt('', 'whatsapp');
+  async getInstructionGuide(): Promise<string> {
+    const packagePricing = await this.getPackagePricingLine();
+    return this.getSystemPrompt('', 'whatsapp', true, true, packagePricing);
+  }
+
+  private async getPackagePricingLine(): Promise<string> {
+    try {
+      const packages = await prisma.package.findMany({
+        where: { name: { in: [...PACKAGE_NAMES_FOR_EXTRACTION] } },
+        orderBy: { price: 'asc' },
+        select: { name: true, price: true },
+      });
+      if (
+        packages.length !== PACKAGE_NAMES_FOR_EXTRACTION.length
+        || packages.some((pkg) => !Number.isInteger(pkg.price) || pkg.price <= 0)
+      ) {
+        throw new Error('The package catalog is missing one or more valid Edition prices.');
+      }
+
+      const packageDescriptions = packages.map((pkg) => {
+        const name = pkg.name.toUpperCase();
+        const badge = name === 'THE EMPRESS'
+          ? ' (Most Loved / Signature)'
+          : name === 'THE GODDESS'
+            ? ' (Flagship)'
+            : '';
+        return `${name}: Ksh ${pkg.price.toLocaleString()}${badge}`;
+      });
+      return `The Editions are ${packageDescriptions.join(', ')}.`;
+    } catch (error) {
+      console.warn('[AGENT] Package catalog unavailable; using the hardcoded package-price prompt fallback.');
+      return PACKAGE_PRICING_FALLBACK;
+    }
   }
 
   private getSystemPrompt(
     businessContext: string,
     platform: string,
     includePackagePricing = true,
-    includeAddonPricing = true
+    includeAddonPricing = true,
+    packagePricingLine = PACKAGE_PRICING_FALLBACK
   ): string {
     const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
     const packagePricing = includePackagePricing
-      ? 'The Editions are THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 (Most Loved / Signature), and THE GODDESS: Ksh 120,000 (Flagship).'
+      ? packagePricingLine
       : 'Use package prices only when present in Business Context; if unavailable, offer to confirm with the team rather than guess.';
     const addonPricing = includeAddonPricing
       ? this.getAddonPricingLine()
@@ -2432,9 +2485,10 @@ ${contextString}`;
       .toLowerCase();
     const includePackagePricing = /\b(package|edition|bloom|muse|icon|legend|queen|empress|goddess|rate\s*card|pricing|price|cost|how\s+much|cheapest|affordable)\b/.test(recentConversation);
     const includeAddonPricing = /\b(add-?ons?|extras?|extra\s+(?:outfit|photo|makeup)|styled\s+wig|wig\s+hire|power\s+suit|sculpture\s+set|balloon\s+backdrop|reel\s+pricing)\b/.test(recentConversation);
+    const packagePricingLine = includePackagePricing ? await this.getPackagePricingLine() : undefined;
 
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: 'system', content: this.getSystemPrompt(fullContext, platform, includePackagePricing, includeAddonPricing) },
+      { role: 'system', content: this.getSystemPrompt(fullContext, platform, includePackagePricing, includeAddonPricing, packagePricingLine) },
       ...history.slice(-MAX_HISTORY_MESSAGES),
       { role: 'user', content: userMessage }
     ];
@@ -2636,7 +2690,8 @@ ${contextString}`;
               } else if (!this.isPaymentConfirmation(userMessage)) {
                 toolResponse = `ERROR: The customer has not explicitly replied yes, confirm, go ahead, or proceed in this message, so the M-Pesa prompt was NOT sent. Ask them to reply yes to confirm the booking.`;
               } else {
-                const result = await this.executeConfirmBookingTool(customerId, initialDraftStep);
+                const expectedDeposit = this.getDepositAmountFromProposalHistory(history);
+                const result = await this.executeConfirmBookingTool(customerId, initialDraftStep, expectedDeposit);
                 confirmedActionThisTurn = true;
                 toolResponse = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed. This is DONE - do not call any more booking tools this turn.`;
               }
@@ -3561,7 +3616,7 @@ ${contextString}`;
       },
     });
 
-    const refundEligible = booking.dateTime.getTime() - Date.now() > 72 * 60 * 60 * 1000;
+    const refundEligible = getBookingPolicyWindow(booking.dateTime).cancellationRefundEligible;
     const refundPosition = refundEligible
       ? 'It is more than 72 hours away and is eligible for a refund under the policy. Eligibility does not confirm a refund amount or that money has been returned.'
       : 'It is 72 hours away or less and is not automatically refundable under the policy.';
@@ -3589,6 +3644,16 @@ ${contextString}`;
     return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
   }
 
+  private getDepositAmountFromProposalHistory(
+    history: { role: 'user' | 'assistant'; content: string }[]
+  ): number | null {
+    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    const match = previousAssistantMessage.match(/\bdeposit\s+is\s+KSH\s+([\d,]+)/i);
+    if (!match) return null;
+    const amount = Number(match[1].replace(/,/g, ''));
+    return Number.isInteger(amount) && amount > 0 ? amount : null;
+  }
+
   private async tryImmediateConfirmation(
     customerId: string,
     userMessage = '',
@@ -3605,7 +3670,8 @@ ${contextString}`;
       if (!this.isPaymentConfirmation(userMessage)) {
         return PAYMENT_CONFIRMATION_REQUIRED_REPLY;
       }
-      const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation');
+      const expectedDeposit = this.getDepositAmountFromProposalHistory(history);
+      const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
       return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
 
@@ -3962,11 +4028,7 @@ ${contextString}`;
       .millisecond(0)
       .toISOString();
 
-    // Fetch package to get deposit amount
-    const pkg = await prisma.package.findFirst({
-      where: { name: { contains: serviceKey, mode: 'insensitive' } }
-    });
-    const depositAmount = this.getConfiguredBookingDeposit(pkg?.deposit);
+    const depositAmount = this.getDepositForPackage(await this.getPackageForDeposit(service));
 
     await bookingDraftService.saveBookingProposal({
       customerId: customer.id,
@@ -3985,7 +4047,11 @@ ${contextString}`;
    * happened on a PRIOR message, not earlier in this same turn. This is what
    * guarantees the customer explicitly agreed before any prompt is sent.
    */
-  private async executeConfirmBookingTool(customerId: string, initialDraftStep: string | undefined) {
+  private async executeConfirmBookingTool(
+    customerId: string,
+    initialDraftStep: string | undefined,
+    expectedDeposit: number | null
+  ) {
     if (initialDraftStep !== 'awaiting_confirmation') {
       throw new Error('No pending booking proposal from a prior message. Call propose_booking first and wait for the customer to explicitly confirm on their own next message before calling confirm_booking.');
     }
@@ -4016,10 +4082,10 @@ ${contextString}`;
       throw new Error(`The proposed time ${draft.time} on ${draft.date} is no longer available. Do not start payment; ask the customer to choose another time.`);
     }
 
-    const pkg = await prisma.package.findFirst({
-      where: { name: { contains: serviceKey, mode: 'insensitive' } }
-    });
-    const depositAmount = this.getConfiguredBookingDeposit(pkg?.deposit);
+    const depositAmount = this.getDepositForPackage(await this.getPackageForDeposit(draft.service || ''));
+    if (expectedDeposit === null || expectedDeposit !== depositAmount) {
+      throw new Error('The package deposit no longer matches the amount in the customer-visible proposal. Do not start payment; prepare a new proposal and ask for confirmation again.');
+    }
 
     await bookingDraftService.markPaymentPending(customerId);
 
@@ -4074,10 +4140,37 @@ ${contextString}`;
     }
   }
 
-  private getConfiguredBookingDeposit(configuredDeposit?: number | null): number {
-    const depositAmount = configuredDeposit ?? MINIMUM_BOOKING_DEPOSIT;
+  private async getPackageForDeposit(packageName?: string): Promise<{ name: string; deposit: number | null } | null> {
+    if (!packageName) {
+      return prisma.package.findFirst({
+        orderBy: { deposit: 'asc' },
+        select: { name: true, deposit: true },
+      });
+    }
+
+    const normalizedName = packageName.trim().toLowerCase().replace(/\s+(?:package|edition)$/i, '');
+    const canonicalName = PACKAGE_NAMES_FOR_EXTRACTION.find((name) => {
+      const normalizedPackageName = name.toLowerCase();
+      return normalizedPackageName === normalizedName
+        || normalizedPackageName.replace(/^the\s+/, '') === normalizedName;
+    }) || packageName.trim();
+    return prisma.package.findUnique({
+      where: { name: canonicalName },
+      select: { name: true, deposit: true },
+    });
+  }
+
+  private getDepositForPackage(pkg: { name: string; deposit: number | null } | null | undefined): number {
+    if (!pkg) {
+      throw new Error('No package deposit is configured. Ask the studio team to confirm the amount.');
+    }
+
+    const depositAmount: unknown = pkg.deposit;
     const isProductionMpesa = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase() === 'production';
-    if (!Number.isInteger(depositAmount) || depositAmount < 1 || (isProductionMpesa && depositAmount < MINIMUM_BOOKING_DEPOSIT)) {
+    if (typeof depositAmount !== 'number' || !Number.isInteger(depositAmount) || depositAmount < 1) {
+      throw new Error(`The configured deposit for ${pkg.name} is missing or invalid. Do not quote or initiate payment; ask the studio team to correct package pricing.`);
+    }
+    if (isProductionMpesa && depositAmount < MINIMUM_BOOKING_DEPOSIT) {
       throw new Error(`The configured booking deposit is below the KSh ${MINIMUM_BOOKING_DEPOSIT.toLocaleString()} minimum. Do not initiate payment; ask the studio team to correct package pricing.`);
     }
     return depositAmount;
@@ -4309,8 +4402,7 @@ ${contextString}`;
 
     await prisma.bookingDraft.deleteMany({ where: { customerId } });
 
-    const hoursUntil = dayjs(booking.dateTime).diff(dayjs(), 'hour', true);
-    const refundEligible = hoursUntil > 72;
+    const refundEligible = getBookingPolicyWindow(booking.dateTime).cancellationRefundEligible;
 
     await notifyAdmin(
       'booking',

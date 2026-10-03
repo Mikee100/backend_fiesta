@@ -104,20 +104,35 @@ test('does not route invalid Groq credentials to Gemini', async () => {
   }
 });
 
-test('keeps all policy identifiers while omitting unrelated price tables', () => {
-  const fullPrompt = agent.getInstructionGuide();
-  const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
-  const pricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
+test('keeps all policy identifiers while omitting unrelated price tables', async () => {
+  const originalPackageFindMany = prisma.package.findMany;
+  (prisma.package.findMany as any) = async () => [
+    { name: 'THE BLOOM', price: 15555 },
+    { name: 'THE MUSE', price: 25000 },
+    { name: 'THE ICON', price: 35000 },
+    { name: 'THE LEGEND', price: 45000 },
+    { name: 'THE QUEEN', price: 55000 },
+    { name: 'THE EMPRESS', price: 70000 },
+    { name: 'THE GODDESS', price: 120000 },
+  ];
+  try {
+    const fullPrompt = await agent.getInstructionGuide();
+    const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
+    const fallbackPricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 29);
-  assert.match(fullPrompt, /THE BLOOM: Ksh 15,000/);
-  assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
-  assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
-  assert.equal(compactPrompt.includes('THE BLOOM: Ksh 15,000'), false);
-  assert.equal(compactPrompt.includes(agent.getAddonPricingLine()), false);
-  assert.match(pricingPrompt, /THE BLOOM: Ksh 15,000/);
-  assert.equal(pricingPrompt.includes(agent.getAddonPricingLine()), false);
-  assert.ok(compactPrompt.length < fullPrompt.length);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 29);
+    assert.match(fullPrompt, /THE BLOOM: Ksh 15,555/);
+    assert.doesNotMatch(fullPrompt, /THE BLOOM: Ksh 15,000/);
+    assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
+    assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
+    assert.equal(compactPrompt.includes('THE BLOOM: Ksh 15,000'), false);
+    assert.equal(compactPrompt.includes(agent.getAddonPricingLine()), false);
+    assert.match(fallbackPricingPrompt, /THE BLOOM: Ksh 15,000/);
+    assert.equal(fallbackPricingPrompt.includes(agent.getAddonPricingLine()), false);
+    assert.ok(compactPrompt.length < fullPrompt.length);
+  } finally {
+    prisma.package.findMany = originalPackageFindMany;
+  }
 });
 
 test('accepts natural confirmation wording for a pending booking', () => {
@@ -328,15 +343,22 @@ test('uses the customer-stated day over a conflicting model-proposed date', () =
   );
 });
 
-test('allows low-value sandbox deposits but rejects them in production', () => {
+test('validates configured package deposits without substituting zero or null', async () => {
   const originalEnvironment = process.env.MPESA_ENVIRONMENT;
+  let configuredDeposit: number | null = 10;
   try {
     process.env.MPESA_ENVIRONMENT = 'sandbox';
-    assert.equal(agent.getConfiguredBookingDeposit(10), 10);
+    assert.equal(agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), 10);
+    configuredDeposit = 0;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /missing or invalid/);
+    configuredDeposit = null;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /missing or invalid/);
 
     process.env.MPESA_ENVIRONMENT = 'production';
-    assert.equal(agent.getConfiguredBookingDeposit(2000), 2000);
-    assert.throws(() => agent.getConfiguredBookingDeposit(10), /below the KSh 2,000 minimum/i);
+    configuredDeposit = 2000;
+    assert.equal(agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), 2000);
+    configuredDeposit = 10;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /below the KSh 2,000 minimum/i);
   } finally {
     if (originalEnvironment === undefined) delete process.env.MPESA_ENVIRONMENT;
     else process.env.MPESA_ENVIRONMENT = originalEnvironment;
@@ -791,9 +813,15 @@ test('captures a recipient named before the clarification reply', () => {
   assert.equal(agent.shouldCaptureRecipientName('Maryanne Nuduta', history), true);
 });
 
-test('does not guess what an ambiguous 10k deposit means', () => {
+test('does not guess what an ambiguous 10k deposit means', async () => {
+  const originalPackageFindUnique = prisma.package.findUnique;
+  (prisma.package.findUnique as any) = async () => ({ name: 'THE BLOOM', deposit: 2000 });
+  try {
   assert.equal(agent.shouldClarifyAmbiguousDeposit('she wants the one with the 10 sh deposit in it'), true);
-  assert.match(agent.getAmbiguousDepositReply(), /Do you mean a Ksh 10,000 deposit|add-on/i);
+    assert.match(await agent.getAmbiguousDepositReply(), /Do you mean a Ksh 10,000 deposit|add-on/i);
+  } finally {
+    prisma.package.findUnique = originalPackageFindUnique;
+  }
 });
 
 test('anchors numeric booking dates to the customer message', () => {
@@ -830,12 +858,19 @@ test('uses the exact date when the offered weekday context includes it', () => {
   );
 });
 
-test('formats additions as plain WhatsApp text', () => {
-  const reply = agent.getAdditionsReply();
+test('formats additions as plain WhatsApp text and uses the package deposit helper', async () => {
+  const originalPackageFindFirst = prisma.package.findFirst;
+  (prisma.package.findFirst as any) = async () => ({ name: 'THE BLOOM', deposit: 2500 });
+  try {
+    const reply = await agent.getAdditionsReply();
 
-  assert.doesNotMatch(reply, /\|.*\|/);
-  assert.match(reply, /Extra edited photo: Ksh 1,000 each/);
-  assert.match(reply, /Nothing has been added yet/);
+    assert.doesNotMatch(reply, /\|.*\|/);
+    assert.match(reply, /Extra edited photo: Ksh 1,000 each/);
+    assert.match(reply, /not included in the Ksh 2,500 deposit/);
+    assert.match(reply, /Nothing has been added yet/);
+  } finally {
+    prisma.package.findFirst = originalPackageFindFirst;
+  }
 });
 
 test('recognizes an add-on selection without restarting booking', () => {

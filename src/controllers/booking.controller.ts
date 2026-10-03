@@ -5,6 +5,7 @@ import { SERVICE_DURATIONS, DEFAULT_DURATION } from '../config/constants';
 import { notifyAdmin } from '../services/notifications/notification.service';
 import dayjs from 'dayjs';
 import { bookingService } from '../services/booking/booking.service';
+import { getBookingPolicyWindow } from '../utils/booking-policy';
 import { businessDay } from '../utils/time';
 
 export class BookingController {
@@ -252,8 +253,7 @@ export class BookingController {
         }
       });
 
-      const hoursUntil = dayjs(existing.dateTime).diff(dayjs(), 'hour', true);
-      const refundEligible = hoursUntil > 72;
+      const refundEligible = getBookingPolicyWindow(existing.dateTime).cancellationRefundEligible;
       await notifyAdmin(
         'booking',
         `Booking cancelled: ${existing.customerId}`,

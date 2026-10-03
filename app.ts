@@ -159,8 +159,8 @@ app.use('/api/conversations', conversationRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/mpesa', paymentRoutes);
 
-app.get('/api/ai-instructions', (_req, res) => {
-  res.json({ instructions: agentService.getInstructionGuide() });
+app.get('/api/ai-instructions', async (_req, res) => {
+  res.json({ instructions: await agentService.getInstructionGuide() });
 });
 
 // Calendar Routes

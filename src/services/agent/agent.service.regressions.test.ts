@@ -10,6 +10,7 @@ import { bookingService } from '../booking/booking.service';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { mpesaService } from '../payment/mpesa.service';
 import { nowInBusinessTimezone } from '../../utils/time';
+import { getBookingPolicyWindow, RESCHEDULE_FORFEITURE_WINDOW_HOURS } from '../../utils/booking-policy';
 import { AgentService, BookingExtractor } from './agent.service';
 
 const agent = new AgentService() as any;
@@ -54,6 +55,24 @@ test('cancellation confirmation accepts a clear yes but not acknowledgements', (
   for (const message of ['ok', 'okay', 'sawa', 'no', 'no, keep it', 'keep it']) {
     assert.equal(agent.isCancellationConfirmation(message), false, message);
   }
+});
+
+test('the shared 72-hour policy preserves strict boundary behavior', () => {
+  const now = new Date('2026-10-03T12:00:00.000Z');
+  const windowMs = RESCHEDULE_FORFEITURE_WINDOW_HOURS * 60 * 60 * 1000;
+
+  assert.deepEqual(
+    getBookingPolicyWindow(new Date(now.getTime() + windowMs - 1), now),
+    { rescheduleForfeitsDeposit: true, cancellationRefundEligible: false }
+  );
+  assert.deepEqual(
+    getBookingPolicyWindow(new Date(now.getTime() + windowMs), now),
+    { rescheduleForfeitsDeposit: false, cancellationRefundEligible: false }
+  );
+  assert.deepEqual(
+    getBookingPolicyWindow(new Date(now.getTime() + windowMs + 1), now),
+    { rescheduleForfeitsDeposit: false, cancellationRefundEligible: true }
+  );
 });
 
 test('cancellation confirmer requires cancel_confirm from the turn-start snapshot', async () => {
@@ -188,6 +207,232 @@ test('an explicit previous-addon question does not require prior assistant wordi
   assert.equal(agent.shouldUsePreviousAddonReply('Which package did I choose before?'), false);
 });
 
+test('all package deposit displays and booking charges use one helper result', async () => {
+  const originals = {
+    packageFindMany: prisma.package.findMany,
+    packageFindUnique: prisma.package.findUnique,
+    packageFindFirst: prisma.package.findFirst,
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    draftUpdate: prisma.bookingDraft.update,
+    studioInfoFindFirst: prisma.studioInfo.findFirst,
+    customerFindUnique: prisma.customer.findUnique,
+    paymentUpsert: prisma.payment.upsert,
+    slots: bookingService.getAvailableSlots,
+    saveProposal: bookingDraftService.saveBookingProposal,
+    draftGet: bookingDraftService.get,
+    markPaymentPending: bookingDraftService.markPaymentPending,
+    stkPush: mpesaService.initiateStkPush,
+  };
+  const sharedDeposit = 3210;
+  const helperCalls: string[] = [];
+  const stkAmounts: number[] = [];
+  const proposalSaves: unknown[] = [];
+  const instance = new AgentService() as any;
+  const draft = {
+    id: 'draft-deposit-test',
+    step: 'awaiting_confirmation',
+    service: 'THE ICON',
+    date: '2026-10-10',
+    time: '15:00',
+    dateTimeIso: '2026-10-10T12:00:00.000Z',
+  };
+  Object.assign(instance, {
+    getDepositForPackage: (pkg: { name: string; deposit: number | null } | null) => {
+      helperCalls.push(pkg?.name || '<missing-package>');
+      return sharedDeposit;
+    },
+  });
+  (prisma.package.findMany as any) = async () => [{ name: 'THE ICON', deposit: sharedDeposit }];
+  (prisma.package.findUnique as any) = async ({ where }: any) => ({ name: where.name, deposit: sharedDeposit });
+  (prisma.package.findFirst as any) = async () => ({ name: 'THE BLOOM', deposit: sharedDeposit });
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.update as any) = async () => draft;
+  (prisma.studioInfo.findFirst as any) = async () => ({ location: 'Studio' });
+  (prisma.customer.findUnique as any) = async () => ({ id: 'customer-1', name: 'Jane Doe' });
+  (prisma.payment.upsert as any) = async () => ({});
+  (bookingService.getAvailableSlots as any) = async () => ['15:00'];
+  (bookingDraftService.saveBookingProposal as any) = async (proposal: unknown) => { proposalSaves.push(proposal); };
+  (bookingDraftService.get as any) = async () => draft;
+  (bookingDraftService.markPaymentPending as any) = async () => {};
+  (mpesaService.initiateStkPush as any) = async (_customerId: string, amount: number) => {
+    stkAmounts.push(amount);
+    return { CheckoutRequestID: 'checkout-deposit-test' };
+  };
+
+  try {
+    const packageSelection = await instance.getPackageSelectionReply('customer-1', 'I want THE ICON');
+    const sameSlot = await instance.getSameBookingSlotReply('customer-1', [
+      { role: 'user', content: 'I want THE ICON' },
+    ]);
+    const bookingProcess = await instance.getBookingProcessReply();
+    const ambiguousDeposit = await instance.getAmbiguousDepositReply();
+    const additions = await instance.getAdditionsReply();
+    const proposal = await instance.executeProposeBookingTool(
+      'customer-1', 'Jane Doe', 'THE ICON', '2026-10-10T15:00'
+    );
+    const confirmation = await instance.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', sharedDeposit);
+
+    for (const reply of [packageSelection, sameSlot, bookingProcess, ambiguousDeposit, additions]) {
+      assert.match(reply, /Ksh 3,210/);
+    }
+    assert.equal(proposal.depositAmount, sharedDeposit);
+    assert.equal(confirmation.depositAmount, sharedDeposit);
+    assert.deepEqual(stkAmounts, [sharedDeposit]);
+    assert.equal(proposalSaves.length, 1);
+    assert.equal(helperCalls.length, 7);
+  } finally {
+    prisma.package.findMany = originals.packageFindMany;
+    prisma.package.findUnique = originals.packageFindUnique;
+    prisma.package.findFirst = originals.packageFindFirst;
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    prisma.bookingDraft.update = originals.draftUpdate;
+    prisma.studioInfo.findFirst = originals.studioInfoFindFirst;
+    prisma.customer.findUnique = originals.customerFindUnique;
+    prisma.payment.upsert = originals.paymentUpsert;
+    bookingService.getAvailableSlots = originals.slots;
+    bookingDraftService.saveBookingProposal = originals.saveProposal;
+    bookingDraftService.get = originals.draftGet;
+    bookingDraftService.markPaymentPending = originals.markPaymentPending;
+    mpesaService.initiateStkPush = originals.stkPush;
+  }
+});
+
+test('confirmation refuses to charge if the package deposit changed after proposal', async () => {
+  const originals = {
+    packageFindUnique: prisma.package.findUnique,
+    draftGet: bookingDraftService.get,
+    slots: bookingService.getAvailableSlots,
+    markPaymentPending: bookingDraftService.markPaymentPending,
+    stkPush: mpesaService.initiateStkPush,
+  };
+  let paymentMarkedPending = false;
+  let paymentStarted = false;
+  const instance = new AgentService() as any;
+  Object.assign(instance, {
+    getDepositForPackage: async () => 3200,
+  });
+  (prisma.package.findUnique as any) = async ({ where }: any) => ({ name: where.name, deposit: 3200 });
+  (bookingDraftService.get as any) = async () => ({
+    id: 'draft-price-changed',
+    step: 'awaiting_confirmation',
+    service: 'THE ICON',
+    date: '2026-10-10',
+    time: '15:00',
+  });
+  (bookingService.getAvailableSlots as any) = async () => ['15:00'];
+  (bookingDraftService.markPaymentPending as any) = async () => { paymentMarkedPending = true; };
+  (mpesaService.initiateStkPush as any) = async () => { paymentStarted = true; return { CheckoutRequestID: 'must-not-send' }; };
+
+  try {
+    for (const proposedAmount of [3000, null]) {
+      paymentMarkedPending = false;
+      paymentStarted = false;
+      await assert.rejects(
+        instance.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', proposedAmount),
+        /no longer matches the amount in the customer-visible proposal/
+      );
+      assert.equal(paymentMarkedPending, false);
+      assert.equal(paymentStarted, false);
+    }
+  } finally {
+    prisma.package.findUnique = originals.packageFindUnique;
+    bookingDraftService.get = originals.draftGet;
+    bookingService.getAvailableSlots = originals.slots;
+    bookingDraftService.markPaymentPending = originals.markPaymentPending;
+    mpesaService.initiateStkPush = originals.stkPush;
+  }
+});
+
+test('proposal amount extraction fails closed when the prior reply is missing or reworded', () => {
+  assert.equal(agent.getDepositAmountFromProposalHistory([PAYMENT_PROPOSAL]), 2000);
+  assert.equal(agent.getDepositAmountFromProposalHistory([]), null);
+  assert.equal(agent.getDepositAmountFromProposalHistory([{
+    role: 'assistant',
+    content: 'Your deposit will be Ksh 2,000. Reply yes if that works.',
+  }]), null);
+});
+
+test('zero or null package deposits never appear in replies or initiate payment', async () => {
+  const originals = {
+    packageFindMany: prisma.package.findMany,
+    packageFindUnique: prisma.package.findUnique,
+    packageFindFirst: prisma.package.findFirst,
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    draftUpdate: prisma.bookingDraft.update,
+    studioInfoFindFirst: prisma.studioInfo.findFirst,
+    customerFindUnique: prisma.customer.findUnique,
+    slots: bookingService.getAvailableSlots,
+    saveProposal: bookingDraftService.saveBookingProposal,
+    draftGet: bookingDraftService.get,
+    markPaymentPending: bookingDraftService.markPaymentPending,
+    stkPush: mpesaService.initiateStkPush,
+  };
+  let configuredDeposit: number | null = 0;
+  let proposalSaves = 0;
+  let paymentStarted = 0;
+  const draft = {
+    id: 'draft-invalid-deposit',
+    step: 'awaiting_confirmation',
+    service: 'THE ICON',
+    date: '2026-10-10',
+    time: '15:00',
+    dateTimeIso: '2026-10-10T12:00:00.000Z',
+  };
+  const instance = new AgentService() as any;
+  (prisma.package.findMany as any) = async () => [{ name: 'THE ICON', deposit: configuredDeposit }];
+  (prisma.package.findUnique as any) = async ({ where }: any) => ({ name: where.name, deposit: configuredDeposit });
+  (prisma.package.findFirst as any) = async () => ({ name: 'THE ICON', deposit: configuredDeposit });
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.update as any) = async () => draft;
+  (prisma.studioInfo.findFirst as any) = async () => ({ location: 'Studio' });
+  (prisma.customer.findUnique as any) = async () => ({ id: 'customer-1', name: 'Jane Doe' });
+  (bookingService.getAvailableSlots as any) = async () => ['15:00'];
+  (bookingDraftService.saveBookingProposal as any) = async () => { proposalSaves++; };
+  (bookingDraftService.get as any) = async () => draft;
+  (bookingDraftService.markPaymentPending as any) = async () => {};
+  (mpesaService.initiateStkPush as any) = async () => { paymentStarted++; return { CheckoutRequestID: 'must-not-send' }; };
+
+  try {
+    for (const invalidDeposit of [0, null]) {
+      configuredDeposit = invalidDeposit;
+      const packageSelection = await instance.getPackageSelectionReply('customer-1', 'I want THE ICON');
+      const sameSlot = await instance.getSameBookingSlotReply('customer-1', [
+        { role: 'user', content: 'I want THE ICON' },
+      ]);
+      const bookingProcess = await instance.getBookingProcessReply();
+      const ambiguousDeposit = await instance.getAmbiguousDepositReply();
+      const additions = await instance.getAdditionsReply();
+      for (const reply of [packageSelection, sameSlot, bookingProcess, ambiguousDeposit, additions]) {
+        assert.doesNotMatch(reply, /(?:deposit is|deposit of|deposit prompt of|deposit\s+\(starting from)\s*Ksh\s*[0-9,]+/i);
+      }
+
+      await assert.rejects(
+        instance.executeProposeBookingTool('customer-1', 'Jane Doe', 'THE ICON', '2026-10-10T15:00'),
+        /missing or invalid/
+      );
+      await assert.rejects(
+        instance.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', 2000),
+        /missing or invalid/
+      );
+    }
+    assert.equal(proposalSaves, 0);
+    assert.equal(paymentStarted, 0);
+  } finally {
+    prisma.package.findMany = originals.packageFindMany;
+    prisma.package.findUnique = originals.packageFindUnique;
+    prisma.package.findFirst = originals.packageFindFirst;
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    prisma.bookingDraft.update = originals.draftUpdate;
+    prisma.studioInfo.findFirst = originals.studioInfoFindFirst;
+    prisma.customer.findUnique = originals.customerFindUnique;
+    bookingService.getAvailableSlots = originals.slots;
+    bookingDraftService.saveBookingProposal = originals.saveProposal;
+    bookingDraftService.get = originals.draftGet;
+    bookingDraftService.markPaymentPending = originals.markPaymentPending;
+    mpesaService.initiateStkPush = originals.stkPush;
+  }
+});
+
 test('an unrelated turn clears a pending cancellation before a later yes', async () => {
   const originals = {
     bookingFindMany: prisma.booking.findMany,
@@ -304,8 +549,8 @@ test('cancellation proposals preserve awaiting_confirmation and payment_pending 
   }
 });
 
-test('system prompt requires a separate explicit cancellation confirmation', () => {
-  const prompt = agent.getInstructionGuide();
+test('system prompt requires a separate explicit cancellation confirmation', async () => {
+  const prompt = agent.getSystemPrompt('', 'whatsapp');
   assert.match(prompt, /CANCELLATIONS MUST BE TWO STEPS AND REAL, NOT TEXT-ONLY/i);
   assert.match(prompt, /"ok", "okay", and "sawa" are not cancellation consent/i);
   assert.match(prompt, /unrelated message.*clear the pending cancellation proposal/i);
@@ -313,6 +558,22 @@ test('system prompt requires a separate explicit cancellation confirmation', () 
   assert.match(prompt, /Never replace an existing booking, reschedule, or payment draft/i);
   const source = readFileSync(path.join(__dirname, 'agent.service.ts'), 'utf8');
   assert.match(source, /Two-step cancellation tool/);
+});
+
+test('package-price prompt uses a warned fallback when package rows are unavailable', async () => {
+  const originalFindMany = prisma.package.findMany;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  (prisma.package.findMany as any) = async () => { throw new Error('database unavailable'); };
+  console.warn = (message: string) => { warnings.push(message); };
+  try {
+    const pricing = await agent.getPackagePricingLine();
+    assert.match(pricing, /THE BLOOM: Ksh 15,000/);
+    assert.ok(warnings.some((warning) => /using the hardcoded package-price prompt fallback/.test(warning)));
+  } finally {
+    prisma.package.findMany = originalFindMany;
+    console.warn = originalWarn;
+  }
 });
 
 test('cancellation notification flags a successful deposit for manual refund review', async () => {
@@ -403,7 +664,7 @@ test('a failed STK push puts the draft back to awaiting_confirmation', async () 
   const originals = {
     get: bookingDraftService.get,
     slots: bookingService.getAvailableSlots,
-    packageFindFirst: prisma.package.findFirst,
+    packageFindUnique: prisma.package.findUnique,
     draftUpdate: prisma.bookingDraft.update,
     stk: mpesaService.initiateStkPush,
     paymentUpsert: prisma.payment.upsert,
@@ -412,19 +673,19 @@ test('a failed STK push puts the draft back to awaiting_confirmation', async () 
   let paymentRecorded = false;
   (bookingDraftService.get as any) = async () => ({ id: 'draft-1', step: 'awaiting_confirmation', service: 'THE ICON', date: '2026-10-10', time: '15:00' });
   (bookingService.getAvailableSlots as any) = async () => ['15:00'];
-  (prisma.package.findFirst as any) = async () => ({ deposit: 2000 });
+  (prisma.package.findUnique as any) = async () => ({ name: 'THE ICON', deposit: 2000 });
   (prisma.bookingDraft.update as any) = async ({ data }: any) => { steps.push(data.step); return {}; };
   (mpesaService.initiateStkPush as any) = async () => { throw new Error('Daraja timeout'); };
   (prisma.payment.upsert as any) = async () => { paymentRecorded = true; };
 
   try {
-    await assert.rejects(agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation'), /couldn't initiate the payment request/);
+    await assert.rejects(agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', 2000), /couldn't initiate the payment request/);
     assert.deepEqual(steps, ['payment_pending', 'awaiting_confirmation']);
     assert.equal(paymentRecorded, false);
   } finally {
     bookingDraftService.get = originals.get;
     bookingService.getAvailableSlots = originals.slots;
-    prisma.package.findFirst = originals.packageFindFirst;
+    prisma.package.findUnique = originals.packageFindUnique;
     prisma.bookingDraft.update = originals.draftUpdate;
     mpesaService.initiateStkPush = originals.stk;
     prisma.payment.upsert = originals.paymentUpsert;
@@ -559,7 +820,7 @@ test('a payment prompt that was sent but not recorded keeps the draft pending an
   const originals = {
     get: bookingDraftService.get,
     slots: bookingService.getAvailableSlots,
-    packageFindFirst: prisma.package.findFirst,
+    packageFindUnique: prisma.package.findUnique,
     draftUpdate: prisma.bookingDraft.update,
     stk: mpesaService.initiateStkPush,
     paymentUpsert: prisma.payment.upsert,
@@ -567,20 +828,20 @@ test('a payment prompt that was sent but not recorded keeps the draft pending an
   const steps: string[] = [];
   (bookingDraftService.get as any) = async () => ({ id: 'draft-1', step: 'awaiting_confirmation', service: 'THE ICON', date: '2026-10-10', time: '15:00' });
   (bookingService.getAvailableSlots as any) = async () => ['15:00'];
-  (prisma.package.findFirst as any) = async () => ({ deposit: 2000 });
+  (prisma.package.findUnique as any) = async () => ({ name: 'THE ICON', deposit: 2000 });
   (prisma.bookingDraft.update as any) = async ({ data }: any) => { steps.push(data.step); return {}; };
   (mpesaService.initiateStkPush as any) = async () => ({ CheckoutRequestID: 'ws_CO_1' });
   (prisma.payment.upsert as any) = async () => { throw new Error('db down'); };
 
   try {
-    const error: any = await agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation').catch((e: any) => e);
+    const error: any = await agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', 2000).catch((e: any) => e);
     assert.equal(error.code, 'PAYMENT_PROMPT_UNRECORDED');
     assert.match(error.message, /Do not send another prompt/);
     assert.deepEqual(steps, ['payment_pending']);
   } finally {
     bookingDraftService.get = originals.get;
     bookingService.getAvailableSlots = originals.slots;
-    prisma.package.findFirst = originals.packageFindFirst;
+    prisma.package.findUnique = originals.packageFindUnique;
     prisma.bookingDraft.update = originals.draftUpdate;
     mpesaService.initiateStkPush = originals.stk;
     prisma.payment.upsert = originals.paymentUpsert;
@@ -614,7 +875,7 @@ test('an unrecognised package stops payment instead of falling back to a legacy 
   (bookingDraftService.markPaymentPending as any) = async () => { paymentStarted = true; };
   (mpesaService.initiateStkPush as any) = async () => { paymentStarted = true; };
   try {
-    await assert.rejects(agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation'), /isn't recognised.*Do not start payment/);
+    await assert.rejects(agent.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', 2000), /isn't recognised.*Do not start payment/);
     assert.equal(paymentStarted, false);
   } finally {
     bookingDraftService.get = originals.get;
