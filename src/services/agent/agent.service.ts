@@ -107,6 +107,21 @@ import {
   shouldUsePastAppointmentsListReply as matchesPastAppointmentsListRequest,
 } from './booking-history-replies';
 import {
+  formatBookingDuration as formatAppointmentDuration,
+  getBookingStatusReply as buildBookingStatusReply,
+  getLastAppointmentDetailsReply as buildLastAppointmentDetailsReply,
+  getPastAppointmentReply as buildPastAppointmentReply,
+  getUpcomingAppointmentDetailsReply as buildUpcomingAppointmentDetailsReply,
+  getUpcomingAppointmentTimeReply as buildUpcomingAppointmentTimeReply,
+  isPastAppointmentFollowUp as matchesPastAppointmentFollowUp,
+  shouldUseBookingStatusReply as matchesBookingStatusRequest,
+  shouldUseLastAppointmentDetailsReply as matchesLastAppointmentDetailsRequest,
+  shouldUsePastAppointmentReply as matchesPastAppointmentRequest,
+  shouldUseUpcomingAppointmentDetailsReply as matchesUpcomingAppointmentDetailsRequest,
+  shouldUseUpcomingAppointmentTimeReply as matchesUpcomingAppointmentTimeRequest,
+  wasUpcomingAppointmentDetailsJustProvided as wasAppointmentDetailsJustProvided,
+} from './appointment-replies';
+import {
   getEarliestImageDeliveryReply as buildEarliestImageDeliveryReply,
   isEarliestImageDeliveryRequest as matchesEarliestImageDeliveryRequest,
 } from './photo-delivery-replies';
@@ -1025,169 +1040,55 @@ export class AgentService {
   }
 
   private shouldUseBookingStatusReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed|have i paid|did i pay|is it paid|is my payment (received|confirmed|done|through)|has (my|the) payment been received|did (my|the) payment go through|did you receive (my|the) payment|did you get (my|the) (money|payment)|have you received (my|the) (money|payment))/i.test(text);
+    return matchesBookingStatusRequest(userMessage);
   }
 
   private shouldUseUpcomingAppointmentTimeReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /\b(when does|what time does|when is|what time is|what time will)\b.*\b(start|begin|session|appointment|booking)\b|\b(start|begin)\b.*\b(when|what time)\b/.test(text);
+    return matchesUpcomingAppointmentTimeRequest(userMessage);
   }
 
   private shouldUseUpcomingAppointmentDetailsReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    if (this.shouldUseBookingProcessReply(userMessage)) return false;
-    if (this.shouldUsePostShootProcessReply(userMessage)) return false;
-    if (this.shouldUseUpcomingAppointmentTimeReply(userMessage)) return false;
-    if (this.shouldUseLastAppointmentDetailsReply(userMessage)) return false;
-    if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
-    if (/\bwhat(?:'s| is| are)?\b.*\b(included|in|on|booked for)\b.*\b(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
-    return /\b(any|what|more|tell me about)\b.*\b(details?|information|shoot|session|appointment|booking)\b|\b(details?|information)\b.*\b(session|shoot|appointment|booking)\b/.test(text);
+    return matchesUpcomingAppointmentDetailsRequest(userMessage);
   }
 
   private shouldUseLastAppointmentDetailsReply(userMessage: string): boolean {
-    return /\b(last|previous|most recent)\s+(session|shoot|appointment|booking)\b/i.test(userMessage);
+    return matchesLastAppointmentDetailsRequest(userMessage);
   }
 
   private formatBookingDuration(durationMinutes?: number | null): string {
-    const minutes = durationMinutes || DEFAULT_DURATION;
-    const hours = Math.floor(minutes / 60);
-    const remainder = minutes % 60;
-    if (hours === 0) return `${remainder} minutes`;
-    if (remainder === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
-    return `${hours} hour${hours === 1 ? '' : 's'} ${remainder} minutes`;
+    return formatAppointmentDuration(durationMinutes);
   }
 
   private wasUpcomingAppointmentDetailsJustProvided(
     history: { role: 'user' | 'assistant'; content: string }[]
   ): boolean {
-    const previousUserMessage = [...history].reverse().find((message) => message.role === 'user')?.content;
-    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
-    return Boolean(
-      previousUserMessage
-      && this.shouldUseUpcomingAppointmentDetailsReply(previousUserMessage)
-      && /\b(session|booking|appointment)\b/i.test(previousAssistantMessage)
-    );
+    return wasAppointmentDetailsJustProvided(history);
   }
 
   private async getUpcomingAppointmentDetailsReply(
     customerId: string,
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): Promise<string | null> {
-    const booking = await prisma.booking.findFirst({
-      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
-      orderBy: { dateTime: 'asc' },
-      include: {
-        customer: { select: { name: true } },
-        bookingAddons: {
-          where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
-          orderBy: { createdAt: 'asc' },
-          select: { name: true, quantity: true },
-        },
-      },
-    });
-
-    if (!booking) return null;
-
-    const payment = await prisma.payment.findFirst({
-      where: { bookingId: booking.id, status: 'success' },
-      orderBy: { updatedAt: 'desc' },
-      select: { amount: true },
-    });
-    const localDateTime = inBusinessTimezone(booking.dateTime);
-    const bookerName = booking.customer?.name?.trim() || '';
-    const recipientName = booking.recipientName?.trim() || '';
-    const isSelfBooking = !recipientName || recipientName.toLowerCase() === bookerName.toLowerCase();
-    const date = localDateTime.format('dddd, D MMMM YYYY');
-    const time = localDateTime.format('h:mm A');
-    const recipient = isSelfBooking ? '' : ` for ${recipientName}`;
-    const extras = booking.bookingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`);
-    const extrasText = extras.length > 0 ? ` Your saved extras are ${extras.join(' and ')}.` : '';
-    const confirmation = payment ? ' It is confirmed, and your deposit has been paid.' : ' Your booking is confirmed.';
-    const duration = this.formatBookingDuration(booking.durationMinutes);
-
-    if (this.wasUpcomingAppointmentDetailsJustProvided(history)) {
-      return `It’s the same session we just discussed: ${booking.service} on ${date} at ${time}${recipient}. It runs for ${duration} at our Parklands studio.${extrasText}${confirmation}`;
-    }
-
-    return `Your ${booking.service} session is on ${date} at ${time}${recipient}. It runs for ${duration} at our Parklands studio.${extrasText}${confirmation}`;
+    return buildUpcomingAppointmentDetailsReply(customerId, history);
   }
 
   private async getLastAppointmentDetailsReply(customerId: string): Promise<string> {
-    const booking = await prisma.booking.findFirst({
-      where: {
-        customerId,
-        status: { not: 'cancelled' },
-        dateTime: { lt: new Date() },
-      },
-      orderBy: { dateTime: 'desc' },
-      select: {
-        service: true,
-        dateTime: true,
-        durationMinutes: true,
-        recipientName: true,
-        bookingAddons: {
-          where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
-          orderBy: { createdAt: 'asc' },
-          select: { name: true, quantity: true },
-        },
-      },
-    });
-
-    if (!booking) return "I don't see a past booking on record yet. Are you asking about your upcoming session?";
-
-    const localDateTime = inBusinessTimezone(booking.dateTime);
-    const details = [
-      `Date: ${localDateTime.format('dddd, D MMMM YYYY')} at ${localDateTime.format('h:mm A')}`,
-      ...(booking.durationMinutes ? [`Duration: ${this.formatBookingDuration(booking.durationMinutes)}`] : []),
-      ...(booking.recipientName ? [`Booked for: ${booking.recipientName}`] : []),
-    ];
-
-    if (booking.bookingAddons.length > 0) {
-      details.push('Add-ons recorded:');
-      details.push(...booking.bookingAddons.map((addon) => `- ${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}`));
-    }
-
-    return `The most recent past booking I have on record is ${booking.service}.\n${details.join('\n')}\n\nDoes that sound like the session you mean?`;
+    return buildLastAppointmentDetailsReply(customerId);
   }
 
   private async getUpcomingAppointmentTimeReply(customerId: string): Promise<string | null> {
-    const upcomingBooking = await prisma.booking.findFirst({
-      where: {
-        customerId,
-        status: 'confirmed',
-        dateTime: { gte: new Date() },
-      },
-      orderBy: { dateTime: 'asc' },
-      select: { service: true, dateTime: true },
-    });
-
-    if (!upcomingBooking) return null;
-
-    return `Your ${upcomingBooking.service} session starts on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY')} at ${inBusinessTimezone(upcomingBooking.dateTime).format('h:mm A')}. Please arrive about 30 minutes early.`;
+    return buildUpcomingAppointmentTimeReply(customerId);
   }
 
     private shouldUsePastAppointmentReply(userMessage: string): boolean {
-      const text = userMessage.toLowerCase();
-      return /(that|the|my)\s+(date|day|appointment|booking|session).*(already\s+)?(passed|past)|already\s+passed|that\s+was\s+in\s+the\s+past/.test(text);
+      return matchesPastAppointmentRequest(userMessage);
     }
 
       private isPastAppointmentFollowUp(
         userMessage: string,
         history: { role: 'user' | 'assistant', content: string }[]
       ): boolean {
-        const text = userMessage.toLowerCase().trim();
-        const isFollowUp = /^(say|tell|repeat)\s+(that|it|again)\b|^(so\s+)?(how|what)\b|what\s+(do|should)\s+i\s+do|which\s+(one|option)|(?:do|choose|pick|i(?:'ll| will) take)\s+(?:number\s+)?[12]\b/.test(text);
-        const recentAssistantMessages = history
-          .filter((message) => message.role === 'assistant')
-          .slice(-3)
-          .map((message) => message.content.toLowerCase());
-        const invalidPastAppointmentMenu = recentAssistantMessages.some((message) => {
-          const describesPastAppointment = /(date|day|appointment|booking|session).*(already\s+)?(passed|past)|already\s+passed/.test(message);
-          return describesPastAppointment && /reschedule/.test(message) && /cancel/.test(message);
-        });
-
-        return isFollowUp && invalidPastAppointmentMenu;
+        return matchesPastAppointmentFollowUp(userMessage, history);
       }
 
   private buildPackageCard(pkg: {
@@ -1591,67 +1492,11 @@ export class AgentService {
   }
 
   private async getBookingStatusReply(customerId: string): Promise<string | null> {
-    // If the customer already has an upcoming confirmed booking, that takes highest precedence
-    const upcomingConfirmed = await prisma.booking.findFirst({
-      where: {
-        customerId,
-        status: 'confirmed',
-        dateTime: { gte: new Date() },
-      },
-      orderBy: { dateTime: 'asc' },
-      select: { id: true, service: true, dateTime: true },
-    });
-
-    if (upcomingConfirmed) {
-      const successfulPayment = await prisma.payment.findFirst({
-        where: { bookingId: upcomingConfirmed.id, status: 'success' },
-        orderBy: { updatedAt: 'desc' },
-      });
-      const receiptNote = successfulPayment?.mpesaReceipt ? ` (M-Pesa receipt: ${successfulPayment.mpesaReceipt})` : '';
-      const sessionDetails = `Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
-      return successfulPayment
-        ? `Your payment is received and confirmed${receiptNote}. ${sessionDetails}`
-        : `${sessionDetails} I can't verify a successful payment from the records I can see; the studio team can confirm the payment status.`;
-    }
-
-    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-
-    if (draft?.step === 'reschedule_confirm') {
-      return customerReplyTemplates.rescheduleAwaitingConfirmation();
-    }
-
-    if (draft?.step === 'awaiting_confirmation') {
-      return customerReplyTemplates.bookingAwaitingConfirmation();
-    }
-
-    if (draft?.step === 'payment_pending') {
-      const pendingPayment = await prisma.payment.findFirst({
-        where: { bookingDraftId: draft.id, status: 'pending' },
-        orderBy: { updatedAt: 'desc' },
-      });
-
-      if (pendingPayment) {
-        return customerReplyTemplates.paymentPending();
-      }
-    }
-
-    return null;
+    return buildBookingStatusReply(customerId);
   }
 
   private async getPastAppointmentReply(customerId: string): Promise<string | null> {
-    const pastBooking = await prisma.booking.findFirst({
-      where: {
-        customerId,
-        status: { not: 'cancelled' },
-        dateTime: { lt: new Date() },
-      },
-      orderBy: { dateTime: 'desc' },
-      select: { service: true, dateTime: true },
-    });
-
-    if (!pastBooking) return null;
-
-    return `You're right - that ${pastBooking.service} appointment was on ${inBusinessTimezone(pastBooking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. Did the session happen, or did you miss it? We can't change or cancel a past appointment, but I can help arrange a new session.`;
+    return buildPastAppointmentReply(customerId);
   }
 
   private async logConversationLearning(params: {
