@@ -84,6 +84,7 @@ import {
 import {
   executeAddNoteTool as saveSessionNote,
   extractSessionNoteMetadata as buildSessionNoteMetadata,
+  executeSaveDeliveryPreferenceTool as saveDeliveryPreference,
 } from './session-tools';
 
 type ReplyContext = {
@@ -3265,13 +3266,6 @@ ${contextString}`;
     return cancelBookingTool.call(this, customerId, date, bookingId);
   }
 
-  private isPlaceholderContactEmail(email?: string | null): boolean {
-    if (!email) return true;
-    const value = email.trim().toLowerCase();
-    if (!value) return true;
-    return value.endsWith('@whatsapp.local') || value.endsWith('@messenger.local') || value.endsWith('@instagram.local');
-  }
-
   /**
    * Saves customer's preferred edited-photo delivery method (especially email)
    * and emits an admin notification so the team can follow through.
@@ -3284,79 +3278,7 @@ ${contextString}`;
     note?: string,
     platform?: string,
   ) {
-    const normalizedMethod = (method || '').toLowerCase();
-    if (!['email', 'download_link', 'whatsapp'].includes(normalizedMethod)) {
-      throw new Error('Invalid delivery method. Use email, download_link, or whatsapp.');
-    }
-
-    const customer = await prisma.customer.findUnique({ where: { id: customerId } });
-    if (!customer) {
-      throw new Error('Customer not found while saving delivery preference.');
-    }
-
-    const normalizedEmail = email?.trim().toLowerCase();
-    const normalizedWhatsappNumber = whatsappNumber?.trim();
-    const emailFromCustomer = this.isPlaceholderContactEmail(customer.email) ? undefined : customer.email?.trim().toLowerCase();
-    const resolvedEmail = normalizedEmail || emailFromCustomer;
-    const resolvedWhatsappNumber = normalizedWhatsappNumber || customer.phone || customerId;
-
-    if (normalizedMethod === 'email') {
-      if (!resolvedEmail) {
-        throw new Error('Email delivery requested but no email address is on file. Ask the customer for their exact email address first.');
-      }
-      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailPattern.test(resolvedEmail)) {
-        throw new Error('The provided email format looks invalid. Ask the customer to confirm the exact email address.');
-      }
-
-      if (customer.email !== resolvedEmail) {
-        await prisma.customer.update({ where: { id: customerId }, data: { email: resolvedEmail } });
-      }
-    }
-
-    const booking = await prisma.booking.findFirst({
-      where: { customerId, dateTime: { gte: new Date() }, status: { not: 'cancelled' } },
-      orderBy: { dateTime: 'asc' }
-    });
-
-    const description = [
-      `Delivery preference: ${normalizedMethod}`,
-      normalizedMethod === 'email' && resolvedEmail ? `Email: ${resolvedEmail}` : '',
-      normalizedMethod === 'whatsapp' && resolvedWhatsappNumber ? `WhatsApp: ${resolvedWhatsappNumber}` : '',
-      note ? `Note: ${note}` : ''
-    ].filter(Boolean).join(' | ');
-
-    await prisma.customerSessionNote.create({
-      data: {
-        customerId,
-        bookingId: booking?.id,
-        type: 'special_request',
-        description,
-        status: 'pending',
-        platform: platform || 'whatsapp',
-        sourceMessage: note?.trim() || undefined,
-      }
-    });
-
-    await notifyAdmin(
-      'booking',
-      `Delivery preference captured for ${customerId}`,
-      `${customer.name || customerId} prefers ${normalizedMethod}${normalizedMethod === 'email' && resolvedEmail ? ` via ${resolvedEmail}` : ''}${normalizedMethod === 'whatsapp' && resolvedWhatsappNumber ? ` via ${resolvedWhatsappNumber}` : ''}.`,
-      {
-        customerId,
-        bookingId: booking?.id,
-        event: 'delivery_preference',
-        deliveryMethod: normalizedMethod,
-        deliveryEmail: normalizedMethod === 'email' ? resolvedEmail : undefined,
-        deliveryPhone: normalizedMethod === 'whatsapp' ? resolvedWhatsappNumber : undefined,
-      }
-    );
-
-    return {
-      method: normalizedMethod,
-      email: normalizedMethod === 'email' ? resolvedEmail : undefined,
-      whatsappNumber: normalizedMethod === 'whatsapp' ? resolvedWhatsappNumber : undefined,
-    };
+    return saveDeliveryPreference(customerId, method, email, whatsappNumber, note, platform);
   }
 
   /**
