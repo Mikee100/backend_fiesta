@@ -25,6 +25,7 @@ export const SERVICE_DURATIONS: Record<string, number> = {
 
 export const DEFAULT_DURATION = 120;
 export const MINIMUM_BOOKING_DEPOSIT = 2000;
+export const BOOKING_SLOT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** Current Editions 2026 + legacy names for extraction / matching */
 export const PACKAGE_NAME_PATTERN =

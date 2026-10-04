@@ -9,14 +9,19 @@ import { businessDay, inBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import dayjs from 'dayjs';
 import { PAYMENT_PROMPT_UNRECORDED } from './constants';
+import { sanitizeSlotValue } from './slot-memory';
 
 export async function executeProposeBookingTool(this: any, customerId: string, name: string, service: string, date: string) {
-  if (!name || name.trim() === '' || name.trim().toLowerCase() === 'unknown') {
+  name = sanitizeSlotValue(name || '');
+  if (!name || /^(?:unknown|whatsapp user)$/i.test(name) || !/[a-z]/i.test(name)) {
     throw new Error('Customer name is required before proposing a booking. Ask the customer for their full name first.');
   }
 
   let customer = await prisma.customer.findUnique({ where: { id: customerId } });
   const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  if (!existingDraft?.isForSomeoneElse && customer?.name.toLowerCase().startsWith(`${name.toLowerCase()} `)) {
+    name = sanitizeSlotValue(customer.name);
+  }
   if (!customer) {
     customer = await prisma.customer.create({ data: { id: customerId, name } });
   } else if (customer.name !== name && !existingDraft?.isForSomeoneElse) {

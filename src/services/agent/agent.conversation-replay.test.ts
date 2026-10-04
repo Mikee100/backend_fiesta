@@ -130,6 +130,14 @@ test('Wairimu conversation replay with six-message history and a next-day return
   stub(prisma.customerMemory, 'findUnique', async () => null);
   stub(prisma.bookingDraft, 'findUnique', async () => draft);
   stub(prisma.bookingDraft, 'findMany', async () => draft ? [draft] : []);
+  stub(prisma.bookingDraft, 'create', async ({ data }: any) => {
+    draft = { id: 'draft-replay', createdAt: new Date(), ...data };
+    return draft;
+  });
+  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => {
+    draft = { ...draft, ...data, updatedAt: new Date() };
+    return { count: 1 };
+  });
   stub(prisma.bookingDraft, 'upsert', async ({ create, update }: any) => {
     draft = { id: 'draft-replay', ...(draft ? { ...draft, ...update } : create), updatedAt: new Date() };
     return draft;
@@ -204,7 +212,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
     history.push({ role: 'user', content: turn.message }, { role: 'assistant', content: reply });
   }
 
-  await context.test('[EXPECTED TO FAIL] [STATE] first name is persisted as soon as stated', () => {
+  await context.test('[FIXED IN 8.1a] [STATE] first name is persisted as soon as stated', () => {
     assert.equal(frames[0].draft?.name || frames[0].customer.name, 'Wairimu');
   });
   await context.test('[EXPECTED TO FAIL] [ROUTING + FAULT INJECTION] catalog request uses DB durations in Rate Card 2026', () => {
@@ -217,7 +225,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
     }
     assert.equal(frames[1].prompts.length, 0, 'catalog must bypass model generation');
   });
-  await context.test('[EXPECTED TO FAIL] [STATE] package selection is persisted immediately', () => {
+  await context.test('[FIXED IN 8.1a] [STATE] package selection is persisted immediately', () => {
     assert.equal(frames[2].draft?.service, 'THE BLOOM');
   });
   await context.test('[EXPECTED TO FAIL] [CAPTURE] both explicitly chosen extras are saved and acknowledged', () => {
@@ -249,7 +257,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
     assert.ok(!frames[7].history.some((message) => /My name is Wairimu/.test(message.content)));
     assert.equal(frames[7].draft?.name || frames[7].customer.name, 'Wairimu');
     assert.equal(frames[7].draft?.service, 'THE BLOOM');
-    assert.match(frames[7].prompts.join('\n'), /Known so far:.*name=Wairimu;.*package=THE BLOOM/);
+    assert.match(frames[7].prompts.join('\n'), /Known so far:.*name="Wairimu";.*package="THE BLOOM"/);
     assert.doesNotMatch(frames[7].reply, /what is your name|which package/i);
     const nameQuestions = frames.filter((frame) => /what is your name|give me your name/i.test(frame.reply));
     assert.ok(nameQuestions.length <= 1);

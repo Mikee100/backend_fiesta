@@ -60,6 +60,7 @@ function createHarness(options: HarnessOptions = {}) {
   const reply = (route: string) => (nullRoutes.has(route) ? null : `ROUTE:${route}`);
 
   Object.assign(agent, {
+    rememberBookingSlots: async () => null,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
     logAiJobMetric: async () => {},

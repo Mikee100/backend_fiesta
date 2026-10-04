@@ -1,4 +1,4 @@
-import { ADDON_CATALOG } from '../../config/constants';
+import { ADDON_CATALOG, BOOKING_SLOT_RETENTION_MS } from '../../config/constants';
 import prisma from '../../config/prisma';
 
 function parseQuantity(note: string, fallback = 1): number {
@@ -92,6 +92,7 @@ export class BookingAddonService {
         customerId,
         bookingId: null,
         status: 'pending',
+        createdAt: { gt: new Date(Date.now() - BOOKING_SLOT_RETENTION_MS), lte: new Date() },
       },
       data: {
         bookingId,

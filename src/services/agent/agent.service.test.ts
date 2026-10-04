@@ -462,7 +462,10 @@ test('availability excludes occupied appointments and competing booking drafts',
   (prisma.booking.findMany as any) = async () => bookings;
   (prisma.bookingDraft.findMany as any) = async ({ where }: any) => {
     assert.deepEqual(where.step.in, ['awaiting_confirmation', 'payment_pending']);
-    return drafts.filter((draft) => draft.id !== where.id?.not);
+    return drafts.filter((draft) => draft.id !== where.id?.not
+      && where.step.in.includes(draft.step)
+      && draft.updatedAt >= where.updatedAt.gte
+      && draft.dateTimeIso !== null);
   };
   (googleCalendarService.getEvents as any) = async () => [];
 
@@ -479,10 +482,24 @@ test('availability excludes occupied appointments and competing booking drafts',
       id: 'competing-draft',
       service: 'THE ICON',
       dateTimeIso: '2026-10-06T10:00:00.000Z',
+      step: 'collecting_slots',
+      date: '2026-10-06',
+      time: '13:00',
+      updatedAt: new Date(),
     }];
     slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
-    assert.equal(slots.includes('13:00'), false);
+    assert.equal(slots.includes('13:00'), true, 'collection never holds a slot, even with an ISO value');
+    for (const step of ['awaiting_confirmation', 'payment_pending']) {
+      drafts[0].step = step;
+      drafts[0].updatedAt = new Date();
+      slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
+      assert.equal(slots.includes('13:00'), false, step);
+      drafts[0].updatedAt = new Date(Date.now() - 16 * 60 * 1000);
+      slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
+      assert.equal(slots.includes('13:00'), true, 'holds expire after fifteen minutes');
+    }
 
+    drafts[0].updatedAt = new Date();
     slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft'));
     assert.equal(slots.includes('13:00'), true);
   } finally {
