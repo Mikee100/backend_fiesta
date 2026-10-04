@@ -4,6 +4,18 @@ import { CHAT_MODEL, createChatCompletion, type ChatProvider } from './llm/provi
 export { createChatCompletion, getGroqCooldownUntil } from './llm/provider';
 import { addUsage, BookingExtractor, findExplicitDayOfMonth, usageFromCompletion, type TokenUsage } from './extraction';
 export { BookingExtractor } from './extraction';
+import {
+  CANCELLATION_PROPOSAL_TTL_MS,
+  MAX_AGENT_COMPLETION_TOKENS,
+  MAX_HISTORY_MESSAGES,
+  MAX_RAG_CONTEXT_CHUNKS,
+  OFFICIAL_WEBSITE_URLS,
+  PACKAGE_PRICING_FALLBACK,
+  PAYMENT_CONFIRMATION_REQUIRED_REPLY,
+  PAYMENT_PROMPT_UNRECORDED,
+  PAYMENT_PROMPT_UNRECORDED_REPLY,
+} from './constants';
+import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
@@ -22,17 +34,6 @@ import { customerReplyTemplates, formatCustomerReply } from '../messaging/custom
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
-
-const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process.env.AI_MAX_COMPLETION_TOKENS) || 1500));
-const MAX_RAG_CONTEXT_CHUNKS = 3;
-const MAX_HISTORY_MESSAGES = 6;
-const CANCELLATION_PROPOSAL_TTL_MS = 60 * 60 * 1000;
-const OFFICIAL_WEBSITE_URLS = {
-  home: 'https://www.fiestahousematernity.com/',
-  reviews: 'https://www.fiestahousematernity.com/reviews',
-  suspendingConcept: 'https://www.fiestahousematernity.com/gallery/suspending-concept',
-} as const;
-const PACKAGE_PRICING_FALLBACK = 'The Editions are THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 (Most Loved / Signature), and THE GODDESS: Ksh 120,000 (Flagship).';
 
 type ReplyContext = {
   customerId: string;
@@ -61,13 +62,6 @@ type MessageRoute = {
 function isAvailableSlotList(result: string[] | { status: string; reason: string }): result is string[] {
   return Array.isArray(result);
 }
-
-// Word-anchored so "exchange" or "remove" no longer read as a reschedule.
-const RESCHEDULE_KEYWORD_PATTERN = /\b(?:reschedul(?:e|ed|es|ing)|chang(?:e|ed|es|ing)|mov(?:e|ed|es|ing)|postpon(?:e|ed|es|ing))\b/;
-
-const PAYMENT_CONFIRMATION_REQUIRED_REPLY = 'Before I send the M-Pesa deposit prompt, please reply yes to confirm the booking.';
-const PAYMENT_PROMPT_UNRECORDED = 'PAYMENT_PROMPT_UNRECORDED';
-const PAYMENT_PROMPT_UNRECORDED_REPLY = 'Please check your phone for an M-Pesa prompt before trying again. If nothing arrives in a few minutes, the studio team can help.';
 
 export class AgentService {
   private readonly naturalAssistantMode = String(process.env.AI_ASSISTANT_NATURAL_MODE || 'false').toLowerCase() === 'true';
