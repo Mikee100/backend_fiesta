@@ -11,6 +11,20 @@ import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import {
+  buildBespokeReply,
+  buildBookingForSomeoneElseReply,
+  buildBusinessIntroductionReply,
+  buildContactDetailsReply,
+  buildMultiPersonBookingReply,
+  buildPackageBudgetReply,
+  buildPortfolioReply,
+  buildPostShootProcessReply,
+  buildRawFilesReply,
+  buildSocialMediaReply,
+  buildTravellingMothersReply,
+  buildWebsiteReply,
+  getReviewPageReply,
+  getSuspendingConceptGalleryReply,
   buildAdditionsReply,
   buildBookingProposalConfirmation,
   buildCancellationProposal,
@@ -18,6 +32,16 @@ import {
   buildRescheduleProposalConfirmation,
   buildTimeOnlyRescheduleProposal,
   isAddonListFollowUp,
+  isAdditionsRequest,
+  isBespokeRequest,
+  isBookingForSomeoneElseRequest,
+  isMultiPersonBookingRequest,
+  isPackageBudgetRequest,
+  isPostShootProcessRequest,
+  isRawFilesRequest,
+  isSocialMediaRequest,
+  isTravellingMothersRequest,
+  isBookingProcessRequest,
   previousMessageRequestsConfirmation,
 } from './replies';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
@@ -887,6 +911,32 @@ test('the additions reply is recognized by its follow-up matcher', () => {
   const reply = buildAdditionsReply(null);
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true);
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: 'Your session is on Friday.' }]), false);
+});
+
+test('static reply builders remain paired with their request matchers', () => {
+  const pairs: Array<{ message: string; matches: (message: string) => boolean; reply: string }> = [
+    { message: "What's your cheapest package?", matches: isPackageBudgetRequest, reply: buildPackageBudgetReply() },
+    { message: 'What add-ons do you have?', matches: isAdditionsRequest, reply: buildAdditionsReply(null) },
+    { message: 'What happens after the shoot?', matches: isPostShootProcessRequest, reply: buildPostShootProcessReply() },
+    { message: 'Can I get raw files?', matches: isRawFilesRequest, reply: buildRawFilesReply() },
+    { message: 'Do you do bespoke shoots?', matches: isBespokeRequest, reply: buildBespokeReply() },
+    { message: "I'm travelling from abroad", matches: isTravellingMothersRequest, reply: buildTravellingMothersReply() },
+    { message: "What's your instagram?", matches: isSocialMediaRequest, reply: buildSocialMediaReply() },
+    { message: 'How to book a session?', matches: isBookingProcessRequest, reply: 'Booking process reply remains DB-backed in AgentService.' },
+    { message: 'I want to book a session for my sister', matches: isBookingForSomeoneElseRequest, reply: buildBookingForSomeoneElseReply() },
+    { message: 'Can my sister join the shoot with me?', matches: isMultiPersonBookingRequest, reply: buildMultiPersonBookingReply() },
+  ];
+
+  for (const pair of pairs) {
+    assert.equal(pair.matches(pair.message), true, pair.message);
+    assert.ok(pair.reply.length > 0, pair.message);
+  }
+  assert.match(buildBusinessIntroductionReply(), /boutique luxury photography studio/);
+  assert.match(buildContactDetailsReply(), /Parklands, Nairobi/);
+  assert.match(buildWebsiteReply(), /fiestahousematernity\.com/);
+  assert.match(buildPortfolioReply(), /portfolio/);
+  assert.match(getReviewPageReply('Where can I read your reviews?') || '', /\/reviews/);
+  assert.match(getSuspendingConceptGalleryReply('Where can I see the Suspending Concept?', []) || '', /\/gallery\/suspending-concept/);
 });
 
 test('confirmation proposal builders remain recognized by the history matcher', () => {

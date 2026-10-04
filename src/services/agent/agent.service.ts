@@ -17,6 +17,19 @@ import {
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
 import {
+  buildBespokeReply,
+  buildBookingForSomeoneElseReply,
+  buildBusinessIntroductionReply,
+  buildContactDetailsReply,
+  buildMultiPersonBookingReply,
+  buildMixedIntentClarificationReply,
+  buildPackageBudgetReply,
+  buildPortfolioReply,
+  buildPostShootProcessReply,
+  buildRawFilesReply,
+  buildSocialMediaReply,
+  buildTravellingMothersReply,
+  buildWebsiteReply,
   buildAdditionsReply,
   buildBookingProposalConfirmation,
   buildCancellationProposal,
@@ -24,6 +37,18 @@ import {
   buildRescheduleProposalConfirmation,
   buildTimeOnlyRescheduleProposal,
   isAddonListFollowUp as matchesAddonListFollowUp,
+  isAdditionsRequest,
+  isBespokeRequest,
+  isBookingForSomeoneElseRequest,
+  isBookingProcessRequest,
+  isMultiPersonBookingRequest,
+  isPackageBudgetRequest,
+  isPostShootProcessRequest,
+  isRawFilesRequest,
+  isSocialMediaRequest,
+  isTravellingMothersRequest,
+  getReviewPageReply as buildReviewPageReply,
+  getSuspendingConceptGalleryReply as buildSuspendingConceptGalleryReply,
   previousMessageRequestsConfirmation as matchesConfirmationRequest,
 } from './replies';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
@@ -463,17 +488,15 @@ export class AgentService {
   }
 
   private getBusinessIntroductionReply(): string {
-    return 'Welcome to Fiesta House! We are a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family portraiture. We take care of everything—from our curated client gown closet and professional hair & makeup to gentle posing guidance so you feel relaxed and radiant in front of the camera. What kind of photoshoot are you planning?';
+    return buildBusinessIntroductionReply();
   }
 
   private shouldUseBookingProcessReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(process\s+of\s+booking|booking\s+process|how\s+to\s+book|how\s+does\s+booking\s+work|what\s+does\s+booking\s+entail|steps\s+to\s+book|explain\s+booking)/.test(text);
+    return isBookingProcessRequest(userMessage);
   }
 
   private shouldUsePostShootProcessReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(after\s+the\s+shoot|what\s+happens\s+after\s+the\s+shoot|post\s*shoot\s*process|after\s+session|after\s+my\s+shoot)/.test(text);
+    return isPostShootProcessRequest(userMessage);
   }
 
   private shouldUseEarliestImageDeliveryReply(userMessage: string): boolean {
@@ -482,8 +505,7 @@ export class AgentService {
   }
 
   private shouldUseRawFilesReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(raw\s+file|raw\s+files|unedited\s+photos|original\s+files|can\s+i\s+get\s+raw)/.test(text);
+    return isRawFilesRequest(userMessage);
   }
 
   private extractInvoiceNumber(userMessage: string): string | null {
@@ -799,12 +821,11 @@ export class AgentService {
   }
 
   private shouldUsePackageBudgetReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(cheapest|most affordable|lowest cost|budget friendly|budget-friendly|cheap|affordable|same as last time|like last time|same as before|same package as last time)/.test(text);
+    return isPackageBudgetRequest(userMessage);
   }
 
   private getPackageBudgetReply(): string {
-    return 'I can help with that. The most affordable option is usually THE BLOOM, while THE ICON is the most popular mid-range package. If you want to keep it simple, tell me which package you prefer: THE BLOOM, THE ICON, or a premium option like THE EMPRESS or THE ROYAL.';
+    return buildPackageBudgetReply();
   }
 
   private shouldClarifyMixedIntent(userMessage: string): boolean {
@@ -826,12 +847,11 @@ export class AgentService {
   }
 
   private getMixedIntentClarificationReply(): string {
-    return 'I can help with the package, the date, or the invoice. Which one would you like to sort out first?';
+    return buildMixedIntentClarificationReply();
   }
 
   private shouldUseAdditionsReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(additions|add-ons|add-on|extras|extra\s+services|extra\s+photo|extra\s+outfit|extra\s+makeup|digital\s+art|power\s+suit|wig\s+hire|suspending\s+concept|sculpture\s+set|reel\s+pricing|what\s+extras)/.test(text);
+    return isAdditionsRequest(userMessage);
   }
 
   private shouldClarifyNewAddon(
@@ -1021,18 +1041,15 @@ export class AgentService {
   }
 
   private shouldUseBespokeReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(bespoke|custom\s+experience|custom\s+shoot|custom\s+package|tailored\s+session|tailored\s+experience|vision\s+does\s+not\s+fit)/.test(text);
+    return isBespokeRequest(userMessage);
   }
 
   private shouldUseTravellingMothersReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(travelling\s+mother|traveling\s+mother|from\s+outside\s+nairobi|from\s+abroad|airport\s+transfer|hotel\s+booking|concierge|soft\s+landing|journeying\s+to\s+us)/.test(text);
+    return isTravellingMothersRequest(userMessage);
   }
 
   private shouldUseSocialMediaReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(social\s+media|instagram|facebook|website|where\s+can\s+i\s+find\s+you\s+online)/.test(text);
+    return isSocialMediaRequest(userMessage);
   }
 
   private shouldHandleResendRequest(userMessage: string): boolean {
@@ -1041,11 +1058,7 @@ export class AgentService {
   }
 
   private shouldUseMultiPersonBookingReply(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    const mentionsAnotherPerson = /(my\s+sister|my\s+brother|my\s+friend|my\s+husband|my\s+wife|my\s+partner|my\s+family|also\s+coming|come\s+with\s+her|come\s+with\s+him|joining\s+the\s+shoot|join\s+the\s+shoot)/.test(text);
-    const bookingContext = /(\bbook(?:s|ed|ing)?\b|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
-    const jointSessionSignal = /(\bwith\b|alongside|together|\bjoin(?:s|ed|ing)?\b|coming\s+with\b|both\s+of\s+us|each\s+of\s+us)/.test(text);
-    return mentionsAnotherPerson && bookingContext && jointSessionSignal;
+    return isMultiPersonBookingRequest(userMessage);
   }
 
   private getStudioPolicyReply(userMessage: string): string | null {
@@ -1099,10 +1112,7 @@ export class AgentService {
   }
 
   private shouldClarifyBookingForSomeoneElse(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    const bookingContext = /(\bbook(?:s|ed|ing)?\b|photoshoot|shoot|session|appointment|ready\s+to\s+book)/.test(text);
-    const bookingForSomeoneElse = /\b(for|on behalf of)\s+my\s+(sister|brother|friend|husband|wife|partner|mother|father|daughter|son|family)\b/.test(text);
-    return bookingContext && bookingForSomeoneElse && !this.shouldUseMultiPersonBookingReply(userMessage);
+    return isBookingForSomeoneElseRequest(userMessage);
   }
 
   private extractStandaloneFullName(userMessage: string): string | null {
@@ -1667,17 +1677,7 @@ export class AgentService {
   }
 
   private getPostShootProcessReply(): string {
-    return [
-      'After the shoot:',
-      '1) Any remaining balance is cleared as per your package terms (M-Pesa or cash).',
-      '2) Edited photos are ready within 10 working days.',
-      '3) Edited photos are delivered as a secure download link only.',
-      '4) We can share that link via WhatsApp or email, based on your preference.',
-      '5) Express delivery is available at an extra fee if you need them sooner.',
-      '6) Raw files are available at an extra fee if requested.',
-      '',
-      "Tell me your preferred delivery method and I'll save it now."
-    ].join('\n');
+    return buildPostShootProcessReply();
   }
 
   private addWorkingDays(from: dayjs.Dayjs, days: number): dayjs.Dayjs {
@@ -1725,11 +1725,7 @@ export class AgentService {
   }
 
   private getRawFilesReply(): string {
-    return [
-      'Raw files are quoted by package tier.',
-      'They are shared as a secure download link.',
-      'If you let me know which package tier you are interested in, our team can confirm the exact quote for raw files.'
-    ].join('\n');
+    return buildRawFilesReply();
   }
 
   private async getAdditionsReply(): Promise<string> {
@@ -1743,92 +1739,46 @@ export class AgentService {
   }
 
   private getBespokeReply(): string {
-    return [
-      'Bespoke Experiences',
-      '',
-      'For the mother whose vision does not fit inside a package, we design custom experiences by consultation.',
-      '',
-      'Reach out to our team to begin the conversation, and we will craft a session around your unique story.'
-    ].join('\n');
+    return buildBespokeReply();
   }
 
   private getTravellingMothersReply(): string {
-    return [
-      'For Our Travelling Mothers',
-      '',
-      'For mothers journeying to us from beyond Nairobi, we curate the full arrival.',
-      '',
-      'Airport transfers, hotel bookings, and a soft landing arranged by our concierge, so all you carry with you is your presence.',
-      '',
-      'Available on request! Let us know your travel dates and we will be delighted to coordinate for you.'
-    ].join('\n');
+    return buildTravellingMothersReply();
   }
 
   private getSocialMediaReply(): string {
-    return [
-      'Instagram: @fiestahousematernity',
-      'https://www.instagram.com/fiestahousematernity',
-      '',
-      'Facebook: Fiesta House Attire',
-      'https://www.facebook.com/fiestahouseattire/',
-      '',
-      'Website: https://www.fiestahousematernity.com/',
-      '',
-      'We only share client photos with consent.'
-    ].join('\n');
+    return buildSocialMediaReply();
   }
 
   private getPortfolioReply(): string {
-    return 'You can see our maternity, newborn and family sessions in the portfolio here: https://www.fiestahousematernity.com/. Have a look and tell me which style feels most like you.';
+    return buildPortfolioReply();
   }
 
   private getSuspendingConceptGalleryReply(
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
   ): string | null {
-    if (/\b(packages?|editions?|price list|pricing)\b/i.test(userMessage)) return null;
-
-    const asksToSeeExample = /\b(where\s+(?:can|could|do)\s+i\s+(?:see|view)|can\s+i\s+see|see\s+this\s+(?:idea|concept))\b/i.test(userMessage)
-      || /\bshow\s+me\b.{0,24}\b(gallery|photos?|pictures?|images?|examples?|concept)\b/i.test(userMessage);
-    if (!asksToSeeExample) return null;
-
-    const mentionsConcept = /suspending\s+concept/i.test(userMessage)
-      || history.slice(-6).some((message) => /suspending\s+concept/i.test(message.content));
-    if (!mentionsConcept) return null;
-
-    return 'You can see the Suspending Concept gallery here: https://www.fiestahousematernity.com/gallery/suspending-concept';
+    return buildSuspendingConceptGalleryReply(userMessage, history);
   }
 
   private getReviewPageReply(userMessage: string): string | null {
-    const asksAboutReviews = /\b(reviews?|testimonials?|client feedback)\b/i.test(userMessage);
-    const asksForPage = /\b(page|website|where|see|read|view|link)\b/i.test(userMessage);
-    if (!asksAboutReviews || !asksForPage) return null;
-
-    return 'You can read Fiesta House Maternity client reviews here: https://www.fiestahousematernity.com/reviews';
+    return buildReviewPageReply(userMessage);
   }
 
   private getWebsiteReply(): string {
-    return 'You can find us here: https://www.fiestahousematernity.com/. It has our portfolio, current packages and more about the studio.';
+    return buildWebsiteReply();
   }
 
   private getContactDetailsReply(): string {
-    return 'We are at Diamond Plaza Annex, 2nd Floor, on 4th Avenue in Parklands, Nairobi. You can reach us on 0720 111928 or at info@fiestahouseattire.com. Our website is https://www.fiestahousematernity.com/.';
+    return buildContactDetailsReply();
   }
 
   private getMultiPersonBookingReply(): string {
-    return [
-      'Great question, and yes, we can plan that.',
-      'Do you want:',
-      '1) one joint session together, or',
-      '2) separate bookings for each of you?',
-      '',
-      "I've noted that another person may join.",
-      "Once you confirm option 1 or 2, share your package, date, and preferred time and I'll check availability."
-    ].join('\n');
+    return buildMultiPersonBookingReply();
   }
 
   private getBookingForSomeoneElseReply(): string {
-    return 'Of course. Is the session just for your sister, or would you both like to be photographed together? Once I know that, I can help with the package, date, and preferred time.';
+    return buildBookingForSomeoneElseReply();
   }
 
   private async captureMultiPersonBookingNote(customerId: string, userMessage: string): Promise<void> {
