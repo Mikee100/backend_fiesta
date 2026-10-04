@@ -200,7 +200,6 @@ export function createMessageRoutes(
     },
     {
       name: 'weekday',
-      deterministicOnly: true,
       when: () => getInformationalFlow() === 'weekday',
       handle: () => this.getWeekdayReply(userMessage, history),
     },

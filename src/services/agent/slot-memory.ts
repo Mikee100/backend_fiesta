@@ -1,7 +1,6 @@
 import prisma from '../../config/prisma';
 import { BOOKING_SLOT_RETENTION_MS, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
-import { businessDay, nowInBusinessTimezone } from '../../utils/time';
-import { findExplicitDate } from './extraction';
+import { resolveCalendarDate } from './extraction';
 
 export const SLOT_MEMORY_WINDOW_MS = BOOKING_SLOT_RETENTION_MS;
 export const EARLY_SLOT_STEP = 'collecting_slots';
@@ -38,23 +37,8 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
   }
 
   if (!question) {
-    const iso = message.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0];
-    if (iso && businessDay(iso).format('YYYY-MM-DD') === iso) slots.date = iso;
-    const explicit = iso ? null : findExplicitDate(message);
-    if (explicit) {
-      const now = nowInBusinessTimezone();
-      let date = now.date(1).month(explicit.month ?? now.month()).date(explicit.day);
-      if (date.isBefore(now, 'day')) {
-        date = explicit.month === null
-          ? now.add(1, 'month').date(1).date(explicit.day)
-          : date.add(1, 'year');
-      }
-      if (date.date() === explicit.day && (explicit.month === null || date.month() === explicit.month)) {
-        slots.date = date.format('YYYY-MM-DD');
-      }
-    }
-    if (/\btomorrow\b/i.test(message)) slots.date = nowInBusinessTimezone().add(1, 'day').format('YYYY-MM-DD');
-    else if (/\btoday\b/i.test(message)) slots.date = nowInBusinessTimezone().format('YYYY-MM-DD');
+    const date = resolveCalendarDate(message);
+    if (date) slots.date = date;
     const time = message.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
     if (time) {
       const hour = time[4] ? Number(time[4]) : Number(time[1]);

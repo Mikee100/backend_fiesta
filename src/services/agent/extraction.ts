@@ -1,6 +1,6 @@
 import dayjs from 'dayjs';
 import { PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
-import { nowInBusinessTimezone } from '../../utils/time';
+import { businessDay, bookingDateFacts, nowInBusinessTimezone } from '../../utils/time';
 import { CHAT_MODEL, createChatCompletion } from './llm/provider';
 
 const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
@@ -72,6 +72,39 @@ export function findExplicitDate(message: string): { day: number; month: number 
 
 export function findExplicitDayOfMonth(message: string): number | null {
   return findExplicitDate(message)?.day ?? null;
+}
+
+export function resolveCalendarDate(message: string): string | null {
+  const iso = message.match(ISO_DATE_PATTERN)?.[1];
+  if (iso) {
+    bookingDateFacts(iso);
+    return iso;
+  }
+  const explicit = findExplicitDate(message);
+  const now = nowInBusinessTimezone();
+  if (explicit) {
+    const year = message.match(/\b((?:19|20)\d{2})\b/)?.[1];
+    const month = explicit.month ?? now.month();
+    let date = now.date(1).year(year ? Number(year) : now.year()).month(month).date(explicit.day);
+    if (!year && date.isBefore(now, 'day')) {
+      date = explicit.month === null
+        ? now.add(1, 'month').date(1).date(explicit.day)
+        : date.add(1, 'year');
+    }
+    if (date.date() !== explicit.day || (explicit.month !== null && date.month() !== month)) {
+      throw new Error('That calendar date is invalid. Please choose a valid date.');
+    }
+    const resolved = date.format('YYYY-MM-DD');
+    bookingDateFacts(resolved);
+    return resolved;
+  }
+  if (/\btomorrow\b/i.test(message)) return now.add(1, 'day').format('YYYY-MM-DD');
+  if (/\btoday\b/i.test(message)) return now.format('YYYY-MM-DD');
+  const weekday = message.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i)?.[1]?.toLowerCase();
+  if (!weekday) return null;
+  const target = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'].indexOf(weekday);
+  const offset = (target - now.day() + 7) % 7;
+  return businessDay(now.add(offset || 7, 'day').format('YYYY-MM-DD')).format('YYYY-MM-DD');
 }
 
 export class BookingExtractor {

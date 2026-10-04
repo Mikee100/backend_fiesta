@@ -8,7 +8,7 @@ import {
   isToolNameValidationError as isMalformedToolNameError,
   normalizeToolName as normalizeGuardedToolName,
 } from './llm/tool-guard';
-import { addUsage, BookingExtractor, findExplicitDayOfMonth, usageFromCompletion, type TokenUsage } from './extraction';
+import { addUsage, BookingExtractor, findExplicitDate, findExplicitDayOfMonth, resolveCalendarDate, usageFromCompletion, type TokenUsage } from './extraction';
 export { BookingExtractor } from './extraction';
 import {
   CANCELLATION_PROPOSAL_TTL_MS,
@@ -22,7 +22,7 @@ import {
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
-import { rememberBookingSlots as storeEarlySlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
+import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import {
   buildBespokeReply,
   buildBookingForSomeoneElseReply,
@@ -68,7 +68,7 @@ import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT, PACKAGE_N
 import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, classifyProviderRateLimit, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
-import { businessDay, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
+import { businessDay, bookingDateFacts, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
@@ -322,17 +322,20 @@ export class AgentService {
     extractedDate?: string | null,
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): string {
+    const explicit = findExplicitDate(userMessage);
+    if (explicit?.month === null && extractedDate && !/\b(?:19|20)\d{2}\b/.test(userMessage)) {
+      const facts = bookingDateFacts(extractedDate);
+      if (!facts.isPast && businessDay(extractedDate).date() === explicit.day) return extractedDate;
+    }
+    const statedDate = resolveCalendarDate(userMessage);
+    if (statedDate) return statedDate;
     const hasDayOfMonth = findExplicitDayOfMonth(userMessage) !== null;
     if (!hasDayOfMonth) {
       const weekdayDate = this.getContextualBookingWeekdayDate(userMessage, history);
       return weekdayDate || proposedDate;
     }
     if (!extractedDate) return proposedDate;
-    // Guard: never let a past extracted date override the LLM's future proposed
-    // date. A past extractedDate almost always means the regex picked up the
-    // wrong calendar month (e.g. Sep 3 when the customer meant Oct 3).
-    const extractedIsInPast = dayjs(extractedDate).isBefore(dayjs(), 'day');
-    if (extractedIsInPast) return proposedDate;
+    bookingDateFacts(extractedDate);
     return extractedDate;
   }
 
@@ -427,6 +430,11 @@ export class AgentService {
     userMessage: string,
     history: { role: 'user' | 'assistant', content: string }[]
   ): string | null {
+    const statedDate = resolveCalendarDate(userMessage);
+    if (statedDate) {
+      const facts = bookingDateFacts(statedDate);
+      return `${facts.date} is ${facts.weekday}.`;
+    }
     const match = userMessage.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
     if (!match) return null;
 
@@ -439,7 +447,7 @@ export class AgentService {
       .find((dateMatch) => dateMatch && Number(dateMatch[1]) === day);
 
     if (recentDateMention) {
-      const contextualDate = dayjs(`${recentDateMention[1]} ${recentDateMention[2]} ${recentDateMention[3]}`, 'D MMMM YYYY');
+      const contextualDate = businessDay(resolveCalendarDate(recentDateMention[0])!);
       if (contextualDate.isValid()) {
         return `${contextualDate.format('MMMM D, YYYY')} is a ${contextualDate.format('dddd')}.`;
       }
@@ -1423,6 +1431,50 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
     // confirmation is only valid if it was already pending from a PRIOR message.
     const draftBeforeThisTurn = await prisma.bookingDraft.findUnique({ where: { customerId } });
     const initialDraftStep = draftBeforeThisTurn?.step;
+    const currentSlots = draftBeforeThisTurn && !earlySlotsExpired(draftBeforeThisTurn) ? draftBeforeThisTurn : null;
+    const statedSlots = extractStatedSlots(userMessage);
+    const knownService = statedSlots.service || currentSlots?.service;
+    const requestedCalendarDate = resolveCalendarDate(userMessage);
+    const nextWeekAvailability = /\bnext\s+week\b/i.test(userMessage)
+      && /\b(dates?|availability|available|slots?|book|session)\b/i.test(userMessage)
+      && (platform === 'whatsapp' || platform === 'web');
+    if (nextWeekAvailability && !knownService) {
+      return { content: 'Which package would you like for your session?', tokensUsed: 0 };
+    }
+    let calendarReply: string | null = null;
+    const dateRangeResults = new Map<string, Awaited<ReturnType<typeof bookingService.getAvailableDates>>>();
+    const checkDateRange = async (fromDate: string, toDate: string, service: string) => {
+      const key = JSON.stringify([fromDate, toDate, service]);
+      let result = dateRangeResults.get(key);
+      if (!result) {
+        result = await bookingService.getAvailableDates(fromDate, toDate, service);
+        dateRangeResults.set(key, result);
+      }
+      calendarReply = result.dates.length
+        ? `Available dates for ${service}:\n${result.dates.map((entry) => `${entry.weekday}, ${entry.date}: ${entry.slots.join(', ')}`).join('\n')}\nWhich date and time would work for you?`
+        : `${result.message} Which other date range would work for you?`;
+      return result;
+    };
+    const checkCalendarSlots = async (date: string, service: string) => {
+      const facts = bookingDateFacts(date);
+      const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => service.toLowerCase().includes(key));
+      if (!serviceKey) throw new Error('Choose a recognised package before checking availability.');
+      const result = await bookingService.getAvailableSlots(date, SERVICE_DURATIONS[serviceKey]);
+      const label = `${facts.date} is ${facts.weekday}`;
+      if (facts.isPast || facts.isMonday || !Array.isArray(result)) {
+        const reason = facts.isPast ? 'That date is in the past' : facts.isMonday ? 'Closed on Mondays'
+          : Array.isArray(result) ? 'No slots are available' : result.reason;
+        calendarReply = `${label}. ${reason}. Which other date would work for you?`;
+        return { ...facts, status: 'closed', reason };
+      }
+      const requestedTime = statedSlots.time || currentSlots?.time;
+      calendarReply = requestedTime && result.includes(requestedTime)
+        ? `${label}. ${requestedTime} is available for ${service}. Would you like me to prepare a booking proposal?`
+        : result.length
+          ? `${label}. Available slots for ${service}: ${result.join(', ')}. Which time would work for you?`
+          : `${label}. No slots are available for ${service}. Which other date would work for you?`;
+      return { ...facts, slots: result };
+    };
 
     // Fetch latest payment status for upcoming booking or active draft
     let paymentSummary = 'No active payment on file.';
@@ -1452,6 +1504,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
 
     const fullContext = `Customer Name: ${JSON.stringify(sanitizeSlotValue(customerName))}
   ${knownSlotsLine(draftBeforeThisTurn, customer?.name)}
+  Computed calendar facts (authoritative, never infer weekdays): today=${nowInBusinessTimezone().format('YYYY-MM-DD dddd')}; requested=${requestedCalendarDate ? JSON.stringify(bookingDateFacts(requestedCalendarDate)) : 'none'}; next week=${JSON.stringify(nextWeekRange())}.
   Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
 Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
 Other Upcoming Bookings: ${otherUpcomingBookings}
@@ -1571,6 +1624,22 @@ ${contextString}`;
         {
           type: 'function',
           function: {
+            name: 'get_available_dates',
+            description: 'Check open dates and a few available times per date for a recognised package, over at most fourteen days. Skip Mondays and fully booked dates. Use the stored package when known; next week means the computed Monday-Sunday range.',
+            parameters: {
+              type: 'object',
+              properties: {
+                fromDate: { type: 'string', description: 'First date, YYYY-MM-DD' },
+                toDate: { type: 'string', description: 'Last date inclusive, YYYY-MM-DD' },
+                service: { type: 'string', description: 'Selected package name' },
+              },
+              required: ['fromDate', 'toDate', 'service'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
             name: 'cancel_booking',
             description: 'Two-step cancellation tool. On the first turn, identify the exact upcoming session, state its date/time and whether it is eligible for a refund (never promise an amount or that money was returned), save a cancel_confirm proposal, and STOP. If there are multiple upcoming sessions, ask which one and save no cancellation proposal until the customer identifies one. On a later turn, call this tool to cancel only when initialDraftStep was already cancel_confirm, the customer message clearly says yes/yeah/yep/ndio/confirm, and the immediately preceding assistant message asked them to confirm this cancellation. ok/okay/sawa are not consent. A no/keep response or unrelated message must clear the pending proposal. The actual cancellation updates the booking and removes its Google Calendar event through the existing cancellation action.',
             parameters: {
@@ -1618,11 +1687,14 @@ ${contextString}`;
       messages,
       temperature: 0.3,
       max_completion_tokens: MAX_AGENT_COMPLETION_TOKENS,
-      ...(allTools.length > 0 ? { tools: allTools, tool_choice: 'auto' as const } : {}),
+      ...(allTools.length > 0 ? { tools: allTools, tool_choice: nextWeekAvailability
+        ? { type: 'function' as const, function: { name: 'get_available_dates' } }
+        : 'auto' as const } : {}),
     };
     let completion = await this.createCompletionWithToolNameGuard(completionParams, allowedToolNames, availableTools);
     let currentResponse = completion.response;
     addUsage(usage, usageFromCompletion(currentResponse, completion.completionCalls));
+    completionParams.tool_choice = 'auto';
 
     let rounds = 0;
     let proposedThisTurn = false; // blocks confirm_booking if propose_booking (even a re-propose with changed details) ran earlier in this same turn
@@ -1758,24 +1830,13 @@ ${contextString}`;
                 toolResponse = `INFO: Note not queued (${noteResult.reason || 'non-actionable'}).`;
               }
             }
+            else if (functionName === 'get_available_dates') {
+              const range = nextWeekAvailability ? nextWeekRange() : args;
+              toolResponse = JSON.stringify(await checkDateRange(range.fromDate, range.toDate, knownService || args.service));
+            }
             else if (functionName === 'get_available_slots') {
               const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date, history);
-              const serviceKey = Object.keys(SERVICE_DURATIONS).find(k => args.service.toLowerCase().includes(k));
-              if (!serviceKey) {
-                toolResponse = `ERROR: "${args.service}" isn't one of our packages. Valid packages are: ${Object.keys(SERVICE_DURATIONS).join(', ')}. Ask the customer to pick one of these.`;
-              } else {
-                const duration = SERVICE_DURATIONS[serviceKey];
-                const result: any = await bookingService.getAvailableSlots(requestedDate, duration);
-                // Spell out the weekday so the model never has to infer it from the raw ISO date.
-                const dateLabel = `${dayjs(requestedDate).format('dddd, MMMM D, YYYY')} (${requestedDate})`;
-
-                if (result.status === 'closed') {
-                  toolResponse = `The business is CLOSED on ${dateLabel} because: ${result.reason}.`;
-                } else {
-                  const slots = Array.isArray(result) ? result : [];
-                  toolResponse = `Available slots for ${args.service} on ${dateLabel}: ${slots.length > 0 ? slots.join(', ') : 'None'}. When referring to this date with the customer, use exactly this weekday - do not guess it.`;
-                }
-              }
+              toolResponse = JSON.stringify(await checkCalendarSlots(requestedDate, knownService || args.service));
             } else {
               toolResponse = `ERROR: Tool ${functionName} not found.`;
             }
@@ -1822,8 +1883,20 @@ ${contextString}`;
       addUsage(usage, usageFromCompletion(currentResponse, completion.completionCalls));
     }
 
+    if (!proposedThisTurn && !confirmedActionThisTurn && !calendarReply) {
+      if (nextWeekAvailability && knownService) {
+        const range = nextWeekRange();
+        await checkDateRange(range.fromDate, range.toDate, knownService);
+      } else if (requestedCalendarDate && knownService
+        && (platform === 'whatsapp' || platform === 'web')
+        && !/\b(cancel|reschedule|move|postpone|note|bringing)\b/i.test(userMessage)
+        && (/\b(available|availability|slots?|open|closed|weekday)\b/i.test(userMessage)
+          || /^\s*(?:\d{1,2}(?:st|nd|rd|th)?\s+|\d{4}-\d{2}-\d{2})/.test(userMessage))) {
+        await checkCalendarSlots(requestedCalendarDate, knownService);
+      }
+    }
     const modelContent = currentResponse.choices[0].message.content?.trim() || '';
-    const emptyResponse = modelContent.length === 0;
+    const emptyResponse = modelContent.length === 0 && !calendarReply;
     console.info('[AGENT_USAGE]', JSON.stringify({
       customerRef: this.customerReference(customerId),
       model: CHAT_MODEL,
@@ -1846,7 +1919,7 @@ ${contextString}`;
       console.warn('[AGENT_FLOW] Blocked unverified action claim:', JSON.stringify({ customerRef: this.customerReference(customerId), reply: modelContent.slice(0, 200) }));
     }
 
-    const safeModelContent = cancellationReply || (unverifiedActionReply
+    const safeModelContent = cancellationReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
       ? unverifiedActionReply
       : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
       && !rescheduleAppliedThisTurn

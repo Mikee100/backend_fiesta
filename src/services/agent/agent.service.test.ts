@@ -447,6 +447,69 @@ test('handles a session mix-up correction without changing the existing booking'
   }
 });
 
+test('date-range availability is bounded and skips Mondays and fully booked days', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const originals = { bookings: prisma.booking.findMany, drafts: prisma.bookingDraft.findMany, events: googleCalendarService.getEvents };
+  const counts = { bookings: 0, drafts: 0, events: 0 };
+  let fullyBooked = false;
+  (prisma.booking.findMany as any) = async ({ where }: any) => {
+    counts.bookings++;
+    assert.ok(where.dateTime.gte instanceof Date && where.dateTime.lte instanceof Date);
+    return fullyBooked ? [{ dateTime: where.dateTime.gte, durationMinutes: 14 * 24 * 60 }]
+      : [{ dateTime: new Date('2026-10-07T06:00:00Z'), durationMinutes: 600 }];
+  };
+  (prisma.bookingDraft.findMany as any) = async ({ where }: any) => {
+    counts.drafts++;
+    assert.deepEqual(where.step.in, ['awaiting_confirmation', 'payment_pending']);
+    return [];
+  };
+  (googleCalendarService.getEvents as any) = async (from: Date, to: Date) => {
+    counts.events++;
+    assert.ok(from < to);
+    return [];
+  };
+  context.after(() => {
+    prisma.booking.findMany = originals.bookings;
+    prisma.bookingDraft.findMany = originals.drafts;
+    googleCalendarService.getEvents = originals.events;
+  });
+  const result = await bookingService.getAvailableDates('2026-10-05', '2026-10-11', 'THE BLOOM');
+  assert.deepEqual(counts, { bookings: 1, drafts: 1, events: 1 });
+  assert.equal(result.dates.some((date) => date.weekday === 'Monday'), false);
+  assert.equal(result.dates.some((date) => date.date === '2026-10-07'), false);
+  assert.deepEqual(result.dates[0], { date: '2026-10-06', weekday: 'Tuesday', slots: ['09:00', '09:30', '10:00'] });
+  const longRange = await bookingService.getAvailableDates('2026-10-05', '2026-10-18', 'THE BLOOM');
+  assert.deepEqual(counts, { bookings: 2, drafts: 2, events: 2 });
+  assert.ok(longRange.dates.every((date) => date.slots.length <= 3));
+  assert.ok(JSON.stringify(longRange).length < 1600);
+  const clamped = await bookingService.getAvailableDates('2026-10-03', '2026-10-06', 'THE BLOOM');
+  assert.equal(clamped.fromDate, '2026-10-04');
+  const beforePast = { ...counts };
+  const past = await bookingService.getAvailableDates('2026-10-01', '2026-10-03', 'THE BLOOM');
+  assert.equal(past.status, 'past');
+  assert.match(past.message, /has passed/);
+  assert.deepEqual(counts, beforePast);
+  fullyBooked = true;
+  const empty = await bookingService.getAvailableDates('2026-10-05', '2026-10-11', 'THE BLOOM');
+  assert.equal(empty.status, 'unavailable');
+  assert.match(empty.message, /closed or fully booked/);
+  assert.deepEqual(empty.dates, []);
+  const mondayOnly = await bookingService.getAvailableDates('2026-10-05', '2026-10-05', 'THE BLOOM');
+  assert.equal(mondayOnly.status, 'unavailable');
+  for (const [from, to, service] of [
+    ['2026-10-05', '2026-10-19', 'THE BLOOM'],
+    ['2026-10-11', '2026-10-05', 'THE BLOOM'],
+    ['2026-02-30', '2026-03-01', 'THE BLOOM'],
+    ['2026-10-05', '2026-10-11', 'not a package'],
+  ]) {
+    const before = { ...counts };
+    await assert.rejects(bookingService.getAvailableDates(from, to, service));
+    assert.deepEqual(counts, before);
+  }
+  assert.deepEqual(await bookingService.getAvailableSlots('2026-10-05', 90), { status: 'closed', reason: 'Closed on Mondays' });
+  assert.deepEqual(await bookingService.getAvailableSlots('2026-10-03', 90), { status: 'closed', reason: 'That date is in the past' });
+});
+
 test('availability excludes occupied appointments and competing booking drafts', async () => {
   const originals = {
     bookingFindMany: prisma.booking.findMany,

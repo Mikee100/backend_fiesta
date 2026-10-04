@@ -132,7 +132,7 @@ type Case = {
 
 // Routes that only fire when natural assistant mode is off (allowDeterministicInfoReplies).
 const NATURAL_GATED_ROUTES = new Set([
-  'packageBudget', 'businessIntroduction', 'weekday', 'website', 'contactDetails', 'portfolio',
+  'packageBudget', 'businessIntroduction', 'website', 'contactDetails', 'portfolio',
   'socialMedia', 'rawFiles', 'additions', 'bespoke', 'travellingMothers', 'earliestImageDelivery',
   'postShootProcess', 'bookingProcess', 'packageSelection', 'packageAdvice',
 ]);

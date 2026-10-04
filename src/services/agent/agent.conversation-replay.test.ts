@@ -3,6 +3,7 @@ import test from 'node:test';
 import prisma from '../../config/prisma';
 import { inBusinessTimezone } from '../../utils/time';
 import { bookingService } from '../booking/booking.service';
+import { googleCalendarService } from '../calendar/calendar.service';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { circuitBreaker } from './resilience.service';
 import { AgentService } from './agent.service';
@@ -149,6 +150,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
   stub(prisma.bookingDraft, 'deleteMany', async () => { draft = null; return { count: 1 }; });
   stub(prisma.booking, 'findFirst', async () => null);
   stub(prisma.booking, 'findMany', async () => []);
+  stub(googleCalendarService, 'getEvents', async () => []);
   stub(prisma.payment, 'findFirst', async () => null);
   stub(prisma.bookingAddon, 'findMany', async () => []);
   stub(prisma.package, 'findMany', async () => packages);
@@ -240,17 +242,24 @@ test('Wairimu conversation replay with six-message history and a next-day return
     assert.doesNotMatch(frames[4].reply, /^Noted:/i);
     assert.match(frames[4].reply, /would you like.*add/i);
   });
-  await context.test('[EXPECTED TO FAIL] [TOOL CONTRACT + MOCKED CALL] next-week request exposes and executes a date-range tool', () => {
+  await context.test('[FIXED IN 8.2] [TOOL CONTRACT + MOCKED CALL] next-week request exposes and executes a date-range tool', () => {
     assert.ok(frames[5].exposedTools.includes('get_available_dates'));
     assert.ok(frames[5].toolResults.length > 0);
     assert.ok(frames[5].toolResults.every((result) => !/ERROR|not found/i.test(result)));
     assert.doesNotMatch(frames[5].reply, /give me your name|which package/i);
   });
-  await context.test('[EXPECTED TO FAIL] [STATE + FAULT INJECTION] October 6 reply uses computed Tuesday and retains date/time', () => {
+  await context.test('[FIXED IN 8.2] [STATE + FAULT INJECTION] October 6 reply uses computed Tuesday and retains date/time', () => {
     assert.doesNotMatch(frames[6].reply, /Monday|closed/i);
     assert.match(frames[6].reply, /Tuesday/);
     assert.equal(frames[6].draft?.date, '2026-10-06');
     assert.equal(frames[6].draft?.time, '10:00');
+  });
+  await context.test('[FIXED IN 8.2] [STATE + FAULT INJECTION] October 5 is refused as a Monday', async () => {
+    activeTurn = { message: '5th October', modelReply: 'October 5 is Tuesday and the studio is open.' };
+    const reply = await instance.handleMessage(customerId, activeTurn.message, history.slice(-6), 'whatsapp');
+    assert.match(reply, /2026-10-05 is Monday/);
+    assert.match(reply, /Closed on Mondays/);
+    assert.doesNotMatch(reply, /Tuesday|studio is open/);
   });
   await context.test('[EXPECTED TO FAIL] [STATE/PROMPT + FAULT INJECTION] known slots survive trimmed history and next day', () => {
     assert.equal(frames[7].history.length, 6);

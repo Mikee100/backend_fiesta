@@ -9,11 +9,13 @@ import { bookingDraftService } from '../booking/booking-draft.service';
 import { bookingService } from '../booking/booking.service';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { mpesaService } from '../payment/mpesa.service';
-import { nowInBusinessTimezone } from '../../utils/time';
+import { bookingDateFacts, nextWeekRange, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow, RESCHEDULE_FORFEITURE_WINDOW_HOURS } from '../../utils/booking-policy';
 import { AgentService, BookingExtractor } from './agent.service';
+import { resolveCalendarDate } from './extraction';
 import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { bookingAddonService } from '../booking/booking-addon.service';
+import { googleCalendarService } from '../calendar/calendar.service';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
@@ -222,6 +224,132 @@ const PAYMENT_PROPOSAL = {
   role: 'assistant' as const,
   content: "Great, I can hold THE ICON for 2026-10-10 at 15:00. The deposit is KSH 2000. If that works for you, just reply yes and I'll send the M-Pesa prompt.",
 };
+
+test('calendar date rollover and 22:00 UTC use Nairobi today, tomorrow and past dates', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-09-30T09:00:00Z').getTime() });
+  assert.equal(resolveCalendarDate('3rd'), '2026-10-03');
+  assert.throws(() => resolveCalendarDate('31st'), /invalid/);
+  assert.throws(() => resolveCalendarDate('31st November'), /invalid/);
+  context.mock.timers.tick(new Date('2026-12-20T09:00:00Z').getTime() - Date.now());
+  assert.equal(resolveCalendarDate('1st January'), '2027-01-01');
+  context.mock.timers.tick(new Date('2026-12-31T22:00:00Z').getTime() - Date.now());
+  assert.equal(resolveCalendarDate('today'), '2027-01-01');
+  assert.equal(resolveCalendarDate('tomorrow'), '2027-01-02');
+  assert.equal(bookingDateFacts('2026-12-31').isPast, true);
+  assert.equal(bookingDateFacts('2027-01-01').isPast, false);
+});
+
+test('Sunday evening next week starts Monday and results omit the closed Monday', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T20:00:00Z').getTime() });
+  assert.deepEqual(nextWeekRange(), { fromDate: '2026-10-05', toDate: '2026-10-11' });
+  context.mock.timers.tick(2 * 60 * 60 * 1000);
+  assert.equal(nowInBusinessTimezone().format('YYYY-MM-DD HH:mm'), '2026-10-05 01:00');
+  assert.deepEqual(nextWeekRange(), { fromDate: '2026-10-12', toDate: '2026-10-18' });
+});
+
+test('calendar tools use stored packages and code-owned next-week and weekday replies', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const restorations: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method];
+    target[method] = implementation;
+    restorations.push(() => { target[method] = original; });
+  };
+  context.after(() => restorations.reverse().forEach((restore) => restore()));
+  let draft: any = { id: 'calendar-draft', step: EARLY_SLOT_STEP, name: 'Wairimu', service: 'THE BLOOM', createdAt: new Date() };
+  stub(prisma.customer, 'findUnique', async () => ({ id: 'calendar-customer', name: 'Wairimu', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => draft);
+  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { Object.assign(draft, data); return { count: 1 }; });
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  let rangeLookups = 0;
+  stub(prisma.booking, 'findMany', async () => {
+    rangeLookups++;
+    return [{ dateTime: new Date('2026-10-07T06:00:00Z'), durationMinutes: 600 }];
+  });
+  stub(prisma.bookingDraft, 'findMany', async () => []);
+  stub(googleCalendarService, 'getEvents', async () => []);
+  const queries: string[] = [];
+  stub(bookingService, 'getAvailableSlots', async (date: string) => {
+    queries.push(date);
+    return date === '2026-10-07' ? [] : ['10:00', '13:00'];
+  });
+  const exposed: string[][] = [];
+  const toolResults: string[] = [];
+  const instance = withQuietAgent({
+    naturalAssistantMode: true,
+    rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots,
+    runAgent: (AgentService.prototype as any).runAgent,
+    getPackagePricingLine: async () => 'THE BLOOM: Ksh 15,000.',
+    createCompletionWithToolNameGuard: async (params: any) => {
+      exposed.push((params.tools || []).map((tool: any) => tool.function.name));
+      toolResults.push(...params.messages.filter((message: any) => message.role === 'tool').map((message: any) => message.content));
+      const forcedRange = params.tool_choice?.function?.name === 'get_available_dates'
+        || params.messages.filter((message: any) => message.role === 'tool').length === 1;
+      const message = forcedRange ? {
+        role: 'assistant', content: null, tool_calls: [{ id: 'calendar-call', type: 'function', function: {
+          name: 'get_available_dates', arguments: JSON.stringify({ fromDate: '2025-01-01', toDate: '2025-12-31', service: 'THE MUSE' }),
+        } }],
+      } : { role: 'assistant', content: 'October 6 is Monday, and the studio is closed. What is your name and package?' };
+      return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 1 } } };
+    },
+  });
+  const rangeReply = await instance.handleMessage('calendar-customer', 'Which dates are available next week?', [], 'whatsapp');
+  assert.match(rangeReply, /THE BLOOM/);
+  assert.match(rangeReply, /Tuesday, 2026-10-06/);
+  assert.doesNotMatch(rangeReply, /2025|THE MUSE|your name|package\?/);
+  assert.deepEqual(queries, []);
+  assert.equal(rangeLookups, 1);
+  assert.ok(exposed[0].includes('get_available_dates') && exposed[0].includes('get_available_slots'));
+  const result = JSON.parse(toolResults[0]);
+  assert.equal(result.fromDate, '2026-10-05');
+  assert.equal(result.toDate, '2026-10-11');
+  assert.equal(result.service, 'THE BLOOM');
+  assert.equal(result.dates.some((entry: any) => entry.date === '2026-10-07'), false);
+  assert.equal(instance.getWeekdayReply('What day is 6 October 2026?', []), '2026-10-06 is Tuesday.');
+  assert.equal(resolveCalendarDate('6 October 2025'), '2025-10-06');
+  assert.equal(instance.getAuthoritativeRequestedDate('2025-10-06', '2026-10-06', '2025-10-06'), '2025-10-06');
+  const dateReply = await instance.handleMessage('calendar-customer', '6th October, 10am', [], 'whatsapp');
+  assert.match(dateReply, /2026-10-06 is Tuesday/);
+  assert.match(dateReply, /10:00 is available/);
+  assert.doesNotMatch(dateReply, /Monday|closed|your name|package\?/);
+  assert.equal(draft.date, '2026-10-06');
+  assert.equal(draft.time, '10:00');
+  const mondayReply = await instance.handleMessage('calendar-customer', '5th October, 10am', [], 'whatsapp');
+  assert.match(mondayReply, /2026-10-05 is Monday.*Closed on Mondays/);
+  const before = queries.length;
+  const completionsBeforeUnknown = exposed.length;
+  draft = { ...draft, service: null };
+  assert.equal(await instance.handleMessage('calendar-customer', 'Which dates are available next week?', [], 'whatsapp'), 'Which package would you like for your session?');
+  assert.equal(queries.length, before);
+  assert.equal(exposed.length, completionsBeforeUnknown, 'unknown package prompts once without calling the model');
+  draft = { ...draft, service: 'THE BLOOM', createdAt: new Date(Date.now() - SLOT_MEMORY_WINDOW_MS) };
+  assert.equal(await instance.handleMessage('calendar-customer', 'Which dates are available next week?', [], 'whatsapp'), 'Which package would you like for your session?');
+  assert.equal(queries.length, before);
+  await instance.runAgent('calendar-customer', 'Which dates are available next week?', [], 'instagram');
+  assert.deepEqual(exposed.at(-1), []);
+  assert.equal(queries.length, before);
+  assert.equal(rangeLookups, 1);
+
+  draft = { ...draft, service: 'THE BLOOM', createdAt: new Date() };
+  for (const [fromDate, toDate, expected] of [
+    ['2026-10-01', '2026-10-03', /That date range has passed/],
+    ['2026-10-05', '2026-10-05', /closed or fully booked/],
+  ] as const) {
+    instance.createCompletionWithToolNameGuard = async (params: any) => ({
+      provider: 'groq', completionCalls: 1, response: { choices: [{ message:
+        params.messages.some((message: any) => message.role === 'tool')
+          ? { role: 'assistant', content: 'There is availability at 10:00. You can book that slot.' }
+          : { role: 'assistant', content: null, tool_calls: [{ id: 'range-edge', type: 'function', function: {
+            name: 'get_available_dates', arguments: JSON.stringify({ fromDate, toDate, service: 'THE BLOOM' }),
+          } }] },
+      }], usage: { total_tokens: 1 } },
+    });
+    const reply = await instance.runAgent('calendar-customer', `Check availability from ${fromDate} to ${toDate}`, [], 'whatsapp');
+    assert.match(reply.content, expected);
+    assert.doesNotMatch(reply.content, /availability at 10:00|book that slot/);
+  }
+});
 
 test('collecting_slots ignores confirmations and reports nothing pending', async (context) => {
   const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findFirst };
