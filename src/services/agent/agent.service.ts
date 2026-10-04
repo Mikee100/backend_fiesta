@@ -2,6 +2,8 @@
 import OpenAI from 'openai';
 import { CHAT_MODEL, createChatCompletion, type ChatProvider } from './llm/provider';
 export { createChatCompletion, getGroqCooldownUntil } from './llm/provider';
+import { addUsage, BookingExtractor, findExplicitDayOfMonth, usageFromCompletion, type TokenUsage } from './extraction';
+export { BookingExtractor } from './extraction';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
@@ -22,7 +24,6 @@ import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 
 const MAX_AGENT_COMPLETION_TOKENS = Math.min(2_500, Math.max(200, Number(process.env.AI_MAX_COMPLETION_TOKENS) || 1500));
-const MAX_EXTRACTOR_COMPLETION_TOKENS = 120;
 const MAX_RAG_CONTEXT_CHUNKS = 3;
 const MAX_HISTORY_MESSAGES = 6;
 const CANCELLATION_PROPOSAL_TTL_MS = 60 * 60 * 1000;
@@ -32,21 +33,6 @@ const OFFICIAL_WEBSITE_URLS = {
   suspendingConcept: 'https://www.fiestahousematernity.com/gallery/suspending-concept',
 } as const;
 const PACKAGE_PRICING_FALLBACK = 'The Editions are THE BLOOM: Ksh 15,000, THE MUSE: Ksh 25,000, THE ICON: Ksh 35,000, THE LEGEND: Ksh 45,000, THE QUEEN: Ksh 55,000, THE EMPRESS: Ksh 70,000 (Most Loved / Signature), and THE GODDESS: Ksh 120,000 (Flagship).';
-
-// --- Hybrid Booking Extractor ---
-type BookingDetails = {
-  name?: string | null;
-  service?: string | null;
-  date?: string | null;
-  time?: string | null;
-};
-
-type TokenUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  completionCalls: number;
-};
 
 type ReplyContext = {
   customerId: string;
@@ -72,61 +58,6 @@ type MessageRoute = {
   deterministicOnly?: boolean;
 };
 
-function usageFromCompletion(response: any, completionCalls: number = 1): TokenUsage {
-  return {
-    inputTokens: response?.usage?.prompt_tokens || 0,
-    outputTokens: response?.usage?.completion_tokens || 0,
-    totalTokens: response?.usage?.total_tokens || 0,
-    completionCalls,
-  };
-}
-
-function addUsage(target: TokenUsage, usage: TokenUsage): void {
-  target.inputTokens += usage.inputTokens;
-  target.outputTokens += usage.outputTokens;
-  target.totalTokens += usage.totalTokens;
-  target.completionCalls += usage.completionCalls;
-}
-
-const MONTH_NAME_PATTERN = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
-const MONTH_ABBREVIATIONS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-const ISO_DATE_PATTERN = /\b(\d{4}-\d{2}-\d{2})\b/;
-
-/**
- * Day-of-month only when written as an ordinal ("3rd"), next to a month name
- * ("3 Oct", "October 3") or inside an ISO date. Bare numbers ("7 months") and
- * hours ("3pm", "15:00") never count. `month` is 0-based when a month name was given.
- */
-function findExplicitDate(message: string): { day: number; month: number | null } | null {
-  const text = message.toLowerCase();
-  const iso = text.match(ISO_DATE_PATTERN);
-  if (iso) return { day: Number(iso[1].slice(8, 10)), month: Number(iso[1].slice(5, 7)) - 1 };
-
-  const dayThenMonth = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:of\\s+)?(${MONTH_NAME_PATTERN})\\b`));
-  const monthThenDay = text.match(new RegExp(`\\b(${MONTH_NAME_PATTERN})\\s*(\\d{1,2})(?:st|nd|rd|th)?\\b(?!\\s*(?:am|pm|:\\d|\\.\\d))`));
-  const ordinal = text.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
-
-  let day: number;
-  let monthName: string | null = null;
-  if (dayThenMonth) {
-    day = Number(dayThenMonth[1]);
-    monthName = dayThenMonth[2];
-  } else if (monthThenDay) {
-    day = Number(monthThenDay[2]);
-    monthName = monthThenDay[1];
-  } else if (ordinal) {
-    day = Number(ordinal[1]);
-  } else {
-    return null;
-  }
-  if (day < 1 || day > 31) return null;
-  return { day, month: monthName ? MONTH_ABBREVIATIONS.indexOf(monthName.slice(0, 3)) : null };
-}
-
-function findExplicitDayOfMonth(message: string): number | null {
-  return findExplicitDate(message)?.day ?? null;
-}
-
 function isAvailableSlotList(result: string[] | { status: string; reason: string }): result is string[] {
   return Array.isArray(result);
 }
@@ -137,146 +68,6 @@ const RESCHEDULE_KEYWORD_PATTERN = /\b(?:reschedul(?:e|ed|es|ing)|chang(?:e|ed|e
 const PAYMENT_CONFIRMATION_REQUIRED_REPLY = 'Before I send the M-Pesa deposit prompt, please reply yes to confirm the booking.';
 const PAYMENT_PROMPT_UNRECORDED = 'PAYMENT_PROMPT_UNRECORDED';
 const PAYMENT_PROMPT_UNRECORDED_REPLY = 'Please check your phone for an M-Pesa prompt before trying again. If nothing arrives in a few minutes, the studio team can help.';
-
-export class BookingExtractor {
-  // 🧼 STEP 1: Clean Input
-  private clean(text: string): string {
-    return text
-      .replace(/[^ 0-\w\s]/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-  }
-
-  // ⚡ STEP 2: Regex Extraction
-  private regexExtract(text: string): BookingDetails {
-    const cleanText = this.clean(text);
-
-    // Don't extract names from short greetings
-    if (cleanText.length < 10) return { name: null, service: null, date: null, time: null };
-
-    // Look for patterns like "my name is..." or "this is..."
-    const nameMatch = cleanText.match(/my name is ([a-z]{2,})/i) || 
-                      cleanText.match(/this is ([a-z]{2,})/i) ||
-                      cleanText.match(/i am ([a-z]{2,})/i);
-    
-    const serviceMatch = cleanText.match(
-      new RegExp(`(?:the\\s+)?(${PACKAGE_NAME_PATTERN})(?:\\s+(?:package|edition))?`, 'i')
-    );
-    const isoDate = text.match(ISO_DATE_PATTERN)?.[1];
-    const explicitDate = isoDate ? null : findExplicitDate(text);
-    const timeMatch = cleanText.match(/(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i);
-
-    let date;
-    let time = null;
-
-    if (timeMatch) {
-      time = timeMatch[0].toLowerCase().replace(/\s/g, '');
-    }
-    if (isoDate && dayjs(isoDate).isValid()) {
-      date = isoDate;
-    } else if (explicitDate && explicitDate.month !== null) {
-      const now = nowInBusinessTimezone();
-      let parsed = now.month(explicitDate.month).date(explicitDate.day);
-      if (parsed.isBefore(now, 'day')) parsed = parsed.add(1, 'year');
-      // dayjs rolls "31 Nov" over into December; treat that as no date.
-      if (parsed.month() === explicitDate.month && parsed.date() === explicitDate.day) {
-        date = parsed.format('YYYY-MM-DD');
-      }
-    } else if (explicitDate) {
-      const day = explicitDate.day;
-      const now = nowInBusinessTimezone();
-      let parsed = now.date(day);
-      // If the resolved date is already in the past, the customer almost
-      // certainly means the same day-of-month in the next calendar month
-      // (e.g. "3rd" said on Sep 30 → Oct 3, not Sep 3).
-      if (parsed.isValid() && parsed.isBefore(now, 'day')) {
-        parsed = now.add(1, 'month').date(day);
-      }
-      if (parsed.isValid()) {
-        date = parsed.format('YYYY-MM-DD');
-      }
-    }
-
-    return {
-      name: nameMatch?.[1] || null,
-      service: serviceMatch?.[1] || null,
-      date: date || null,
-      time: time || null
-    };
-  }
-
-  // 🤖 STEP 3: AI Extraction (STRICT JSON)
-  private async aiExtract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
-    const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
-    const { response } = await createChatCompletion({
-      model: CHAT_MODEL,
-      messages: [
-        {
-          role: 'system',
-          content: `Current Date/Time: ${now}\n\nExtract booking details from the user message.\n\nReturn ONLY valid JSON. No text.\n\nFormat:\n{\n  "name": string | null,\n  "service": string | null,\n  "date": string | null,\n  "time": string | null\n}\n\nRules:\n- Name must be full name if possible
-- Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names)
-- Prefer Edition names like "THE EMPRESS" over legacy names
-- Convert date into YYYY-MM-DD
-- Convert time into 24h format (HH:mm)
-- If missing, return null
-`
-        },
-        { role: 'user', content: message }
-      ],
-      temperature: 0,
-      max_completion_tokens: MAX_EXTRACTOR_COMPLETION_TOKENS,
-    });
-    let details: BookingDetails = {};
-    try {
-      details = JSON.parse(response.choices[0].message.content || '{}');
-    } catch {
-      details = {};
-    }
-    return { details, usage: usageFromCompletion(response) };
-  }
-
-  // 🔥 FINAL HYBRID METHOD
-  // Skips the expensive AI extraction call when no booking-related signals are
-  // present in the message (e.g. pure questions, greetings, complaints) - this
-  // avoids the double-LLM-call latency and token burn for ~60% of messages.
-  private hasBookingSignals(message: string): boolean {
-    const text = message.toLowerCase();
-    return /\b(\d{1,2})(st|nd|rd|th)?\b|\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b|\b(am|pm)\b|\bbook|\bschedule|\bappointment|\bsession|\bpackage|\bbloom|\bmuse|\bicon|\blegend|\bqueen|\bempress|\bgoddess|\bresched|\bcancel|\bdeposit|\bmpesa|\bpay/i.test(text);
-  }
-
-  private needsAiExtraction(message: string): boolean {
-    const text = message.toLowerCase();
-    const rescheduleSignal = /\b(reschedule|change|move|postpone)\b/.test(text);
-    const hasDateSignal = /\b\d{1,2}(st|nd|rd|th)?\b|\b\d{4}-\d{2}-\d{2}\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
-    const hasTimeSignal = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
-    return rescheduleSignal && hasDateSignal && hasTimeSignal;
-  }
-
-  async extract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
-    const regex = this.regexExtract(message);
-    console.log('Regex result:', regex);
-    if (regex.name && regex.service && regex.date && regex.time) {
-      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
-    }
-    if (!this.needsAiExtraction(message)) {
-      console.log('No reschedule date/time extraction needed - skipping AI extractor call.');
-      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
-    }
-    const { details: ai, usage } = await this.aiExtract(message);
-    console.log('AI result:', ai);
-    return {
-      details: {
-        name: regex.name || ai.name,
-        service: regex.service || ai.service,
-        date: regex.date || ai.date,
-        time: regex.time || ai.time
-      },
-      usage
-    };
-  }
-}
-
 
 export class AgentService {
   private readonly naturalAssistantMode = String(process.env.AI_ASSISTANT_NATURAL_MODE || 'false').toLowerCase() === 'true';
