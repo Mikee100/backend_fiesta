@@ -86,6 +86,13 @@ import {
   extractSessionNoteMetadata as buildSessionNoteMetadata,
   executeSaveDeliveryPreferenceTool as saveDeliveryPreference,
 } from './session-tools';
+import {
+  checkTokenBudget as getTokenBudgetStatus,
+  escalate as createEscalation,
+  logAiJobMetric as recordAiJobMetric,
+  recordTokenUsage as saveTokenUsage,
+  touchCustomerMemory as updateCustomerMemory,
+} from './usage-and-memory';
 
 type ReplyContext = {
   customerId: string;
@@ -3011,26 +3018,7 @@ ${contextString}`;
    * later if wanted). Best-effort: failures here must never break the reply.
    */
   private async touchCustomerMemory(customerId: string, userMessage: string, platform: string): Promise<void> {
-    const customer = await prisma.customer.findUnique({ where: { id: customerId } });
-    if (!customer) return; // customer doesn't exist yet (e.g. first-ever web chat message)
-
-    const summary = userMessage.length > 200 ? userMessage.slice(0, 200) + '…' : userMessage;
-    const existing = await prisma.customerMemory.findUnique({ where: { customerId } });
-
-    await prisma.customerMemory.upsert({
-      where: { customerId },
-      update: {
-        relationshipStage: existing?.relationshipStage === 'new' || !existing ? 'interested' : existing.relationshipStage,
-        lastInteractionSummary: summary,
-        preferredChannel: platform
-      },
-      create: {
-        customerId,
-        relationshipStage: 'interested',
-        lastInteractionSummary: summary,
-        preferredChannel: platform
-      }
-    });
+    return updateCustomerMemory(customerId, userMessage, platform);
   }
 
   /**
@@ -3038,19 +3026,7 @@ ${contextString}`;
    * a failure here must never break the actual customer-facing reply.
    */
   private async escalate(customerId: string, escalationType: string, description: string, sentimentScore?: number): Promise<void> {
-    try {
-      await prisma.escalation.create({
-        data: { customerId, escalationType, description, status: 'OPEN', sentimentScore }
-      });
-      await notifyAdmin(
-        'escalation',
-        `Customer ${customerId} needs attention`,
-        description,
-        { customerId, escalationType, sentimentScore }
-      );
-    } catch (err) {
-      console.error('Failed to create escalation:', err);
-    }
+    return createEscalation(customerId, escalationType, description, sentimentScore);
   }
 
   /**
@@ -3132,11 +3108,7 @@ ${contextString}`;
     customerId: string; platform: string; success: boolean; latencyMs: number;
     failureReason?: string; isFallback?: boolean; circuitBreakerTrip?: boolean; circuitBreakerReason?: string;
   }): Promise<void> {
-    try {
-      await prisma.aiJobMetric.create({ data });
-    } catch (err) {
-      console.error('Failed to log AI job metric:', err);
-    }
+    return recordAiJobMetric(data);
   }
 
   /**
@@ -3146,51 +3118,12 @@ ${contextString}`;
    * meant to catch runaway/abusive customers long before real usage would.
    */
   private async checkTokenBudget(customerId: string): Promise<boolean> {
-    if (process.env.NODE_ENV !== 'production') return true;
-
-    // Optional: allow exempting tester or admin phone numbers via comma-separated list
-    const exemptNumbers = (process.env.EXEMPT_TOKEN_CAP_NUMBERS || '')
-      .split(',')
-      .map(n => n.trim().replace(/\D/g, ''))
-      .filter(Boolean);
-    const cleanId = customerId.replace(/\D/g, '');
-    if (cleanId && exemptNumbers.includes(cleanId)) {
-      return true;
-    }
-
-    const customer = await prisma.customer.findUnique({
-      where: { id: customerId },
-      select: { dailyTokenUsage: true, tokenResetDate: true }
-    });
-    if (!customer) return true;
-
-    const isNewDay = !customer.tokenResetDate || customer.tokenResetDate.toDateString() !== new Date().toDateString();
-    const currentUsage = isNewDay ? 0 : customer.dailyTokenUsage;
-    return currentUsage < DAILY_TOKEN_CAP;
+    return getTokenBudgetStatus(customerId);
   }
 
   /** Records token usage after a successful reply, resetting the daily counter if a new day has started. */
   private async recordTokenUsage(customerId: string, tokensUsed: number): Promise<void> {
-    if (tokensUsed <= 0) return;
-    try {
-      const customer = await prisma.customer.findUnique({
-        where: { id: customerId },
-        select: { dailyTokenUsage: true, tokenResetDate: true }
-      });
-      if (!customer) return; // customer created later in the flow (e.g. at booking time) - nothing to update yet
-
-      const isNewDay = !customer.tokenResetDate || customer.tokenResetDate.toDateString() !== new Date().toDateString();
-      await prisma.customer.update({
-        where: { id: customerId },
-        data: {
-          dailyTokenUsage: isNewDay ? tokensUsed : { increment: tokensUsed },
-          tokenResetDate: new Date(),
-          totalTokensUsed: { increment: tokensUsed }
-        }
-      });
-    } catch (err) {
-      console.error('Failed to record token usage:', err);
-    }
+    return saveTokenUsage(customerId, tokensUsed);
   }
 
   /**
