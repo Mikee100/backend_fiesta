@@ -298,9 +298,9 @@ test('Wairimu conversation replay with six-message history and a next-day return
     assert.match(frames[8].reply, /10 working days/);
     assert.equal(frames[8].prompts.length, 0, 'money and policy must bypass model generation');
   });
-  await context.test('[EXPECTED TO FAIL] [SIMULATED QUOTA] exhausted-budget walk-in turn hands off rather than announcing a limit', () => {
+  await context.test('[FIXED IN 8.7] [SIMULATED QUOTA] exhausted-budget walk-in turn hands off rather than announcing a limit', () => {
     assert.doesNotMatch(frames[9].reply, /conversation limit|quota|today.*limit/i);
-    assert.match(frames[9].reply, /team member.*continu|short break/i);
+    assert.equal(frames[9].reply, 'Thank you for your patience. A member of our team will pick this up with you shortly.');
     assert.ok(frames[9].escalations > frames[8].escalations);
   });
   await context.test('[FIXED IN 8.6] [FAULT INJECTION] stale lashes price and retired package wording are blocked', () => {

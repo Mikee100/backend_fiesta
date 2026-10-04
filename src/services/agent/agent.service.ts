@@ -25,6 +25,7 @@ import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
 import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
+import { BUDGET_HANDOFF_REPLY } from './constants';
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { EDITIONS_PENDING_OWNER_CONFIRMATION } from '../../config/constants';
@@ -2049,9 +2050,14 @@ ${contextString}`;
       await this.escalate(
         customerId,
         'quota',
-        `Customer hit the daily AI token budget (cap: ${DAILY_TOKEN_CAP}). The bot sent the quota fallback instead of continuing the conversation.`
+        JSON.stringify({
+          event: 'quota_handoff_requested', platform, customerMessage: userMessage.slice(0, 2000),
+          dailyTokenCap: DAILY_TOKEN_CAP, requiresHumanReply: true,
+          responseTarget: 'within the business day', assignedOwner: null,
+          note: 'Automated replies stopped. A studio team member must claim this handoff and reply; no booking or payment action was taken.',
+        })
       );
-      return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
+      return this.respond(ctx, BUDGET_HANDOFF_REPLY, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
     }
 
     if (platform === 'whatsapp' || platform === 'web') {

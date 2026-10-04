@@ -22,3 +22,4 @@ export const ADDON_QUOTED_PRICE_LABEL = 'quoted by package tier';
 export const ADDON_MAKEUP_CLARIFICATION = 'Is the extra makeup for another person?';
 export const ADDON_MULTI_CLARIFICATION = 'Which add-on would you like to add to your session?';
 export const ADDON_ADDITIONS_HEADER = 'Yes, these optional additions are available:';
+export const BUDGET_HANDOFF_REPLY = 'Thank you for your patience. A member of our team will pick this up with you shortly.';

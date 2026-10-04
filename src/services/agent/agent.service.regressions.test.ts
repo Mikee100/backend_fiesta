@@ -20,10 +20,44 @@ import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/
 import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
 import { buildAdditionsReply, isAddonListFollowUp } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
+import { DAILY_TOKEN_CAP } from './resilience.service';
+import { BUDGET_HANDOFF_REPLY } from './constants';
 import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('plain information keeps tool schemas off while action/date turns expose them', () => {
+  const instance = new AgentService() as any;
+  for (const message of ['Hello', 'Where is the studio?', 'What happens after the session?', 'How much is THE BLOOM?', 'What extras do you have?', 'Is the makeup inclusive of lashes?']) {
+    assert.equal(instance.shouldExposeTools(message, [], 'whatsapp'), false, message);
+  }
+  for (const message of ['How do I book?', 'Which dates are available next week?', '6th October, 10am', 'Please add an extra outfit', 'Send the download link by email', 'confirm']) {
+    assert.equal(instance.shouldExposeTools(message, [], 'whatsapp'), true, message);
+    assert.equal(instance.shouldExposeTools(message, [], 'instagram'), false, message);
+  }
+});
+
+test('budget cutoff requests a human handoff without exposing limits or invoking the model', async () => {
+  const capBefore = DAILY_TOKEN_CAP;
+  const escalations: any[] = [];
+  const instance = withQuietAgent({
+    checkTokenBudget: async () => false,
+    escalate: async (customerId: string, type: string, description: string) => { escalations.push({ customerId, type, payload: JSON.parse(description) }); },
+    runAgent: async () => { assert.fail('budget cutoff must not invoke the model'); },
+  });
+  const reply = await instance.handleMessage('budget-customer', 'Can I walk in?', [], 'whatsapp');
+  assert.equal(reply, BUDGET_HANDOFF_REPLY);
+  assert.doesNotMatch(reply, /quota|token|limit|50,?000|tomorrow/i);
+  assert.equal(reply, 'Thank you for your patience. A member of our team will pick this up with you shortly.');
+  assert.equal(escalations.length, 1);
+  assert.equal(escalations[0].customerId, 'budget-customer');
+  assert.equal(escalations[0].type, 'quota');
+  assert.equal(escalations[0].payload.customerMessage, 'Can I walk in?');
+  assert.equal(escalations[0].payload.requiresHumanReply, true);
+  assert.equal(escalations[0].payload.assignedOwner, null);
+  assert.equal(DAILY_TOKEN_CAP, capBefore);
+});
 
 test('output verifier blocks transcript money, weekday, retired-name and duration faults', (context) => {
   context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
