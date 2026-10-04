@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AgentService } from './agent.service';
+import { ADDON_MAKEUP_CLARIFICATION } from './constants';
 
 type Msg = { role: 'user' | 'assistant'; content: string };
 type HarnessOptions = { natural?: boolean; nullRoutes?: string[] };
@@ -100,6 +101,7 @@ function createHarness(options: HarnessOptions = {}) {
 }
 
 function routeOf(reply: string): string {
+  if (reply === ADDON_MAKEUP_CLARIFICATION) return 'selectedAddon';
   if (reply.startsWith('ROUTE:')) return reply.slice('ROUTE:'.length);
   if (/^Yes\. Your original session date and time are still booked/.test(reply)) return 'rescheduleWithdrawalConfirmation';
   if (/^(No rush\.|You are welcome\.)/.test(reply)) return 'postActionAcknowledgement';
@@ -190,6 +192,7 @@ const CASES: Case[] = [
   { message: 'i would want 2 of them then', history: [EXTRA_OUTFIT_EXPLAINED], expected: 'selectedAddon' },
   { message: 'add an extra professional make-up for me', expected: 'selectedAddon' },
   { message: 'What add-ons do you have?', expected: 'additions' },
+  { message: 'what extras do you have?', expected: 'additions' },
   { message: 'remove the extra outfit', expected: 'additions', note: 'Phase 8.3: add-on information stays deterministic without reading remove as reschedule' },
   { message: 'Do you do bespoke shoots?', expected: 'bespoke' },
   { message: "I'm travelling from abroad", expected: 'travellingMothers' },

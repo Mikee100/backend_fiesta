@@ -1434,6 +1434,7 @@ test('includes add-ons linked through a booking session note when invoicing', as
     assert.deepEqual(addonUpdateWhere, {
       ...expectedScope,
       status: { in: ['pending', 'confirmed'] },
+      unitPrice: { gt: 0 },
     });
   } finally {
     prisma.customerSessionNote.findMany = originals.sessionNoteFindMany;

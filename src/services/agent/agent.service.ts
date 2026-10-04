@@ -23,6 +23,8 @@ import {
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
 import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
+import { addonQuantity, selectedAddons } from './addon-capture';
+import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import {
   buildBespokeReply,
   buildBookingForSomeoneElseReply,
@@ -792,43 +794,15 @@ export class AgentService {
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): AddonCatalogItem | null {
-    const text = userMessage.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
-    const selectionSignal = /\b(want|would like|add|include|choose|go with|take|prefer)\b/.test(text);
-    const explicitSelection = selectionSignal
-      ? ADDON_CATALOG.find((item) => item.match.test(text))
-      : null;
-    if (explicitSelection) return explicitSelection;
+    return selectedAddons(userMessage, history)[0] || null;
+  }
 
-    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
-
-    // "I want 2 of them" right after explaining a single add-on.
-    if (selectionSignal && lastAssistant && /\b(it|them|that|those|this|one|ones)\b/.test(text)) {
-      const discussed = ADDON_CATALOG.filter((item) => item.match.test(lastAssistant.content));
-      if (discussed.length === 1) return discussed[0];
-    }
-
-    const affirmative = /^(?:yes+|yeah+|yep+|yup|sure|okay|ok)(?:\s*,?\s*(?:that's|that is|thats)\s+(?:what\s+i\s+want|what\s+i'd\s+like))?[.! ]*$/i;
-    if (!affirmative.test(text.trim())) return null;
-
-    if (!lastAssistant || !/\bif\s+you(?:'|’)d\s+like\b[\s\S]{0,160}\b(?:we|i)\s+can\s+(?:add|include)\b/i.test(lastAssistant.content)) {
-      return null;
-    }
-
-    const offeredAddons = ADDON_CATALOG.filter((item) => item.match.test(lastAssistant.content));
-    return offeredAddons.length === 1 ? offeredAddons[0] : null;
+  private getSelectedAddons(userMessage: string, history: { role: 'user' | 'assistant'; content: string }[] = []): AddonCatalogItem[] {
+    return selectedAddons(userMessage, history);
   }
 
   private getRequestedAddonQuantity(userMessage: string, addon: AddonCatalogItem): number {
-    if (!addon.quantityFromNote) return 1;
-    const text = userMessage.toLowerCase();
-    const digits = text.match(/\b(\d{1,2})\b/);
-    if (digits) {
-      const qty = Number(digits[1]);
-      if (qty > 0 && qty <= 20) return qty;
-    }
-    const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, both: 2, couple: 2 };
-    const word = Object.keys(words).find((w) => new RegExp(`\\b${w}\\b`).test(text));
-    return word ? words[word] : 1;
+    return addonQuantity(userMessage, addon);
   }
 
   private getAddonSelectionReply(addon: AddonCatalogItem, quantity = 1): string {
@@ -836,9 +810,9 @@ export class AgentService {
       ? quantity > 1
         ? `${quantity} x Ksh ${addon.unitPrice.toLocaleString()} = Ksh ${(addon.unitPrice * quantity).toLocaleString()}`
         : `Ksh ${addon.unitPrice.toLocaleString()}${addon.quantityFromNote ? ' each' : ''}`
-      : 'quoted by package tier';
+      : ADDON_QUOTED_PRICE_LABEL;
     const label = quantity > 1 ? `${quantity} x ${addon.name}` : addon.name;
-    return `Noted: ${label} (${price}). It will be added to the session balance, not the deposit. I have not changed your package or date. What would you like to confirm next?`;
+    return `${ADDON_NOTED_PREFIX} ${label} (${price}). It will be added to the session balance, not the deposit. ${ADDON_UNCHANGED_REPLY} What would you like to confirm next?`;
   }
 
   private shouldUseBespokeReply(userMessage: string): boolean {
@@ -1822,7 +1796,8 @@ ${contextString}`;
               }
             }
             else if (functionName === 'add_session_note') {
-              const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type, args.category, args.priority, userMessage, platform);
+              const noteResult = await this.executeAddNoteTool(customerId, args.bookingDate, args.note, args.type, args.category, args.priority, userMessage, platform,
+                this.getSelectedAddons(userMessage, history).map((item) => item.sku));
               if (noteResult.created) {
                 noteSavedThisTurn = true;
                 toolResponse = `SUCCESS: Note added to session as ${noteResult.type}.`;
@@ -2667,9 +2642,10 @@ ${contextString}`;
     category?: string,
     priority?: string,
     sourceMessage?: string,
-    platform?: string
+    platform?: string,
+    approvedAddonSkus?: readonly string[]
   ): Promise<{ created: boolean; reason?: string; type?: string }> {
-    return saveSessionNote.call(this, customerId, bookingDate, note, type, category, priority, sourceMessage, platform);
+    return saveSessionNote.call(this, customerId, bookingDate, note, type, category, priority, sourceMessage, platform, approvedAddonSkus);
   }
 }
 

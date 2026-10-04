@@ -10,6 +10,8 @@ import {
   shouldNotifyOutage,
 } from './resilience.service';
 import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
+import { addonInquiryReply, addonRecipient, addonSelectionClarification } from './addon-capture';
+import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -247,31 +249,43 @@ export function createMessageRoutes(
     {
       name: 'addonListFollowUp',
       replyMode: 'deterministic',
-      when: () => this.isAddonListFollowUp(userMessage, history),
+      when: () => this.isAddonListFollowUp(userMessage, history) && !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history),
       handle: () => this.getAdditionsReply(),
     },
     {
       name: 'selectedAddon',
-      when: () => Boolean(this.getSelectedAddon(userMessage, history)),
+      when: () => Boolean(addonInquiryReply(userMessage) || addonSelectionClarification(userMessage, history) || this.getSelectedAddon(userMessage, history)),
       handle: async () => {
-        const selectedAddon = this.getSelectedAddon(userMessage, history);
-        if (!selectedAddon) return null;
-        const addonQuantity = this.getRequestedAddonQuantity(userMessage, selectedAddon);
-        const noteResult = await this.executeAddNoteTool(
-          customerId,
-          '',
-          addonQuantity > 1 ? `${addonQuantity} x ${selectedAddon.name}` : selectedAddon.name,
-          'special_request',
-          'addon',
-          'normal',
-          userMessage,
-          platform
-        );
-        return noteResult.created
-          ? this.getAddonSelectionReply(selectedAddon, addonQuantity)
-          : noteResult.reason === 'duplicate_pending_note'
-            ? `${selectedAddon.name} is already recorded for your session, so I have not added it twice.`
-            : 'I could not save that add-on just yet. Please tell me which extra you would like to include.';
+        const inquiry = addonInquiryReply(userMessage);
+        if (inquiry) return inquiry;
+        const clarification = addonSelectionClarification(userMessage, history);
+        if (clarification) return clarification;
+        const choices = this.getSelectedAddons(userMessage, history);
+        if (!choices.length) return null;
+        const saved: string[] = [];
+        const existing: string[] = [];
+        const failed: string[] = [];
+        for (const addon of choices) {
+          try {
+            const quantity = this.getRequestedAddonQuantity(userMessage, addon);
+            const label = quantity > 1 ? `${quantity} x ${addon.name}` : addon.name;
+            const recipient = addonRecipient(userMessage, addon.sku);
+            const noteResult = await this.executeAddNoteTool(customerId, '', `${label}${recipient ? ` ${recipient}` : ''}`,
+              'special_request', 'addon', 'normal', userMessage, platform, choices.map((choice: { sku: string }) => choice.sku));
+            if (noteResult.created) saved.push(label);
+            else if (noteResult.reason === 'duplicate_pending_note') existing.push(label);
+            else failed.push(label);
+          } catch {
+            failed.push(addon.name);
+          }
+        }
+        if (choices.length === 1 && saved.length === 1) {
+          return this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]));
+        }
+        return [saved.length ? `${ADDON_NOTED_PREFIX} ${saved.join('; ')}.` : '',
+          existing.length ? `Already recorded: ${existing.join('; ')}. I have not added these twice.` : '',
+          failed.length ? `Not saved: ${failed.join('; ')}. The team can help confirm these.` : '',
+          `${ADDON_BALANCE_REPLY} ${ADDON_UNCHANGED_REPLY}`].filter(Boolean).join('\n');
       },
     },
     {

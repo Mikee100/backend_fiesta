@@ -238,14 +238,14 @@ test('Wairimu conversation replay with six-message history and a next-day return
   await context.test('[FIXED IN 8.1a] [STATE] package selection is persisted immediately', () => {
     assert.equal(frames[2].draft?.service, 'THE BLOOM');
   });
-  await context.test('[EXPECTED TO FAIL] [CAPTURE] both explicitly chosen extras are saved and acknowledged', () => {
+  await context.test('[FIXED IN 8.4 CAPTURE] [CAPTURE] both explicitly chosen extras are saved and acknowledged', () => {
     const saved = frames[3].notes.join('\n');
     assert.match(saved, /makeup/i);
     assert.match(saved, /outfit/i);
     assert.match(frames[3].reply, /makeup/i);
     assert.match(frames[3].reply, /outfit/i);
   });
-  await context.test('[EXPECTED TO FAIL] [CAPTURE] hypothetical wig question saves nothing', () => {
+  await context.test('[FIXED IN 8.4 CAPTURE] [CAPTURE] hypothetical wig question saves nothing', () => {
     assert.deepEqual(frames[4].notes, frames[3].notes);
     assert.doesNotMatch(frames[4].reply, /^Noted:/i);
     assert.match(frames[4].reply, /would you like.*add/i);

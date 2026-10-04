@@ -17,9 +17,202 @@ import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractState
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
+import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
+import { buildAdditionsReply, isAddonListFollowUp } from './replies';
+import { ADDON_CATALOG } from '../../config/constants';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('add-on consent rejects questions and scopes quantities to each explicit choice', async (context) => {
+  const originalFind = prisma.customerSessionNote.findFirst;
+  (prisma.customerSessionNote.findFirst as any) = async () => { assert.fail('non-consensual notes must stop before storage lookup'); };
+  context.after(() => { prisma.customerSessionNote.findFirst = originalFind; });
+  const choices = selectedAddons('I want 2 extra outfits and 3 extra photos');
+  assert.equal(choices.length, 2);
+  assert.equal(addonQuantity('I want 2 extra outfits and 3 extra photos', choices.find((item) => item.sku === 'extra_outfit')!), 2);
+  assert.equal(addonQuantity('I want 2 extra outfits and 3 extra photos', choices.find((item) => item.sku === 'extra_edited_photo')!), 3);
+  assert.equal(addonQuantity("I'm 7 months pregnant and I want 2 extra outfits", choices.find((item) => item.sku === 'extra_outfit')!), 2);
+  assert.throws(() => addonQuantity('I want 2.5 extra outfits', choices.find((item) => item.sku === 'extra_outfit')!));
+  for (const question of ['What if I want to hire a wig from you?', 'Can I add an extra outfit?', 'How much is extra makeup?', 'Do you have styled wigs?', 'Is it possible to add extra photos?', 'I want to know about wig hire']) {
+    assert.deepEqual(selectedAddons(question), []);
+    assert.deepEqual(await agent.executeAddNoteTool('consent-customer', '', 'Styled wig hire', 'special_request', 'addon', 'normal', question, 'whatsapp'), {
+      created: false, reason: 'addon_requires_explicit_choice',
+    });
+  }
+  assert.deepEqual(await agent.executeAddNoteTool('consent-customer', '', 'Styled wig hire', 'special_request', 'addon', 'normal', 'I want an extra outfit', 'whatsapp'), {
+    created: false, reason: 'addon_requires_explicit_choice',
+  });
+  assert.deepEqual(await agent.executeAddNoteTool('consent-customer', '', '5 x Extra outfit beyond package', 'special_request', 'addon', 'normal', 'I want 2 extra outfits', 'whatsapp'), {
+    created: false, reason: 'addon_quantity_requires_confirmation',
+  });
+});
+
+test('negated extras never save and mixed negation selects only the wanted outfit', async (context) => {
+  assert.equal(addonSelectionClarification('I want extra makeup'), 'Is the extra makeup for another person?');
+  assert.match(addonSelectionClarification('yes', [{ role: 'assistant', content: 'Would you like extra makeup or styled wig hire?' }]) || '', /Which add-on/);
+  const original = prisma.customerSessionNote.findFirst;
+  (prisma.customerSessionNote.findFirst as any) = async () => { assert.fail('negation must stop before storage'); };
+  context.after(() => { prisma.customerSessionNote.findFirst = original; });
+  for (const message of ["I don't want the wig", 'no extra outfit', 'skip the makeup', "I don't need extra photos"]) {
+    assert.deepEqual(selectedAddons(message), []);
+    assert.equal((await agent.executeAddNoteTool('negation', '', 'Extra outfit beyond package', 'special_request', 'addon', 'normal', message, 'whatsapp')).created, false);
+  }
+  for (const message of ["I don't want extra makeup, just the outfit", 'no makeup, just the outfit']) {
+    assert.deepEqual(selectedAddons(message).map((item) => item.sku), ['extra_outfit']);
+  }
+  const choices = selectedAddons('I want 2 outfits and a wig');
+  assert.equal(addonQuantity('I want 2 outfits and a wig', choices.find((item) => item.sku === 'extra_outfit')!), 2);
+  assert.equal(addonQuantity('I want 2 outfits and a wig', choices.find((item) => item.sku === 'wig_hire')!), 1);
+});
+
+test('real add-on dispatch saves multiple explicit choices and never saves the wig hypothetical', async () => {
+  const notes: string[] = [];
+  const instance = withQuietAgent({ naturalAssistantMode: true,
+    executeAddNoteTool: async (_customer: string, _date: string, note: string) => { notes.push(note); return { created: true }; },
+    getAdditionsReply: () => { assert.fail('single-offer consent must not invoke the catalog'); },
+    runAgent: async () => { assert.fail('capture and inquiry should bypass model generation'); },
+  });
+  const reply = await instance.handleMessage('addon-customer', 'I also want extra makeup for my sister and an extra outfit', [], 'whatsapp');
+  assert.equal(notes.length, 2);
+  assert.match(notes.join('\n'), /makeup for my sister/i);
+  assert.match(reply, /Noted for your session/);
+  assert.match(reply, /makeup/i);
+  assert.match(reply, /outfit/i);
+  assert.match(reply, /balance, not the deposit/);
+  const before = notes.length;
+  const hypothetical = await instance.handleMessage('addon-customer', 'What if I want to hire a wig from you?', [], 'whatsapp');
+  assert.match(hypothetical, /Would you like to add/);
+  assert.equal(notes.length, before);
+  await instance.handleMessage('addon-customer', 'yes', [{ role: 'assistant', content: hypothetical }], 'whatsapp');
+  assert.equal(notes.length, before + 1);
+  assert.match(notes.at(-1) || '', /Styled wig hire/);
+  instance.executeAddNoteTool = async (_customer: string, _date: string, note: string) => ({ created: !/makeup/i.test(note) });
+  const partial = await instance.handleMessage('addon-customer', 'I want extra makeup for my sister and an extra outfit', [], 'whatsapp');
+  assert.match(partial, /Noted for your session: Extra outfit/);
+  assert.match(partial, /Not saved: Extra professional makeup/);
+});
+
+test('single versus multi offers and makeup recipients require unambiguous consent', async () => {
+  const notes: string[] = [];
+  const instance = withQuietAgent({ naturalAssistantMode: true,
+    executeAddNoteTool: async (_customer: string, _date: string, note: string) => { notes.push(note); return { created: true }; },
+    getAdditionsReply: () => { assert.fail('an offer clarification must not query the catalog'); },
+    runAgent: async () => { assert.fail('clarification should be deterministic'); },
+  });
+  const multi = await instance.handleMessage('offer', 'yes', [{ role: 'assistant', content: 'Would you like to add an extra outfit or styled wig hire?' }], 'whatsapp');
+  assert.match(multi, /Which add-on/);
+  assert.equal(notes.length, 0);
+  const question = await instance.handleMessage('offer', 'I want extra makeup', [], 'whatsapp');
+  assert.equal(question, 'Is the extra makeup for another person?');
+  assert.equal(notes.length, 0);
+  await instance.handleMessage('offer', 'For my sister', [{ role: 'assistant', content: question }], 'whatsapp');
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /makeup for my sister/i);
+});
+
+test('a legitimate second outfit increments once while accidental resends do not', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const restorations: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restorations.push(() => { target[method] = original; });
+  };
+  context.after(() => restorations.reverse().forEach((restore) => restore()));
+  const notes: any[] = [];
+  let row: any = null;
+  let writes = 0;
+  stub(prisma.bookingDraft, 'findUnique', async () => ({ id: 'draft', step: 'collecting_slots' }));
+  stub(prisma.customerSessionNote, 'findFirst', async ({ where }: any) => notes.find((note) => note.createdAt >= where.createdAt.gte && note.description === where.description && (!where.sourceMessage || note.sourceMessage === where.sourceMessage)) || null);
+  stub(prisma.customerSessionNote, 'create', async ({ data }: any) => { const note = { id: `note-${notes.length + 1}`, createdAt: new Date(), ...data }; notes.push(note); return note; });
+  stub(prisma.bookingAddon, 'findFirst', async ({ where }: any) => where.sessionNoteId ? row?.sessionNoteId === where.sessionNoteId ? row : null : row);
+  stub(prisma.bookingAddon, 'create', async ({ data }: any) => { writes++; row = { id: 'outfit', ...data }; return row; });
+  stub(prisma.bookingAddon, 'update', async ({ data }: any) => { writes++; row.quantity += data.quantity.increment; row.totalPrice += data.totalPrice.increment; row.sessionNoteId = data.sessionNoteId; return row; });
+  stub(require('../notifications/notification.service'), 'notifyAdmin', async () => {});
+  const instance = withQuietAgent({ naturalAssistantMode: true, runAgent: async () => { assert.fail('outfit capture must not call the model'); } });
+  await instance.handleMessage('second-outfit', 'I want an extra outfit', [], 'whatsapp');
+  assert.equal(row.quantity, 1);
+  await instance.handleMessage('second-outfit', 'I want an extra outfit', [], 'whatsapp');
+  assert.equal(row.quantity, 1);
+  assert.equal(writes, 1);
+  context.mock.timers.tick(2 * 60 * 60 * 1000);
+  await instance.handleMessage('second-outfit', 'another outfit', [], 'whatsapp');
+  assert.equal(row.quantity, 2);
+  assert.equal(row.totalPrice, 8000);
+  const duplicate = await instance.handleMessage('second-outfit', 'another outfit', [], 'whatsapp');
+  assert.equal(row.quantity, 2);
+  assert.equal(writes, 2);
+  assert.match(duplicate, /Already recorded/);
+});
+
+test('quoted extras never render Ksh zero or enter invoice totals', async (context) => {
+  const originals = { notes: prisma.customerSessionNote.findMany, addons: prisma.bookingAddon.findMany, update: prisma.bookingAddon.updateMany };
+  context.after(() => { prisma.customerSessionNote.findMany = originals.notes; prisma.bookingAddon.findMany = originals.addons; prisma.bookingAddon.updateMany = originals.update; });
+  (prisma.customerSessionNote.findMany as any) = async () => [];
+  (prisma.bookingAddon.findMany as any) = async () => [
+    { name: 'Professional Reel', quantity: 1, unitPrice: 0, totalPrice: 0 },
+    { name: 'Raw files', quantity: 1, unitPrice: 0, totalPrice: 0 },
+    { name: 'Extra outfit', quantity: 1, unitPrice: 4000, totalPrice: 4000 },
+  ];
+  (prisma.bookingAddon.updateMany as any) = async ({ where }: any) => { assert.deepEqual(where.unitPrice, { gt: 0 }); return { count: 1 }; };
+  for (const sku of ['professional_reel', 'raw_files']) {
+    const reply = agent.getAddonSelectionReply(ADDON_CATALOG.find((item) => item.sku === sku));
+    assert.match(reply, /quoted by package tier/);
+    assert.doesNotMatch(reply, /Ksh\s*0\b|=\s*Ksh/);
+  }
+  const total = await bookingAddonService.sumForBooking('quoted');
+  assert.equal(total.addonsTotal, 4000);
+  assert.deepEqual(total.lineItems.map((item) => item.name), ['Extra outfit']);
+  await bookingAddonService.markInvoiced('quoted');
+});
+
+test('generated add-on replies remain recognised by the shared-phrase matcher', async () => {
+  for (const addon of ADDON_CATALOG) {
+    const reply = agent.getAddonSelectionReply(addon);
+    assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true, addon.sku);
+  }
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: buildAdditionsReply(2000) }]), true);
+  let lists = 0;
+  const instance = withQuietAgent({ naturalAssistantMode: true,
+    getAdditionsReply: () => { lists++; return 'ADDON LIST'; },
+    executeAddNoteTool: async () => { assert.fail('a list request must not capture'); },
+    runAgent: async () => { assert.fail('the extras list must be deterministic'); },
+  });
+  assert.equal(await instance.handleMessage('extras-list', 'what extras do you have?', [], 'whatsapp'), 'ADDON LIST');
+  assert.equal(lists, 1);
+});
+
+test('real add-on persistence keeps new-session extras pending without changing the draft or older booking', async (context) => {
+  const restorations: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method];
+    target[method] = implementation;
+    restorations.push(() => { target[method] = original; });
+  };
+  context.after(() => restorations.reverse().forEach((restore) => restore()));
+  const draft = { id: 'draft-new', step: 'awaiting_confirmation', service: 'THE BLOOM', date: '2026-10-06', time: '10:00' };
+  const before = { ...draft };
+  const notes: any[] = [];
+  const rows: any[] = [];
+  stub(prisma.bookingDraft, 'findUnique', async () => draft);
+  stub(prisma.bookingDraft, 'update', async () => { assert.fail('add-ons must not change the draft'); });
+  stub(prisma.booking, 'findFirst', async () => { assert.fail('a new draft must not pick an older booking'); });
+  stub(prisma.booking, 'create', async () => { assert.fail('add-ons must not create bookings'); });
+  stub(prisma.customerSessionNote, 'findFirst', async () => null);
+  stub(prisma.customerSessionNote, 'create', async ({ data }: any) => { notes.push(data); return { id: `note-${notes.length}`, ...data }; });
+  stub(prisma.bookingAddon, 'findFirst', async () => null);
+  stub(prisma.bookingAddon, 'create', async ({ data }: any) => { rows.push(data); return data; });
+  const notifications = require('../notifications/notification.service');
+  stub(notifications, 'notifyAdmin', async () => {});
+  const instance = withQuietAgent({ naturalAssistantMode: true, runAgent: async () => { assert.fail('explicit extras must bypass the model'); } });
+  const reply = await instance.handleMessage('pending-extras', 'I also want extra makeup for my sister and an extra outfit', [], 'whatsapp');
+  assert.equal(notes.length, 2);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.sku).sort(), ['extra_makeup', 'extra_outfit']);
+  assert.ok(rows.every((row) => row.status === 'pending' && row.bookingId === undefined && row.sessionNoteId));
+  assert.match(notes.map((note) => note.description).join('\n'), /for my sister/);
+  assert.match(reply, /Noted for your session/);
+  assert.deepEqual(draft, before);
+});
 
 test('money and policy routes are deterministic and rendered copy matches the approval document', async (context) => {
   const packages = [

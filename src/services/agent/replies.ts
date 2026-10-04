@@ -1,5 +1,5 @@
 import { ADDON_CATALOG } from '../../config/constants';
-import { OFFICIAL_WEBSITE_URLS } from './constants';
+import { OFFICIAL_WEBSITE_URLS, ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER, ADDON_QUOTED_PRICE_LABEL } from './constants';
 export { isBookingProcessRequest } from './booking-process-reply';
 
 export function buildAdditionsReply(deposit: number | null): string {
@@ -7,10 +7,10 @@ export function buildAdditionsReply(deposit: number | null): string {
     .filter((item) => item.unitPrice > 0)
     .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`);
   const quotedLines = ADDON_CATALOG.filter((item) => item.unitPrice === 0)
-    .map((item) => `${item.name}: quoted by package tier`);
+    .map((item) => `${item.name}: ${ADDON_QUOTED_PRICE_LABEL}`);
 
   return [
-    'Yes, these optional additions are available:',
+    ADDON_ADDITIONS_HEADER,
     '',
     ...pricedLines,
     '',
@@ -39,6 +39,8 @@ export function isAddonListFollowUp(
 
   const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
   if (!lastAssistant) return false;
+  if ([ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER]
+    .some((phrase) => normalizeHyphens(lastAssistant.content).toLowerCase().includes(phrase.toLowerCase()))) return true;
   return /(available extras|add-?ons?\b|optional additions|extra services|extra outfit|styled wig)/i.test(
     normalizeHyphens(lastAssistant.content)
   );

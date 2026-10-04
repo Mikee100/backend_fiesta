@@ -3,6 +3,7 @@ import prisma from '../../config/prisma';
 import { ADDON_CATALOG } from '../../config/constants';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { notifyAdmin } from '../notifications/notification.service';
+import { addonQuantity, addonRecipient, isAdditionalAddonRequest, isAddonInquiry, selectedAddons } from './addon-capture';
 
 export function extractSessionNoteMetadata(note: string, type?: string, category?: string, priority?: string): {
   normalizedType: string;
@@ -119,7 +120,8 @@ export async function executeAddNoteTool(
   category?: string,
   priority?: string,
   sourceMessage?: string,
-  platform?: string
+  platform?: string,
+  approvedAddonSkus?: readonly string[]
 ): Promise<{ created: boolean; reason?: string; type?: string }> {
   const rawNote = (note || '').trim();
   if (!rawNote) {
@@ -139,26 +141,54 @@ export async function executeAddNoteTool(
   }
 
   const metadata = this.extractSessionNoteMetadata(rawNote, type, category, priority);
+  const noteAddons = ADDON_CATALOG.filter((item) => item.match.test(rawNote));
+  const sourceHasAddons = ADDON_CATALOG.some((item) => item.match.test(sourceMessage || ''));
+  const approved = approvedAddonSkus || selectedAddons(sourceMessage || rawNote).map((item) => item.sku);
+  if (noteAddons.some((item) => item.sku === 'extra_makeup') && !addonRecipient(sourceMessage || rawNote, 'extra_makeup')) {
+    return { created: false, reason: 'addon_recipient_requires_confirmation' };
+  }
+  if ((noteAddons.length || metadata.category === 'addon' || sourceHasAddons) && isAddonInquiry(sourceMessage || rawNote)) {
+    return { created: false, reason: 'addon_requires_explicit_choice' };
+  }
+  if ((noteAddons.length || metadata.category === 'addon')
+    && (!noteAddons.length || noteAddons.some((item) => !approved.includes(item.sku)))) {
+    return { created: false, reason: 'addon_requires_explicit_choice' };
+  }
+  try {
+    if (noteAddons.some((item) => addonQuantity(rawNote, item) !== addonQuantity(sourceMessage || rawNote, item))) {
+      return { created: false, reason: 'addon_quantity_requires_confirmation' };
+    }
+  } catch {
+    return { created: false, reason: 'addon_quantity_requires_confirmation' };
+  }
   const normalizedType = metadata.normalizedType;
   const normalizedCategory = metadata.category;
   const normalizedPriority = metadata.priority;
 
   const duplicateWindowStart = dayjs().subtract(24, 'hour').toDate();
+  const incrementalSkus = noteAddons.filter((item) => isAdditionalAddonRequest(sourceMessage || '', item.sku)).map((item) => item.sku);
   const duplicate = await prisma.customerSessionNote.findFirst({
     where: {
       customerId,
       status: 'pending',
       type: normalizedType,
       description: rawNote,
+      ...(incrementalSkus.length ? { sourceMessage } : {}),
       createdAt: { gte: duplicateWindowStart },
     },
     select: { id: true },
   });
   if (duplicate) {
+    if (noteAddons.length) {
+      const recorded = await prisma.bookingAddon.findFirst({ where: { sessionNoteId: duplicate.id, status: { in: ['pending', 'confirmed', 'invoiced'] } } });
+      if (!recorded) return { created: false, reason: 'addon_requires_staff_review', type: normalizedType };
+    }
     return { created: false, reason: 'duplicate_pending_note', type: normalizedType };
   }
 
-  const parsedDate = bookingDate ? dayjs(bookingDate) : null;
+  const addonDraft = noteAddons.length ? await prisma.bookingDraft.findUnique({ where: { customerId } }) : null;
+  const pendingNewSession = Boolean(addonDraft && !addonDraft.bookingId);
+  const parsedDate = bookingDate && !pendingNewSession ? dayjs(bookingDate) : null;
   const bookingOnDate = parsedDate?.isValid()
     ? await prisma.booking.findFirst({
         where: {
@@ -171,8 +201,8 @@ export async function executeAddNoteTool(
         }
       })
     : null;
-  const booking = bookingOnDate ?? await prisma.booking.findFirst({
-    where: { customerId, status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
+  const booking = pendingNewSession ? null : bookingOnDate ?? await prisma.booking.findFirst({
+    where: { customerId, ...(addonDraft?.bookingId ? { id: addonDraft.bookingId } : {}), status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
     orderBy: { dateTime: 'asc' }
   });
 
@@ -198,12 +228,16 @@ export async function executeAddNoteTool(
     }
   });
 
-  await bookingAddonService.createFromNote({
+  const addonCount = await bookingAddonService.createFromNote({
     customerId,
     bookingId: booking?.id,
     note: rawNote,
     sessionNoteId: createdNote.id,
+    incrementExistingSkus: incrementalSkus,
   });
+  if (noteAddons.length && addonCount === 0) {
+    return { created: false, reason: 'addon_already_recorded', type: normalizedType };
+  }
 
   if (normalizedType === 'action_request' || normalizedType === 'special_request') {
     await notifyAdmin(
