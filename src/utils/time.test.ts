@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { businessDay, inBusinessTimezone, BUSINESS_TIMEZONE } from './time';
 
+test('2026-10-06 is Tuesday in the business timezone', () => {
+  assert.equal(inBusinessTimezone('2026-10-06T07:00:00Z').format('dddd'), 'Tuesday');
+});
+
+test('2026-10-05 is Monday in the business timezone', () => {
+  assert.equal(inBusinessTimezone('2026-10-05T07:00:00Z').format('dddd'), 'Monday');
+});
+
 test('converts UTC appointment times to Nairobi time', () => {
   const appointment = inBusinessTimezone('2026-09-04T21:30:00.000Z');
 
