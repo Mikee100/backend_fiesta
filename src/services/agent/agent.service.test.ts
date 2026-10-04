@@ -913,6 +913,23 @@ test('the additions reply is recognized by its follow-up matcher', () => {
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: 'Your session is on Friday.' }]), false);
 });
 
+test('earliest photo delivery replies stay paired with their request matcher', async () => {
+  const originalFindFirst = prisma.booking.findFirst;
+  try {
+    (prisma.booking.findFirst as any) = async () => null;
+    const noBookingReply = await agent.getEarliestImageDeliveryReply('customer-123');
+    assert.equal(agent.shouldUseEarliestImageDeliveryReply('When can I get the photos?'), true);
+    assert.match(noBookingReply, /share your booked date/i);
+
+    (prisma.booking.findFirst as any) = async () => ({ dateTime: new Date('2026-07-01T07:00:00.000Z') });
+    const bookedReply = await agent.getEarliestImageDeliveryReply('customer-123');
+    assert.equal(agent.shouldUseEarliestImageDeliveryReply('When is the delivery date for images?'), true);
+    assert.match(bookedReply, /earliest delivery date is/);
+  } finally {
+    prisma.booking.findFirst = originalFindFirst;
+  }
+});
+
 test('static reply builders remain paired with their request matchers', async () => {
   const originalGetPackageForDeposit = agent.getPackageForDeposit;
   const originalGetDepositForPackage = agent.getDepositForPackage;
