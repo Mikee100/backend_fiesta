@@ -20,9 +20,233 @@ import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/
 import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
 import { buildAdditionsReply, isAddonListFollowUp } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
+import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('output verifier blocks transcript money, weekday, retired-name and duration faults', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const facts = { amounts: [2000, 4000, 15000], deposits: [2000], editions: [{ name: 'THE BLOOM', duration: '1.5 hours' }] };
+  for (const [reply, reason] of [
+    ['A 30% deposit applies.', 'percentage_deposit'],
+    ['Your deposit is Ksh 4,500.', 'unknown_amount'],
+    ['The deposit is Ksh 4,000.', 'deposit_mismatch'],
+    ['Lashes cost Ksh 500.', 'lashes_price'],
+    ['Eyelashes cost Ksh 4,000.', 'lashes_price'],
+    ['Ksh 4,000 per lash.', 'lashes_price'],
+    ['Lashes cost USD 5.', 'lashes_price'],
+    ['6 Oct 2026 is a Monday.', 'weekday_mismatch'],
+    ['The standard makeup package is available.', 'retired_package'],
+    ['THE BLOOM takes 5 hours.', 'duration_mismatch'],
+    ['Choose the 5-hour Bloom.', 'duration_mismatch'],
+  ]) assert.ok(verifyModelReply(reply, facts).reasons.includes(reason), reply);
+  assert.deepEqual(verifyModelReply('2026-10-06 is Tuesday.', facts).reasons, []);
+  assert.deepEqual(verifyModelReply('Sunday Oct 4 and Tuesday Oct 6.', facts).reasons, []);
+  assert.ok(verifyModelReply('Sunday Oct 4 and Monday Oct 6.', facts).reasons.includes('weekday_mismatch'));
+  assert.ok(verifyModelReply('STANDARD - Ksh 15,000', facts).reasons.includes('retired_package'));
+  assert.deepEqual(verifyModelReply('A gold gown is available.', facts).reasons, []);
+  assert.deepEqual(verifyModelReply('THE BLOOM is 1.5 hours. The deposit is Ksh 2,000.', facts).reasons, []);
+  assert.equal(verifyModelReply('\u2014 I can help with your session.', facts).reply, 'I can help with your session.');
+  assert.deepEqual(verifyModelReply('The tool-returned amount is Ksh 8,000.', { ...facts, amounts: [...facts.amounts, 8000] }).reasons, []);
+});
+
+test('verifier permits attributed quotes and checked totals without blessing invented studio prices', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const facts = { amounts: [2000, 4000, 15000], deposits: [2000], editions: [], packagePrices: [{ name: 'THE BLOOM', price: 15000 }] };
+  for (const [reply, customerMessage] of [
+    ["You quoted Ksh 12,000; I'll confirm the studio price.", 'You said Ksh 12,000, is that right?'],
+    ['Your budget is Ksh 12,000.', 'My budget is Ksh 12,000.'],
+    ['Your budget is Ksh 12,000.', 'My budget is 12000.'],
+    ['Another studio quoted Ksh 12,000.', 'Another studio quoted Ksh 12,000.'],
+    ['2 extra outfits = Ksh 8,000.', ''],
+    ['Your 2 extra outfits will cost Ksh 8,000.', ''],
+    ['2 x Ksh 4,000 = Ksh 8,000.', ''],
+    ['THE BLOOM + 2 extra outfits = Ksh 23,000.', ''],
+    ['The deposit is Ksh 2,000.', ''],
+    ['The deposit is 2000.', ''],
+    ['THE BLOOM costs Ksh 15,000, and the deposit is Ksh 2,000.', ''],
+    ['The deposit is Ksh. 2,000.', ''],
+    ['10 working days, 15 photos, 10am: our standard process.', ''],
+    ['The team can confirm lashes details; 15 photos are ready in 10 working days.', ''],
+    ['Lashes at 10am. Makeup at 10:00.', ''],
+  ]) assert.deepEqual(verifyModelReply(reply, { ...facts, customerMessage }).reasons, [], reply);
+  assert.ok(verifyModelReply('THE BLOOM costs Ksh 12,000.', { ...facts, customerMessage: 'My budget is Ksh 12,000.' }).reasons.includes('unknown_amount'));
+  assert.ok(verifyModelReply('You quoted Ksh 12,000; THE BLOOM costs Ksh 12,000.', { ...facts, customerMessage: 'You quoted Ksh 12,000.' }).reasons.includes('unknown_amount'));
+  assert.ok(verifyModelReply('2 extra outfits = Ksh 4,000.', facts).reasons.includes('computed_total_mismatch'));
+  assert.ok(verifyModelReply('The deposit is 4500.', facts).reasons.includes('deposit_mismatch'));
+  assert.deepEqual(verifyModelReply('Saturday 10 October 2026. Tuesday 6 October 2026.', facts).reasons, []);
+  assert.ok(verifyModelReply('Saturday 10 October 2026. Monday 6 October 2026.', facts).reasons.includes('weekday_mismatch'));
+  assert.deepEqual(verifyModelReply('We dress your husband in custom outfits.', facts).reasons, [], 'the numeric/date verifier does not certify inclusion promises');
+});
+
+for (const [name, text, reason] of [
+  ['30% deposit, Ksh 4,500 for Bloom', '30% deposit, Ksh 4,500 for Bloom.', 'percentage_deposit'],
+  ['lashes at KSh 500', 'Lashes at KSh 500.', 'lashes_price'],
+  ['6 Oct is a Monday', '6 Oct is a Monday.', 'weekday_mismatch'],
+  ['a 5-hour Bloom', 'Choose a 5-hour Bloom.', 'duration_mismatch'],
+  ['the standard makeup package', 'The standard makeup package is available.', 'retired_package'],
+]) test(`verifier transcript: ${name} is blocked`, (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  assert.ok(verifyModelReply(text, { amounts: [2000, 15000], deposits: [2000], editions: [{ name: 'THE BLOOM', duration: '1.5 hours' }] }).reasons.includes(reason));
+});
+test('verifier transcript: leading stray dash is removed without a retry', async () => {
+  const result = await verifyWithOneRetry('\u2014 Hello.', { amounts: [], deposits: [], editions: [] }, async () => { assert.fail('punctuation cleanup needs no retry'); }, async () => { assert.fail('punctuation cleanup needs no escalation'); });
+  assert.equal(result.reply, 'Hello.');
+});
+
+test('verifier escalation cooldown is customer-scoped and expires after ten minutes', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: 0 });
+  const notify = createVerifierEscalationLimiter();
+  assert.equal(notify('customer-a'), true);
+  assert.equal(notify('customer-a'), false);
+  assert.equal(notify('customer-b'), true);
+  context.mock.timers.tick(VERIFIER_ESCALATION_COOLDOWN_MS);
+  assert.equal(notify('customer-a'), true);
+});
+
+test('output verifier regenerates exactly once and escalates repeated violations', async () => {
+  const facts = { amounts: [2000], deposits: [2000], editions: [] };
+  let retries = 0;
+  const offending: string[] = [];
+  const corrected = await verifyWithOneRetry('A 30% deposit applies.', facts, async () => { retries++; return 'The deposit is Ksh 2,000.'; }, async () => { assert.fail('valid regeneration must not escalate'); });
+  assert.equal(corrected.reply, 'The deposit is Ksh 2,000.');
+  assert.equal(retries, 1);
+  const blocked = await verifyWithOneRetry('Lashes cost Ksh 500.', facts, async () => { retries++; return 'Lashes cost Ksh 500.'; }, async (text) => { offending.push(text); });
+  assert.equal(blocked.reply, VERIFIER_FALLBACK);
+  assert.equal(blocked.blocked, true);
+  assert.equal(retries, 2);
+  assert.equal(offending.length, 1);
+  assert.match(offending[0], /500/);
+  const failed = await verifyWithOneRetry('A 30% deposit applies.', facts, async () => { throw new Error('provider unavailable'); }, async (text) => { offending.push(text); });
+  assert.equal(failed.reply, VERIFIER_FALLBACK);
+  const empty = await verifyWithOneRetry('A 30% deposit applies.', facts, async () => '', async (text) => { offending.push(text); });
+  assert.equal(empty.reply, VERIFIER_FALLBACK);
+});
+
+test('real agent output verifier retries once, counts usage and escalates unsafe output', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Unknown', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  let catalogLookups = 0;
+  stub(prisma.package, 'findMany', async () => { catalogLookups++; return [{ name: 'THE BLOOM', price: 15000, deposit: 2000, duration: '1.5 hours' }]; });
+  stub(knowledgeRetrieval, 'search', async () => []);
+  let calls = 0;
+  let repeated = false;
+  const escalations: string[] = [];
+  const instance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent, getPackagePricingLine: async () => 'THE BLOOM: Ksh 15,000.',
+    escalate: async (_customer: string, _type: string, text: string) => { escalations.push(text); },
+    createCompletionWithToolNameGuard: async (params: any) => {
+      calls++;
+      const correcting = params.messages.at(-1)?.role === 'system';
+      if (correcting) assert.equal(params.tools, undefined);
+      const content = repeated ? 'Lashes cost Ksh 500.' : correcting ? 'The deposit is Ksh 2,000.' : 'A 30% deposit applies.';
+      return { provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant', content } }], usage: { total_tokens: 3 } } };
+    },
+  });
+  const corrected = await instance.runAgent('verifier-customer', 'Tell me about deposits', [], 'whatsapp');
+  assert.equal(corrected.content, 'The deposit is Ksh 2,000.');
+  assert.equal(corrected.tokensUsed, 6);
+  assert.equal(calls, 2);
+  assert.equal(escalations.length, 0);
+  repeated = true;
+  calls = 0;
+  const blocked = await instance.runAgent('verifier-customer', 'Tell me about lashes', [], 'whatsapp');
+  assert.equal(blocked.content, VERIFIER_FALLBACK);
+  assert.equal(blocked.failureType, 'output_verifier_failed');
+  assert.equal(calls, 2);
+  assert.equal(escalations.length, 1);
+  assert.match(escalations[0], /500/);
+  const escalation = JSON.parse(escalations[0]);
+  assert.equal(escalation.customerMessage, 'Tell me about lashes');
+  assert.match(escalation.offendingText.original, /500/);
+  let executed = 0;
+  instance.executeConfirmBookingTool = async () => { executed++; assert.fail('correction tools must never execute'); };
+  calls = 0;
+  instance.createCompletionWithToolNameGuard = async () => ({ provider: 'groq', completionCalls: 1, response: { choices: [{ message: ++calls === 1
+    ? { role: 'assistant', content: 'Lashes cost Ksh 500.' }
+    : { role: 'assistant', content: null, tool_calls: [{ id: 'forbidden', type: 'function', function: { name: 'confirm_booking', arguments: '{}' } }] },
+  }], usage: { total_tokens: 3 } } });
+  const attempted = await instance.runAgent('verifier-customer', 'Tell me about lashes', [], 'whatsapp');
+  assert.equal(attempted.content, VERIFIER_FALLBACK);
+  assert.equal(executed, 0);
+  assert.equal(calls, 2);
+  assert.equal(escalations.length, 1, 'repeat blocks for the same customer must not flood escalation storage');
+  const beforeLookups = catalogLookups;
+  instance.createCompletionWithToolNameGuard = async () => ({ provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant', content: '\u2014 Hello, I can help with your session.' } }], usage: { total_tokens: 3 } } });
+  const greeting = await instance.runAgent('verifier-customer', 'Hello', [], 'whatsapp');
+  assert.equal(greeting.content, 'Hello, I can help with your session.');
+  assert.equal(catalogLookups, beforeLookups, 'plain conversational verification must not query catalog facts');
+  for (const [userMessage, modelReply] of [
+    ['My budget is 12000.', 'Your budget is Ksh 12,000.'],
+    ['You said Ksh 12,000, is that right?', "You mentioned Ksh 12,000; I'll confirm the studio price."],
+    ['How much are 2 extra outfits?', '2 extra outfits = Ksh 8,000.'],
+    ['Tell me about the deposit.', 'The deposit is 2000.'],
+    ['What does Bloom plus 2 extra outfits cost?', 'THE BLOOM + 2 extra outfits = Ksh 23,000.'],
+  ]) {
+    calls = 0;
+    instance.createCompletionWithToolNameGuard = async () => { calls++; return { provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant', content: modelReply } }], usage: { total_tokens: 3 } } }; };
+    assert.equal((await instance.runAgent('verifier-customer', userMessage, [], 'whatsapp')).content, modelReply);
+    assert.equal(calls, 1, 'permitted amounts must not trigger a correction');
+  }
+});
+
+test('canned replies and exact tool proposals bypass verification and cannot be rewritten', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  stub(require('./output-verifier'), 'verifyWithOneRetry', async () => { assert.fail('backend-owned output must not invoke verification'); });
+  const deterministic = withQuietAgent({ naturalAssistantMode: true, getBookingProcessReply: async () => 'Canned deposit Ksh 2,000.', runAgent: async () => { assert.fail('canned output must not invoke the model'); } });
+  assert.equal(await deterministic.handleMessage('canned', 'How do I book?', [], 'whatsapp'), 'Canned deposit Ksh 2,000.');
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Wairimu Kamau', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  let completions = 0;
+  let proposals = 0;
+  const instance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent,
+    getPackagePricingLine: async () => 'THE BLOOM: Ksh 15,000.',
+    executeProposeBookingTool: async () => { proposals++; return { depositAmount: 2000 }; },
+    createCompletionWithToolNameGuard: async (params: any) => {
+      completions++;
+      const message = params.messages.some((entry: any) => entry.role === 'tool')
+        ? { role: 'assistant', content: 'A 30% deposit applies: Ksh 4,500. The date is different.' }
+        : { role: 'assistant', content: null, tool_calls: [{ id: 'exact-proposal', type: 'function', function: {
+          name: 'propose_booking', arguments: JSON.stringify({ customerName: 'Wairimu Kamau', service: 'THE BLOOM', date: '2026-10-07', time: '10:00' }),
+        } }] };
+      return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 3 } } };
+    },
+  });
+  const result = await instance.runAgent('exact-proposal', 'Book THE BLOOM on 2026-10-07 at 10:00', [], 'whatsapp');
+  assert.match(result.content, /I can hold THE BLOOM for 2026-10-07 at 10:00/);
+  assert.match(result.content, /deposit is KSH 2000/);
+  assert.doesNotMatch(result.content, /30%|4,500|different/);
+  assert.equal(proposals, 1);
+  assert.equal(completions, 2, 'no corrective completion is allowed for exact tool output');
+  stub(prisma.bookingDraft, 'findUnique', async () => ({ id: 'pending', step: 'awaiting_confirmation', service: 'THE BLOOM', date: '2026-10-07', time: '10:00' }));
+  let confirmations = 0;
+  instance.executeConfirmBookingTool = async () => { confirmations++; return { depositAmount: 2000, service: 'THE BLOOM', date: '2026-10-07', time: '10:00' }; };
+  completions = 0;
+  instance.createCompletionWithToolNameGuard = async (params: any) => {
+    completions++;
+    const message = params.messages.some((entry: any) => entry.role === 'tool')
+      ? { role: 'assistant', content: 'No payment request was sent. A 30% deposit applies.' }
+      : { role: 'assistant', content: null, tool_calls: [{ id: 'exact-confirm', type: 'function', function: { name: 'confirm_booking', arguments: '{}' } }] };
+    return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 3 } } };
+  };
+  const receipt = await instance.runAgent('exact-proposal', 'confirm', [{ role: 'assistant', content: 'The deposit is KSH 2000. Reply yes to confirm.' }], 'whatsapp');
+  assert.match(receipt.content, /initiated a deposit payment request of KSH 2000/);
+  assert.doesNotMatch(receipt.content, /No payment|30%/);
+  assert.equal(confirmations, 1);
+  assert.equal(completions, 2);
+});
 
 test('add-on consent rejects questions and scopes quantities to each explicit choice', async (context) => {
   const originalFind = prisma.customerSessionNote.findFirst;

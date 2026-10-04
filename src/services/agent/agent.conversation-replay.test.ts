@@ -8,6 +8,7 @@ import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { circuitBreaker } from './resilience.service';
 import { AgentService } from './agent.service';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
+import { VERIFIER_CORRECTION_PREFIX } from './output-verifier';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 type Turn = {
@@ -116,6 +117,8 @@ test('Wairimu conversation replay with six-message history and a next-day return
   const instance = new AgentService() as any;
   instance.naturalAssistantMode = true;
   let activeTurn = turns[0];
+  let totalCompletions = 0;
+  const correctionLengths: number[] = [];
   let prompts: string[] = [];
   let exposedTools: string[] = [];
   let toolResults: string[] = [];
@@ -184,6 +187,11 @@ test('Wairimu conversation replay with six-message history and a next-day return
       return { created: true, type: 'special_request' };
     },
     createCompletionWithToolNameGuard: async (params: any) => {
+      totalCompletions++;
+      const finalMessage = params.messages.at(-1);
+      if (finalMessage?.role === 'system' && finalMessage.content.startsWith(VERIFIER_CORRECTION_PREFIX)) {
+        correctionLengths.push(finalMessage.content.length);
+      }
       const systemMessage = params.messages.find((message: any) => message.role === 'system');
       if (systemMessage) prompts.push(systemMessage.content);
       exposedTools.push(...(params.tools || []).map((tool: any) => tool.function.name));
@@ -222,6 +230,11 @@ test('Wairimu conversation replay with six-message history and a next-day return
 
   await context.test('[FIXED IN 8.1a] [STATE] first name is persisted as soon as stated', () => {
     assert.equal(frames[0].draft?.name || frames[0].customer.name, 'Wairimu');
+  });
+  await context.test('[FIXED IN 8.6] [COST + MOCKED CALL] verifier retries once in the twelve-turn replay', () => {
+    assert.equal(correctionLengths.length, 1);
+    assert.ok(correctionLengths[0] < 1600, 'corrective instruction should be compact');
+    console.info('[REPLAY_VERIFIER_COST]', JSON.stringify({ turns: turns.length, correctiveCalls: correctionLengths.length, correctionCharacters: correctionLengths[0], totalMockCompletions: totalCompletions }));
   });
   await context.test('[FIXED IN 8.3] [ROUTING + FAULT INJECTION] catalog request uses DB durations in Rate Card 2026', () => {
     assert.match(frames[1].reply, /Rate Card 2026/);
@@ -290,10 +303,10 @@ test('Wairimu conversation replay with six-message history and a next-day return
     assert.match(frames[9].reply, /team member.*continu|short break/i);
     assert.ok(frames[9].escalations > frames[8].escalations);
   });
-  await context.test('[EXPECTED TO FAIL] [FAULT INJECTION] stale lashes price and retired package wording are blocked', () => {
+  await context.test('[FIXED IN 8.6] [FAULT INJECTION] stale lashes price and retired package wording are blocked', () => {
     assert.doesNotMatch(frames[10].reply, /500|standard makeup package/i);
   });
-  await context.test('[EXPECTED TO FAIL] [FAULT INJECTION] model reply has no leading stray punctuation', () => {
+  await context.test('[FIXED IN 8.6] [FAULT INJECTION] model reply has no leading stray punctuation', () => {
     assert.doesNotMatch(frames[11].reply, /^[\s\u2014\u2013-]+/);
   });
 });

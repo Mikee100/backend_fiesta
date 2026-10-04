@@ -25,6 +25,9 @@ import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
 import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
+import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
+import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
+import { EDITIONS_PENDING_OWNER_CONFIRMATION } from '../../config/constants';
 import {
   buildBespokeReply,
   buildBookingForSomeoneElseReply,
@@ -165,6 +168,7 @@ export class AgentService {
   private readonly naturalAssistantMode = String(process.env.AI_ASSISTANT_NATURAL_MODE || 'false').toLowerCase() === 'true';
   private readonly conversationFlows = new ConversationFlowMatcher();
   private readonly conversationFlowHandler = new ConversationFlowHandler(this.conversationFlows);
+  private readonly shouldEscalateVerifier = createVerifierEscalationLimiter();
 
   private isNaturalAssistantModeEnabled(): boolean {
     return this.naturalAssistantMode;
@@ -1654,6 +1658,8 @@ ${contextString}`;
     // tool call in a single turn - loop until it returns plain text instead of
     // assuming a single round. A hard cap prevents a runaway loop.
     const usage: TokenUsage = { ...extractorUsage };
+    const verifiedToolAmounts = new Set<number>();
+    const verifiedToolDeposits = new Set<number>();
     let toolCalls = 0;
     const MAX_TOOL_ROUNDS = 3;
     const completionParams = {
@@ -1677,6 +1683,7 @@ ${contextString}`;
     let cancelledThisTurn = false;
     let noteSavedThisTurn = false;
     let cancellationReply: string | null = null;
+    let exactProposalReply: string | null = null;
     while (currentResponse.choices[0].message.tool_calls && rounds < MAX_TOOL_ROUNDS) {
       rounds++;
       const responseMessage = currentResponse.choices[0].message;
@@ -1710,7 +1717,9 @@ ${contextString}`;
             else if (functionName === 'propose_booking') {
               const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date, history);
               const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${requestedDate}T${args.time}`);
+              if (Number.isInteger(result.depositAmount) && result.depositAmount > 0) verifiedToolDeposits.add(result.depositAmount);
               proposedThisTurn = true;
+              exactProposalReply = buildBookingProposalConfirmation(args.service, requestedDate, args.time, result.depositAmount);
               toolResponse = `PROPOSED (not yet charged): ${args.service} on ${requestedDate} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "${buildBookingProposalConfirmation(args.service, requestedDate, args.time, result.depositAmount)}" Do NOT call confirm_booking in this same turn.`;
             }
             else if (functionName === 'confirm_booking') {
@@ -1721,8 +1730,10 @@ ${contextString}`;
               } else {
                 const expectedDeposit = this.getDepositAmountFromProposalHistory(history);
                 const result = await this.executeConfirmBookingTool(customerId, initialDraftStep, expectedDeposit);
+                if (Number.isInteger(result.depositAmount) && result.depositAmount > 0) verifiedToolDeposits.add(result.depositAmount);
                 confirmedActionThisTurn = true;
-                toolResponse = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed. This is DONE - do not call any more booking tools this turn.`;
+                exactProposalReply = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed.`;
+                toolResponse = `${exactProposalReply} This is DONE - do not call any more booking tools this turn.`;
               }
             }
             else if (functionName === 'propose_reschedule') {
@@ -1742,6 +1753,7 @@ ${contextString}`;
                 const policyNotice = this.isRescheduleWithin72Hours(result.oldDateTime)
                   ? `${this.getReschedulePolicyMessage()} `
                   : '';
+                exactProposalReply = `${policyNotice}${buildRescheduleProposalConfirmation(args.service, args.newDate, args.newTime)}`;
                 toolResponse = `${policyNotice}PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "${buildRescheduleProposalConfirmation(result.service, args.newDate, args.newTime)}" Do NOT call confirm_reschedule in this same turn.`;
               }
             }
@@ -1751,6 +1763,7 @@ ${contextString}`;
               } else {
                 const result = await this.executeConfirmRescheduleTool(customerId, initialDraftStep);
                 rescheduleAppliedThisTurn = true;
+                exactProposalReply = customerReplyTemplates.rescheduleConfirmed(result.service, inBusinessTimezone(result.newDateTime).format('dddd, MMMM D, YYYY [at] h:mm A'), result.depositForfeited);
                 await this.notifyRescheduleAdmin({
                   customerId,
                   event: 'confirmed',
@@ -1842,6 +1855,9 @@ ${contextString}`;
             tool_call_id: toolCall.id,
             content: toolResponse
           });
+          if (!/^(?:ERROR|INFO):/.test(toolResponse) && ['propose_booking', 'confirm_booking', 'propose_reschedule', 'confirm_reschedule', 'cancel_booking'].includes(functionName)) {
+            for (const amount of currencyAmounts(toolResponse)) verifiedToolAmounts.add(amount);
+          }
         }
       }
 
@@ -1871,19 +1887,7 @@ ${contextString}`;
       }
     }
     const modelContent = currentResponse.choices[0].message.content?.trim() || '';
-    const emptyResponse = modelContent.length === 0 && !calendarReply;
-    console.info('[AGENT_USAGE]', JSON.stringify({
-      customerRef: this.customerReference(customerId),
-      model: CHAT_MODEL,
-      completionCalls: usage.completionCalls,
-      toolCalls,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      totalTokens: usage.totalTokens,
-      latencyMs: Date.now() - modelRunStartedAt,
-      rateLimited: false,
-      failureType: emptyResponse ? 'empty_model_response' : null,
-    }));
+    const emptyResponse = modelContent.length === 0 && !calendarReply && !exactProposalReply && !cancellationReply;
 
     const unverifiedActionReply = this.getUnverifiedActionReply(modelContent, {
       rescheduled: rescheduleAppliedThisTurn,
@@ -1894,19 +1898,91 @@ ${contextString}`;
       console.warn('[AGENT_FLOW] Blocked unverified action claim:', JSON.stringify({ customerRef: this.customerReference(customerId), reply: modelContent.slice(0, 200) }));
     }
 
-    const safeModelContent = cancellationReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
+    const codeOwnedReply = cancellationReply || exactProposalReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
       ? unverifiedActionReply
       : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
       && !rescheduleAppliedThisTurn
       ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
-      : this.formatCustomerReply(modelContent, userMessage, history));
+      : null);
+    let safeModelContent = codeOwnedReply || this.formatCustomerReply(modelContent, userMessage, history);
+    let verifierBlocked = false;
+    let verifierRetries = 0;
+    let correctionChars = 0;
+    if (!codeOwnedReply && !emptyResponse) {
+      const facts: VerifierFacts = {
+        amounts: [...new Set([...ADDON_CATALOG.filter((addon) => addon.unitPrice > 0).map((addon) => addon.unitPrice), ...verifiedToolAmounts])],
+        deposits: [...verifiedToolDeposits], editions: [], customerMessage: userMessage, packagePrices: [],
+      };
+      if (currencyAmounts(safeModelContent).length
+        || depositAmounts(safeModelContent).length
+        || /\bdeposit\b/i.test(safeModelContent) && /%|\bpercent(?:age)?\b|\bper\s+cent\b/i.test(safeModelContent)
+        || /\b(?:bloom|muse|icon|legend|queen|empress|goddess)\b/i.test(safeModelContent) && /\b(?:hours?|hrs?)\b/i.test(safeModelContent)) {
+        try {
+          const rows = await prisma.package.findMany({ select: { name: true, price: true, deposit: true, duration: true } });
+          facts.editions = rows.filter((row) => !EDITIONS_PENDING_OWNER_CONFIRMATION.includes(row.name)
+            && (!SEED_EDITION_INCLUSIONS[row.name] || SEED_EDITION_INCLUSIONS[row.name].duration === row.duration))
+            .map((row) => ({ name: row.name, duration: row.duration }));
+          const amounts = [...facts.amounts];
+          facts.packagePrices = rows.filter((row) => Number.isInteger(row.price) && row.price > 0).map((row) => ({ name: row.name, price: row.price }));
+          const deposits: number[] = [...verifiedToolDeposits];
+          for (const row of rows) {
+            if (Number.isInteger(row.price) && row.price > 0) amounts.push(row.price);
+            try { const deposit = this.getDepositForPackage(row); deposits.push(deposit); amounts.push(deposit); } catch {}
+          }
+          facts.amounts = [...new Set(amounts)];
+          facts.deposits = [...new Set(deposits)];
+        } catch {
+          console.warn('[AGENT_FLOW] Verifier catalog facts unavailable; unverified financial claims will be withheld.');
+        }
+      }
+      const verified = await verifyWithOneRetry(safeModelContent, facts, async (reasons) => {
+        verifierRetries++;
+        const correctionText = verifierCorrectionMessage(reasons, facts, modelContent);
+        correctionChars = correctionText.length;
+        console.info(`[AGENT_FLOW] verifier=retry correction_chars=${correctionChars}`);
+        const correction = await this.createCompletionWithToolNameGuard({
+          model: CHAT_MODEL, temperature: 0.3, max_completion_tokens: MAX_AGENT_COMPLETION_TOKENS,
+          messages: [...messages, { role: 'assistant', content: modelContent }, {
+            role: 'system', content: correctionText,
+          }],
+        }, [], [], completion.provider);
+        addUsage(usage, usageFromCompletion(correction.response, correction.completionCalls));
+        const message = correction.response.choices[0].message;
+        if (message.tool_calls?.length) throw new Error('Verifier correction must not call tools.');
+        const reply = message.content?.trim() || '';
+        if (this.getUnverifiedActionReply(reply, { rescheduled: rescheduleAppliedThisTurn, cancelled: cancelledThisTurn, noteSaved: noteSavedThisTurn })
+          || this.isUnverifiedBookingConfirmation(reply, userMessage, history) && !rescheduleAppliedThisTurn) {
+          throw new Error('Verifier correction claimed an unverified action.');
+        }
+        return this.formatCustomerReply(reply, userMessage, history);
+      }, async (text, reasons) => {
+        if (!this.shouldEscalateVerifier(customerId)) {
+          console.info('[AGENT_FLOW] verifier=escalation_suppressed');
+          return;
+        }
+        await this.escalate(customerId, 'booking', JSON.stringify({
+          event: 'output_verifier_blocked', reasons, customerMessage: userMessage.slice(0, 2000), offendingText: JSON.parse(text),
+        }));
+      });
+      safeModelContent = verified.reply;
+      verifierBlocked = verified.blocked;
+    }
+    console.info('[AGENT_USAGE]', JSON.stringify({
+      customerRef: this.customerReference(customerId), model: CHAT_MODEL,
+      completionCalls: usage.completionCalls, toolCalls,
+      verifierChecked: !codeOwnedReply && !emptyResponse,
+      verifierRetries, correctionChars,
+      inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens,
+      latencyMs: Date.now() - modelRunStartedAt, rateLimited: false,
+      failureType: verifierBlocked ? 'output_verifier_failed' : emptyResponse ? 'empty_model_response' : null,
+    }));
 
     return {
       content: emptyResponse
         ? 'Sorry, I lost the thread there. Could you tell me a little more about what you need?'
         : safeModelContent,
       tokensUsed: usage.totalTokens,
-      ...(emptyResponse ? { failureType: 'empty_model_response' } : {}),
+      ...(verifierBlocked ? { failureType: 'output_verifier_failed' } : emptyResponse ? { failureType: 'empty_model_response' } : {}),
     };
   }
 
