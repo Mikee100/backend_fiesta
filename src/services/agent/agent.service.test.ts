@@ -143,7 +143,7 @@ test('does not route invalid Groq credentials to Gemini', async () => {
   }
 });
 
-test('keeps all policy identifiers while omitting unrelated price tables', async () => {
+test('keeps hard policy identifiers while replacing redundant voice rules and omitting unrelated price tables', async () => {
   const originalPackageFindMany = prisma.package.findMany;
   (prisma.package.findMany as any) = async () => [
     { name: 'THE BLOOM', price: 15555 },
@@ -159,7 +159,10 @@ test('keeps all policy identifiers while omitting unrelated price tables', async
     const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
     const fallbackPricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 29);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-C]\d+[a-z]?\./g) || []).length, 20);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 25);
+    assert.match(fullPrompt, /BRAND:.*Luxury, Safety, Convenience and Comfort/);
+    assert.match(fullPrompt, /VOICE:.*never photoshoot/);
     assert.match(fullPrompt, /THE BLOOM: Ksh 15,555/);
     assert.doesNotMatch(fullPrompt, /THE BLOOM: Ksh 15,000/);
     assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
@@ -716,7 +719,7 @@ test('does not claim payment was received without a successful payment record', 
 
   try {
     const unpaidStatusReply = await agent.getBookingStatusReply('customer-123');
-    assert.match(unpaidStatusReply || '', /session is confirmed/i);
+    assert.match(unpaidStatusReply || '', /session for the Icon edition is confirmed/i);
     assert.match(unpaidStatusReply || '', /can't verify a successful payment/i);
     assert.doesNotMatch(unpaidStatusReply || '', /payment is received/i);
 
@@ -1019,9 +1022,11 @@ test('static reply builders remain paired with their request matchers', async ()
   const originalGetPackageForDeposit = agent.getPackageForDeposit;
   const originalGetDepositForPackage = agent.getDepositForPackage;
   const originalStudioInfoFindFirst = prisma.studioInfo.findFirst;
+  const originalPackageFindMany = prisma.package.findMany;
   agent.getPackageForDeposit = async () => null;
   agent.getDepositForPackage = () => null;
   (prisma.studioInfo.findFirst as any) = async () => null;
+  (prisma.package.findMany as any) = async () => [];
 
   try {
     const bookingProcessReply = await agent.getBookingProcessReply();
@@ -1042,7 +1047,7 @@ test('static reply builders remain paired with their request matchers', async ()
       assert.equal(pair.matches(pair.message), true, pair.message);
       assert.ok(pair.reply.length > 0, pair.message);
     }
-    assert.match(buildBusinessIntroductionReply(), /boutique luxury photography studio/);
+    assert.equal(buildBusinessIntroductionReply(), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
     assert.match(buildContactDetailsReply(), /Parklands, Nairobi/);
     assert.match(buildWebsiteReply(), /fiestahousematernity\.com/);
     assert.match(buildPortfolioReply(), /portfolio/);
@@ -1052,6 +1057,7 @@ test('static reply builders remain paired with their request matchers', async ()
     agent.getPackageForDeposit = originalGetPackageForDeposit;
     agent.getDepositForPackage = originalGetDepositForPackage;
     prisma.studioInfo.findFirst = originalStudioInfoFindFirst;
+    prisma.package.findMany = originalPackageFindMany;
   }
 });
 

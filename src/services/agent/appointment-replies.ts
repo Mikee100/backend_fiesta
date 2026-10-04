@@ -4,6 +4,8 @@ import { DEFAULT_DURATION } from '../../config/constants';
 import { inBusinessTimezone } from '../../utils/time';
 import { customerReplyTemplates } from '../messaging/customer-reply.templates';
 import { isBookingProcessRequest, isPostShootProcessRequest } from './replies';
+import { editionInText } from './reply-voice';
+import { BOOKING_WELCOME_CLOSING } from './constants';
 
 type ConversationMessage = { role: 'user' | 'assistant'; content: string };
 
@@ -165,9 +167,9 @@ export async function getBookingStatusReply(customerId: string): Promise<string 
       orderBy: { updatedAt: 'desc' },
     });
     const receiptNote = successfulPayment?.mpesaReceipt ? ` (M-Pesa receipt: ${successfulPayment.mpesaReceipt})` : '';
-    const sessionDetails = `Your ${upcomingConfirmed.service} session is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
+    const sessionDetails = `Your session for ${editionInText(upcomingConfirmed.service)} is confirmed for ${inBusinessTimezone(upcomingConfirmed.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}.`;
     return successfulPayment
-      ? `Your payment is received and confirmed${receiptNote}. ${sessionDetails}`
+      ? `Your payment is received and confirmed${receiptNote}. ${sessionDetails} ${BOOKING_WELCOME_CLOSING}`
       : `${sessionDetails} I can't verify a successful payment from the records I can see; the studio team can confirm the payment status.`;
   }
 

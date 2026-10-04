@@ -12,6 +12,7 @@ import {
 import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
 import { addonInquiryReply, addonRecipient, addonSelectionClarification } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
+import { needsUnchangedReassurance } from './reply-voice';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -280,12 +281,12 @@ export function createMessageRoutes(
           }
         }
         if (choices.length === 1 && saved.length === 1) {
-          return this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]));
+          return this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]), needsUnchangedReassurance(userMessage));
         }
         return [saved.length ? `${ADDON_NOTED_PREFIX} ${saved.join('; ')}.` : '',
           existing.length ? `Already recorded: ${existing.join('; ')}. I have not added these twice.` : '',
           failed.length ? `Not saved: ${failed.join('; ')}. The team can help confirm these.` : '',
-          `${ADDON_BALANCE_REPLY} ${ADDON_UNCHANGED_REPLY}`].filter(Boolean).join('\n');
+          `${ADDON_BALANCE_REPLY}${needsUnchangedReassurance(userMessage) ? ` ${ADDON_UNCHANGED_REPLY}` : ''}`].filter(Boolean).join('\n');
       },
     },
     {

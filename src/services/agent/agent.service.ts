@@ -26,6 +26,9 @@ import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStat
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
+import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
+import { editionInText, repeatedCollectionQuestion } from './reply-voice';
+import { enforceSlogan } from './slogan-guard';
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { EDITIONS_PENDING_OWNER_CONFIRMATION } from '../../config/constants';
@@ -810,14 +813,14 @@ export class AgentService {
     return addonQuantity(userMessage, addon);
   }
 
-  private getAddonSelectionReply(addon: AddonCatalogItem, quantity = 1): string {
+  private getAddonSelectionReply(addon: AddonCatalogItem, quantity = 1, unchangedRequested = false): string {
     const price = addon.unitPrice > 0
       ? quantity > 1
         ? `${quantity} x Ksh ${addon.unitPrice.toLocaleString()} = Ksh ${(addon.unitPrice * quantity).toLocaleString()}`
         : `Ksh ${addon.unitPrice.toLocaleString()}${addon.quantityFromNote ? ' each' : ''}`
       : ADDON_QUOTED_PRICE_LABEL;
     const label = quantity > 1 ? `${quantity} x ${addon.name}` : addon.name;
-    return `${ADDON_NOTED_PREFIX} ${label} (${price}). It will be added to the session balance, not the deposit. ${ADDON_UNCHANGED_REPLY} What would you like to confirm next?`;
+    return `${ADDON_NOTED_PREFIX} ${label} (${price}). It will be added to the session balance, not the deposit.${unchangedRequested ? ` ${ADDON_UNCHANGED_REPLY}` : ''}`;
   }
 
   private shouldUseBespokeReply(userMessage: string): boolean {
@@ -849,7 +852,8 @@ export class AgentService {
     }
 
     if (/\b(couple|partner|husband|wife|children|kids|family)\b/.test(text) && /\b(session|shoot|join|include|come|attend)\b/.test(text)) {
-      return 'Your partner and children are welcome to join your maternity session. We will guide poses that include everyone beautifully.';
+      const companion = /\bhusband\b/.test(text) ? 'Your husband is' : /\bpartner\b/.test(text) ? 'Your partner is' : 'Your partner and children are';
+      return `${companion} very welcome to join your maternity session. We'll guide poses that include everyone.`;
     }
 
     if (/(late\s+night|late-night|evening)/.test(text) && /\b(sessions?|shoot|booking|open|slot)\b/.test(text)) {
@@ -1326,20 +1330,18 @@ B5. SESSION NOTES - USE JUDGEMENT ON WHAT'S WORTH SAVING: use 'add_session_note'
 
 [C] BUSINESS KNOWLEDGE (answer from this, then tool results, then escalate)
 C1. INFORMATION PRIORITY ORDER: answer customer questions using, in this order: (1) the Business Context provided above, (2) the customer's own Upcoming/Past Booking or payment context provided above, (3) results actually returned by a tool call this turn. If none of these answer the question, follow C2. Never invent facts, prices, or policies that aren't present in one of these three sources.
-C2. If none of the above answers their question, politely let them know you'll have a human team member follow up.
+C2. If none of the above answers their question, do not guess. Say: "${UNKNOWN_ANSWER_REPLY}"
 C3. RATE CARD 2026 & ACTIVE OFFERINGS: ${packagePricing} Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked about current offerings, describe THE EDITIONS; additions include extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture Set, and Reels; Bespoke Experiences; or Concierge Services for Travelling Mothers. Never present legacy names as current packages or use "standard" generically for the lineup.
 C3b. ADD-ON PRICES: These are the only exact prices to quote: ${addonPricing} When asked what add-ons are available, list their prices accurately; never invent a price or say a fixed-price item "varies". Add-ons are settled with the balance, not the deposit.
 C4. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
 C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"
 
 [D] CONVERSATION STYLE
-D1. IDENTITY & NAME HANDLING: Greet clients warmly by name whenever known. If the Customer Name is "Unknown" or "WhatsApp User", ask for their name with genuine hospitality (e.g. "By the way, what name should I put down for you?"), and address them naturally once provided. You MUST have their real name before proposing any booking - never invent or reuse a placeholder name.
-D2. VOICE: Be warm, gracious, capable, and attentive—like a dedicated personal concierge at a luxury photography studio. Maternity and newborn milestones are celebratory life events; share their excitement and speak with genuine care and reassurance.
-D3. CONTEXT & VARIATION: Read recent turns, resolve references, acknowledge repeats, and vary phrasing. Avoid robotic canned openers, parroting, narration, repeated wording, and rigid menus. Speak consultatively—highlighting what makes each session special (styling from our gown closet, professional hair & makeup, partner joining).
+${BRAND_RULES}
+${VOICE_RULES}
 D4. FORMAT: Use plain WhatsApp text that is easy and inviting to read on mobile, typically 2 to 4 comfortable sentences. Use a list only when specifically requested or genuinely clearer; never dump irrelevant context fields.
 D4b. EDITION COMPARISONS: When comparing two or more editions, never use a markdown table or a wide side-by-side grid. Use a short heading, then one compact block per edition with the price and only the most decision-useful facts (studio time, edited photos, outfits, and notable inclusions). Follow with 1 to 3 plain-language "The difference" bullets and a gentle recommendation question. State each edition's actual inclusions independently; never write that one edition has the "same" extras as another unless that is explicitly verified in Business Context. Keep the comparison easy to scan on a phone and under 650 characters when possible.
 D5. LENGTH: Aim for concise, well-paced replies (under 800 characters) that provide helpful substance without overwhelming the customer or sounding like an abrupt robot.
-D6. OWN ERRORS: Correct previous incorrect guidance plainly and briefly with polite grace; do not defend or repeat it.
 D7. BUSINESS INTRODUCTION EXAMPLE: Describe Fiesta House as a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family sessions. Mention our curated client gown closet, professional hair & makeup pampering, and relaxed posing guidance naturally rather than giving a brochure. Use only facts in Business Context.
 D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step invitation or question (e.g. offering to check open dates or reserve a slot). Keep it genuine and caring rather than aggressive, and skip it once a booking, reschedule, or cancellation is confirmed.`;
   }
@@ -1448,7 +1450,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
       }
       const requestedTime = statedSlots.time || currentSlots?.time;
       calendarReply = requestedTime && result.includes(requestedTime)
-        ? `${label}. ${requestedTime} is available for ${service}. Would you like me to prepare a booking proposal?`
+        ? `${label}. ${requestedTime} is available for ${editionInText(service)}. Would you like to go ahead with that time?`
         : result.length
           ? `${label}. Available slots for ${service}: ${result.join(', ')}. Which time would work for you?`
           : `${label}. No slots are available for ${service}. Which other date would work for you?`;
@@ -1899,12 +1901,14 @@ ${contextString}`;
       console.warn('[AGENT_FLOW] Blocked unverified action claim:', JSON.stringify({ customerRef: this.customerReference(customerId), reply: modelContent.slice(0, 200) }));
     }
 
+    const repeatedQuestionReply = !proposedThisTurn && !confirmedActionThisTurn
+      ? repeatedCollectionQuestion(modelContent, currentSlots, customer?.name, userMessage) : null;
     const codeOwnedReply = cancellationReply || exactProposalReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
       ? unverifiedActionReply
       : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
       && !rescheduleAppliedThisTurn
       ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
-      : null);
+      : null) || repeatedQuestionReply;
     let safeModelContent = codeOwnedReply || this.formatCustomerReply(modelContent, userMessage, history);
     let verifierBlocked = false;
     let verifierRetries = 0;
@@ -1968,6 +1972,7 @@ ${contextString}`;
       safeModelContent = verified.reply;
       verifierBlocked = verified.blocked;
     }
+    safeModelContent = await enforceSlogan(customerId, platform, safeModelContent, history);
     console.info('[AGENT_USAGE]', JSON.stringify({
       customerRef: this.customerReference(customerId), model: CHAT_MODEL,
       completionCalls: usage.completionCalls, toolCalls,

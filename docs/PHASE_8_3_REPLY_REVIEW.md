@@ -18,8 +18,8 @@ Here is how booking works:
 4. We check availability; a Ksh 2,000 deposit secures your slot.
 5. Once you confirm the proposal, we send the M-Pesa prompt. Your booking is confirmed after the deposit is received.
 6. Come for your session at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi.
-7. Pay the remaining balance after the shoot by M-Pesa or cash.
-Edited photos are ready 10 working days after the shoot and shared through a secure download link.
+7. Pay the remaining balance after your session by M-Pesa or cash.
+Edited photos are ready 10 working days after your session and shared through a secure download link.
 
 Would you like to check available dates?
 ```

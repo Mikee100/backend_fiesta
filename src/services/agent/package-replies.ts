@@ -6,6 +6,7 @@ import { EDITION_CATALOG_HEADER, EDITION_CATALOG_INTRO, EDITION_CATALOG_FOLLOW_U
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { inBusinessTimezone } from '../../utils/time';
 import { getDepositForPackage, getPackageForDeposit } from './booking-tools';
+import { editionInText } from './reply-voice';
 
 export function buildPackageCard(pkg: {
   name: string;
@@ -185,7 +186,10 @@ export async function getPackageSelectionReply(customerId: string, userMessage: 
     return `${selectedPackage.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
   }
 
-  return `${selectedPackage.name} is a lovely choice. What date are you considering? Once you have a day in mind, I can check the available times for you.`;
+  if (draft?.step && !['collecting_slots', 'service'].includes(draft.step)) return null;
+  if (!draft?.date) return `You've chosen ${editionInText(selectedPackage.name)}. What date would suit you?`;
+  if (!draft.time) return `You've chosen ${editionInText(selectedPackage.name)}. What time would suit you?`;
+  return `Your details for ${editionInText(selectedPackage.name)} are noted. Would you like to go ahead?`;
 }
 
 export async function getSameBookingSlotReply(

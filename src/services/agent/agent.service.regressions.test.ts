@@ -22,10 +22,161 @@ import { buildAdditionsReply, isAddonListFollowUp } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
 import { DAILY_TOKEN_CAP } from './resilience.service';
 import { BUDGET_HANDOFF_REPLY } from './constants';
+import { BRAND_RULES, BRAND_SLOGAN, VOICE_RULES } from './constants';
+import { buildBookingProposalConfirmation, previousMessageRequestsConfirmation, buildPostShootProcessReply, isPostShootProcessRequest } from './replies';
+import { editionInText, repeatedCollectionQuestion } from './reply-voice';
+import { containsSlogan, enforceSlogan, normalizeSlogan } from './slogan-guard';
 import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('brand and voice replace redundant rules while retaining the complete client brief', () => {
+  const instance = new AgentService() as any;
+  const prompt = instance.getSystemPrompt('', 'whatsapp', false, false);
+  assert.ok(prompt.includes(BRAND_RULES));
+  assert.ok(prompt.includes(VOICE_RULES));
+  for (const pillar of ['Luxury', 'Safety', 'Convenience', 'Comfort']) assert.ok(BRAND_RULES.includes(pillar));
+  assert.match(BRAND_RULES, /all-women, professionally trained.*relevant AND verified/);
+  assert.ok(BRAND_RULES.includes(BRAND_SLOGAN));
+  assert.match(BRAND_RULES, /at most once per conversation.*greeting or closing.*never in a price, policy or booking/);
+  assert.match(VOICE_RULES, /never photoshoot.*glow.*hashtags.*emojis unless/);
+  assert.doesNotMatch(prompt, /D1\. IDENTITY|D2\. VOICE|D3\. CONTEXT|D6\. OWN ERRORS/);
+});
+
+test('reworded replies preserve confirmation and add-on matchers', () => {
+  const proposal = buildBookingProposalConfirmation('THE BLOOM', '2026-10-06', '10:00', 2000);
+  assert.match(proposal, /the Bloom edition.*Tuesday, 6 October 2026/);
+  assert.match(proposal, /deposit is Ksh 2,000/);
+  assert.match(proposal, /confirmed once the deposit is received/);
+  assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: proposal }]), true);
+  assert.equal(editionInText('THE ICON'), 'the Icon edition');
+  assert.match(buildPostShootProcessReply(), /^After your session:/);
+  for (const message of ['What happens after the shoot?', 'What happens after your session?']) assert.equal(isPostShootProcessRequest(message), true);
+  const draft = { step: 'collecting_slots', name: 'Wairimu', service: 'THE BLOOM', date: '2026-10-06', time: '10:00' };
+  assert.equal(repeatedCollectionQuestion('What is your name and which package would you like?', draft), 'Your session details are noted. Would you like to go ahead?');
+  assert.equal(repeatedCollectionQuestion('Which package?', { ...draft, date: null }), 'What date would suit you?');
+  assert.equal(repeatedCollectionQuestion('Which package?', { ...draft, step: 'awaiting_confirmation' }), null);
+});
+
+test('warm booking closing requires both a confirmed booking and successful payment', async (context) => {
+  const originals = { booking: prisma.booking.findFirst, payment: prisma.payment.findFirst };
+  context.after(() => { prisma.booking.findFirst = originals.booking; prisma.payment.findFirst = originals.payment; });
+  (prisma.booking.findFirst as any) = async () => ({ id: 'confirmed', service: 'THE BLOOM', dateTime: new Date('2026-10-06T07:00:00Z') });
+  let paid: any = null;
+  (prisma.payment.findFirst as any) = async () => paid;
+  const unpaid = await agent.getBookingStatusReply('warm-closing');
+  assert.doesNotMatch(unpaid, /looking forward|payment is received/);
+  paid = { status: 'success', amount: 2000, mpesaReceipt: 'TEST-ONLY' };
+  const confirmed = await agent.getBookingStatusReply('warm-closing');
+  assert.match(confirmed, /the Bloom edition.*Tuesday, October 6, 2026/);
+  assert.match(confirmed, /looking forward to welcoming you/);
+  assert.doesNotMatch(confirmed, /THE BLOOM/);
+});
+
+test('real voice guard asks only missing collection details and leaves protected drafts unchanged', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  let draft: any = { step: 'collecting_slots', name: 'Wairimu', service: 'THE BLOOM', date: null, time: null, createdAt: new Date() };
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Wairimu', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => draft);
+  stub(prisma.booking, 'findFirst', async () => null);
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  const instance = withQuietAgent({ naturalAssistantMode: true, runAgent: (AgentService.prototype as any).runAgent,
+    createCompletionWithToolNameGuard: async () => ({ provider: 'groq', completionCalls: 1, response: {
+      choices: [{ message: { role: 'assistant', content: 'What is your name and which package would you like?' } }], usage: { total_tokens: 1 },
+    } }),
+  });
+  assert.equal(await instance.handleMessage('voice-guard', 'I am back. What details are still missing?', [], 'whatsapp'), 'What date would suit you?');
+  draft.date = '2026-10-06';
+  assert.equal(await instance.handleMessage('voice-guard', 'I am back. What details are still missing?', [], 'whatsapp'), 'What time would suit you?');
+  draft.time = '10:00';
+  assert.equal(await instance.handleMessage('voice-guard', 'I am back. What details are still missing?', [], 'whatsapp'), 'Your session details are noted. Would you like to go ahead?');
+  for (const step of ['awaiting_confirmation', 'payment_pending', 'reschedule_confirm', 'cancel_confirm']) {
+    draft = { ...draft, step };
+    const before = { ...draft };
+    await instance.runAgent('voice-guard', 'I am back.', [], 'whatsapp');
+    assert.deepEqual(draft, before);
+  }
+});
+
+test('slogan guard survives trimmed history and restart with an atomic persisted claim', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  const flags = new Set<string>();
+  let session: any = { sessionId: 'first-session', startedAt: new Date() };
+  stub(prisma.unifiedConversation, 'findFirst', async () => session);
+  stub(prisma.message, 'findFirst', async () => null);
+  stub(prisma.customerMemory, 'upsert', async () => ({}));
+  stub(prisma.customerMemory, 'updateMany', async ({ where, data }: any) => {
+    const marker = where.NOT.keyInsights.has;
+    assert.equal(data.keyInsights.push, marker);
+    const recordKey = `${where.customerId}:${marker}`;
+    if (flags.has(recordKey)) return { count: 0 };
+    flags.add(recordKey); return { count: 1 };
+  });
+  const raw = `Welcome to Fiesta House Maternity. "${BRAND_SLOGAN}";`;
+  const first = await enforceSlogan('slogan-customer', 'web', raw, []);
+  assert.equal(first, `Welcome to Fiesta House Maternity. ${BRAND_SLOGAN}`);
+  assert.equal(containsSlogan(await enforceSlogan('slogan-customer', 'web', raw, [])), false);
+  session = { sessionId: 'second-session', startedAt: new Date() };
+  const simultaneous = await Promise.all([enforceSlogan('slogan-customer', 'web', raw, []), enforceSlogan('slogan-customer', 'web', raw, [])]);
+  assert.equal(simultaneous.filter(containsSlogan).length, 1);
+  const flagsBeforeRestricted = flags.size;
+  for (const statement of ['The price is Ksh 15,000.', 'The deposit is Ksh 2,000.', 'Tuesday, 6 October is available.', 'See you in October.', 'Our policy is ten working days.', 'The booking is confirmed.', 'Your husband is welcome; we guide poses.']) {
+    const reply = await enforceSlogan('slogan-customer', 'web', `Welcome. ${statement} ${BRAND_SLOGAN}`, []);
+    assert.equal(containsSlogan(reply), false, statement);
+    assert.ok(reply.includes(statement));
+  }
+  assert.equal(flags.size, flagsBeforeRestricted);
+  assert.equal(normalizeSlogan(`Hello. "${BRAND_SLOGAN}";`), `Hello. ${BRAND_SLOGAN}`);
+  assert.equal(normalizeSlogan(`Hello. ${BRAND_SLOGAN},!`), `Hello. ${BRAND_SLOGAN}`);
+  assert.equal(normalizeSlogan('Hello. "Where  Every Mother Becomes Iconic.";'), `Hello. ${BRAND_SLOGAN}`);
+  session = null;
+  assert.equal(containsSlogan(await enforceSlogan('thread-customer', 'web', raw, [])), true);
+  assert.equal(containsSlogan(await enforceSlogan('thread-customer', 'web', raw, [])), false);
+  stub(prisma.message, 'findFirst', async () => ({ id: 'old-outbound-slogan' }));
+  assert.equal(containsSlogan(await enforceSlogan('legacy-customer', 'whatsapp', raw, [])), false);
+  stub(prisma.unifiedConversation, 'findFirst', async () => { throw new Error('storage unavailable'); });
+  assert.equal(containsSlogan(await enforceSlogan('failed-customer', 'web', raw, [])), false);
+});
+
+test('final agent output normalizes and durably suppresses repeated slogans after history trimming', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Unknown', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  stub(prisma.unifiedConversation, 'findFirst', async () => ({ sessionId: 'durable', startedAt: new Date() }));
+  stub(prisma.message, 'findFirst', async () => null);
+  stub(prisma.customerMemory, 'upsert', async () => ({}));
+  let claimed = false;
+  stub(prisma.customerMemory, 'updateMany', async () => { if (claimed) return { count: 0 }; claimed = true; return { count: 1 }; });
+  const instance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent,
+    createCompletionWithToolNameGuard: async () => ({ provider: 'groq', completionCalls: 1, response: {
+      choices: [{ message: { role: 'assistant', content: `Welcome to Fiesta House Maternity. "${BRAND_SLOGAN}";` } }], usage: { total_tokens: 1 },
+    } }),
+  });
+  assert.equal((await instance.runAgent('durable-slogan', 'Hello', [], 'web')).content, `Welcome to Fiesta House Maternity. ${BRAND_SLOGAN}`);
+  const restartedInstance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent, createCompletionWithToolNameGuard: instance.createCompletionWithToolNameGuard });
+  const trimmed = [{ role: 'user' as const, content: 'Hello again' }, { role: 'assistant' as const, content: 'How can I help?' }];
+  assert.equal(containsSlogan((await restartedInstance.runAgent('durable-slogan', 'Hello', trimmed, 'web')).content), false);
+});
+
+test('correcting guidance does not ask to reconfirm completed work', () => {
+  assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: 'Correction: the team will confirm that fee. Your completed booking is unchanged.' }]), false);
+});
 
 test('plain information keeps tool schemas off while action/date turns expose them', () => {
   const instance = new AgentService() as any;
@@ -259,8 +410,9 @@ test('canned replies and exact tool proposals bypass verification and cannot be 
     },
   });
   const result = await instance.runAgent('exact-proposal', 'Book THE BLOOM on 2026-10-07 at 10:00', [], 'whatsapp');
-  assert.match(result.content, /I can hold THE BLOOM for 2026-10-07 at 10:00/);
-  assert.match(result.content, /deposit is KSH 2000/);
+  assert.match(result.content, /details for the Bloom edition.*Wednesday, 7 October 2026 at 10:00/);
+  assert.match(result.content, /deposit is Ksh 2,000/);
+  assert.match(result.content, /confirmed once the deposit is received/);
   assert.doesNotMatch(result.content, /30%|4,500|different/);
   assert.equal(proposals, 1);
   assert.equal(completions, 2, 'no corrective completion is allowed for exact tool output');
@@ -338,6 +490,13 @@ test('real add-on dispatch saves multiple explicit choices and never saves the w
   assert.match(reply, /makeup/i);
   assert.match(reply, /outfit/i);
   assert.match(reply, /balance, not the deposit/);
+  assert.doesNotMatch(reply, /I have not changed|confirm next/);
+  const single = instance.getAddonSelectionReply(ADDON_CATALOG.find((item: any) => item.sku === 'extra_outfit'));
+  assert.doesNotMatch(single, /I have not changed/);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: single }]), true);
+  const reassured = instance.getAddonSelectionReply(ADDON_CATALOG.find((item: any) => item.sku === 'extra_outfit'), 1, true);
+  assert.match(reassured, /I have not changed your edition or date/);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reassured }]), true);
   const before = notes.length;
   const hypothetical = await instance.handleMessage('addon-customer', 'What if I want to hire a wig from you?', [], 'whatsapp');
   assert.match(hypothetical, /Would you like to add/);

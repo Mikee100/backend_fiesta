@@ -1,5 +1,7 @@
 import { ADDON_CATALOG } from '../../config/constants';
 import { OFFICIAL_WEBSITE_URLS, ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER, ADDON_QUOTED_PRICE_LABEL } from './constants';
+import { businessDay } from '../../utils/time';
+import { editionInText } from './reply-voice';
 export { isBookingProcessRequest } from './booking-process-reply';
 
 export function buildAdditionsReply(deposit: number | null): string {
@@ -47,11 +49,11 @@ export function isAddonListFollowUp(
 }
 
 export function buildBookingProposalConfirmation(service: string, date: string, time: string, deposit: number): string {
-  return `Great, I can hold ${service} for ${date} at ${time}. The deposit is KSH ${deposit}. If that works for you, just reply yes and I'll send the M-Pesa prompt.`;
+  return `Your details for ${editionInText(service)} are ready for ${businessDay(date).format('dddd, D MMMM YYYY')} at ${time}. The deposit is Ksh ${deposit.toLocaleString()}. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.`;
 }
 
 export function buildRescheduleProposalConfirmation(service: string, date: string, time: string): string {
-  return `Great, I can move your ${service} session to ${date} at ${time}. If that works for you, just reply yes and I'll confirm it.`;
+  return `I can move your session for ${editionInText(service)} to ${businessDay(date).format('dddd, D MMMM YYYY')} at ${time}. If that works for you, reply yes and I'll confirm it.`;
 }
 
 export function buildTimeOnlyRescheduleProposal(service: string, date: string, time: string): string {
@@ -97,17 +99,17 @@ export function buildMixedIntentClarificationReply(): string {
 }
 
 export function buildBusinessIntroductionReply(): string {
-  return 'Welcome to Fiesta House! We are a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family portraiture. We take care of everything—from our curated client gown closet and professional hair & makeup to gentle posing guidance so you feel relaxed and radiant in front of the camera. What kind of photoshoot are you planning?';
+  return 'Welcome to Fiesta House Maternity. What kind of session are you planning?';
 }
 
 export function isPostShootProcessRequest(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
-  return /(after\s+the\s+shoot|what\s+happens\s+after\s+the\s+shoot|post\s*shoot\s*process|after\s+session|after\s+my\s+shoot)/.test(text);
+  return /(after\s+(?:(?:the|my|your)\s+)?(?:shoot|session)|post\s*(?:shoot|session)\s*process)/.test(text);
 }
 
 export function buildPostShootProcessReply(): string {
   return [
-    'After the shoot:',
+    'After your session:',
     '1) Any remaining balance is cleared as per your package terms (M-Pesa or cash).',
     '2) Edited photos are ready within 10 working days.',
     '3) Edited photos are delivered as a secure download link only.',
@@ -126,9 +128,9 @@ export function isRawFilesRequest(userMessage: string): boolean {
 
 export function buildRawFilesReply(): string {
   return [
-    'Raw files are quoted by package tier.',
+    'Raw files are quoted by edition.',
     'They are shared as a secure download link.',
-    'If you let me know which package tier you are interested in, our team can confirm the exact quote for raw files.'
+    'The team can confirm the fee for your edition.'
   ].join('\n');
 }
 

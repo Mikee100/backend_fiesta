@@ -282,7 +282,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
     assert.match(reply, /Closed on Mondays/);
     assert.doesNotMatch(reply, /Tuesday|studio is open/);
   });
-  await context.test('[EXPECTED TO FAIL] [STATE/PROMPT + FAULT INJECTION] known slots survive trimmed history and next day', () => {
+  await context.test('[FIXED IN 8.8] [STATE/PROMPT + FAULT INJECTION] known slots survive trimmed history and next day', () => {
     assert.equal(frames[7].history.length, 6);
     assert.ok(!frames[7].history.some((message) => /My name is Wairimu/.test(message.content)));
     assert.equal(frames[7].draft?.name || frames[7].customer.name, 'Wairimu');
