@@ -16,6 +16,7 @@ import {
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
+import { buildAdditionsReply, isAddonListFollowUp as matchesAddonListFollowUp } from './replies';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
@@ -838,15 +839,7 @@ export class AgentService {
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
   ): boolean {
-    const text = this.normalizeHyphens(userMessage).trim().toLowerCase().replace(/[.!?]+$/, '');
-    const affirmative = /^(show(\s+me)?(\s+the)?(\s+(full\s+)?(list|options|extras|add-?ons))?|see\s+them|list\s+them|list\s+the\s+(extras|add-?ons)|what\s+(are\s+they|else)|yes(\s+please)?|yeah|yep|sure|ok(ay)?|please)$/.test(text);
-    if (!affirmative) return false;
-
-    const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
-    if (!lastAssistant) return false;
-    return /(available extras|add-?ons?\b|optional additions|extra services|extra outfit|styled wig)/i.test(
-      this.normalizeHyphens(lastAssistant.content)
-    );
+    return matchesAddonListFollowUp(userMessage, history);
   }
 
   /** Collapse unicode dashes so regexes written with "-" still match model output. */
@@ -1723,28 +1716,7 @@ export class AgentService {
     } catch {
       console.warn('Unable to resolve starting deposit for add-ons reply.');
     }
-
-    const pricedLines = ADDON_CATALOG
-      .filter((item) => item.unitPrice > 0)
-      .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`);
-    const quotedLines = ADDON_CATALOG
-      .filter((item) => item.unitPrice === 0)
-      .map((item) => `${item.name}: quoted by package tier`);
-
-    return [
-      'Yes, these optional additions are available:',
-      '',
-      ...pricedLines,
-      '',
-      'Quoted by package tier:',
-      ...quotedLines,
-      '',
-      deposit === null
-        ? 'They are optional and are added to the balance, not the deposit. The studio team can confirm the deposit amount. Nothing has been added yet.'
-        : `They are optional, are added to the balance, and are not included in the Ksh ${deposit.toLocaleString()} deposit. Nothing has been added yet.`,
-      '',
-      'Which, if any, would you like me to note for the session?'
-    ].join('\n');
+    return buildAdditionsReply(deposit);
   }
 
   private getBespokeReply(): string {

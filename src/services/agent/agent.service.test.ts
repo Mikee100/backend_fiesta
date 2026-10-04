@@ -10,6 +10,7 @@ import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
+import { buildAdditionsReply, isAddonListFollowUp } from './replies';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
 import { inBusinessTimezone } from '../../utils/time';
 const agent = new AgentService() as any;
@@ -871,6 +872,12 @@ test('formats additions as plain WhatsApp text and uses the package deposit help
   } finally {
     prisma.package.findFirst = originalPackageFindFirst;
   }
+});
+
+test('the additions reply is recognized by its follow-up matcher', () => {
+  const reply = buildAdditionsReply(null);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: 'Your session is on Friday.' }]), false);
 });
 
 test('recognizes an add-on selection without restarting booking', () => {
