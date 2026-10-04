@@ -1,5 +1,6 @@
 import { ADDON_CATALOG } from '../../config/constants';
 import { OFFICIAL_WEBSITE_URLS } from './constants';
+export { isBookingProcessRequest } from './booking-process-reply';
 
 export function buildAdditionsReply(deposit: number | null): string {
   const pricedLines = ADDON_CATALOG
@@ -95,11 +96,6 @@ export function buildMixedIntentClarificationReply(): string {
 
 export function buildBusinessIntroductionReply(): string {
   return 'Welcome to Fiesta House! We are a boutique luxury photography studio in Parklands, Nairobi, specialising in maternity, newborn, and family portraiture. We take care of everything—from our curated client gown closet and professional hair & makeup to gentle posing guidance so you feel relaxed and radiant in front of the camera. What kind of photoshoot are you planning?';
-}
-
-export function isBookingProcessRequest(userMessage: string): boolean {
-  const text = userMessage.toLowerCase();
-  return /(process\s+of\s+booking|booking\s+process|how\s+to\s+book|how\s+does\s+booking\s+work|what\s+does\s+booking\s+entail|steps\s+to\s+book|explain\s+booking)/.test(text);
 }
 
 export function isPostShootProcessRequest(userMessage: string): boolean {
