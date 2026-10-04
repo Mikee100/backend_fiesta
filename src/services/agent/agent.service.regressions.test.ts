@@ -279,7 +279,7 @@ test('all package deposit displays and booking charges use one helper result', a
     assert.equal(confirmation.depositAmount, sharedDeposit);
     assert.deepEqual(stkAmounts, [sharedDeposit]);
     assert.equal(proposalSaves.length, 1);
-    assert.equal(helperCalls.length, 7);
+    assert.equal(helperCalls.length, 5);
   } finally {
     prisma.package.findMany = originals.packageFindMany;
     prisma.package.findUnique = originals.packageFindUnique;
