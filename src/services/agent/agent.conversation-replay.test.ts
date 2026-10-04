@@ -7,6 +7,7 @@ import { googleCalendarService } from '../calendar/calendar.service';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { circuitBreaker } from './resilience.service';
 import { AgentService } from './agent.service';
+import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 type Turn = {
@@ -26,11 +27,16 @@ const packages = [
   ['THE QUEEN', 55000, '3 hours'],
   ['THE EMPRESS', 70000, '3.5 hours'],
   ['THE GODDESS', 120000, '5 hours'],
-].map(([name, price, duration]) => ({
-  name: String(name), price: Number(price), duration: String(duration), deposit: 2000,
-  images: 6, makeup: true, outfits: 2, styling: true, photobook: false,
-  photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null,
-}));
+].map(([name, price, duration]) => {
+  const reference = SEED_EDITION_INCLUSIONS[String(name)];
+  return {
+    name: String(name), price: Number(price), duration: String(duration), deposit: 2000,
+    images: reference?.images ?? 6, makeup: true, outfits: reference?.outfits ?? 2, styling: true,
+    photobook: reference?.photobook ?? false, photobookSize: reference?.photobookSize ?? null,
+    mount: reference?.mount ?? false, balloonBackdrop: reference?.balloonBackdrop ?? false,
+    wig: reference?.wig ?? false, notes: null,
+  };
+});
 
 const turns: Turn[] = [
   {
@@ -217,15 +223,17 @@ test('Wairimu conversation replay with six-message history and a next-day return
   await context.test('[FIXED IN 8.1a] [STATE] first name is persisted as soon as stated', () => {
     assert.equal(frames[0].draft?.name || frames[0].customer.name, 'Wairimu');
   });
-  await context.test('[EXPECTED TO FAIL] [ROUTING + FAULT INJECTION] catalog request uses DB durations in Rate Card 2026', () => {
+  await context.test('[FIXED IN 8.3] [ROUTING + FAULT INJECTION] catalog request uses DB durations in Rate Card 2026', () => {
     assert.match(frames[1].reply, /Rate Card 2026/);
     for (const [name, duration] of [
       ['THE BLOOM', '1.5 hours'], ['THE ICON', '2.5 hours'],
-      ['THE LEGEND', '2.5 hours'], ['THE EMPRESS', '3.5 hours'],
+      ['THE LEGEND', '2.5 hours'],
     ]) {
       assert.ok(frames[1].reply.includes(name) && frames[1].reply.includes(duration), `${name}: ${duration}`);
     }
     assert.equal(frames[1].prompts.length, 0, 'catalog must bypass model generation');
+    assert.match(frames[1].reply, /THE EMPRESS[^\n]*Ask me for details/);
+    assert.doesNotMatch(frames[1].reply, /THE EMPRESS[^\n]*3\.5 hours/);
   });
   await context.test('[FIXED IN 8.1a] [STATE] package selection is persisted immediately', () => {
     assert.equal(frames[2].draft?.service, 'THE BLOOM');
@@ -271,7 +279,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
     const nameQuestions = frames.filter((frame) => /what is your name|give me your name/i.test(frame.reply));
     assert.ok(nameQuestions.length <= 1);
   });
-  await context.test('[EXPECTED TO FAIL] [ROUTING + FAULT INJECTION] booking-process and turnaround reply never invents a percentage deposit', () => {
+  await context.test('[FIXED IN 8.3] [ROUTING + FAULT INJECTION] booking-process and turnaround reply never invents a percentage deposit', () => {
     assert.doesNotMatch(frames[8].reply, /30%|4,500|7,500|six editions/i);
     assert.match(frames[8].reply, /2,000/);
     assert.match(frames[8].reply, /10 working days/);

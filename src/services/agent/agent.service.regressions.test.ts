@@ -16,9 +16,120 @@ import { resolveCalendarDate } from './extraction';
 import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
+import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('money and policy routes are deterministic and rendered copy matches the approval document', async (context) => {
+  const packages = [
+    { name: 'THE BLOOM', price: 15000, duration: '1.5 hours', images: 6, outfits: 2, photobook: false, mount: false, balloonBackdrop: false, wig: false },
+    { name: 'THE MUSE', price: 25000, duration: '2 hours', images: 12, outfits: 3, photobook: false, mount: false, balloonBackdrop: false, wig: false },
+    { name: 'THE ICON', price: 35000, duration: '2.5 hours', images: 15, outfits: 4, photobook: false, mount: true, balloonBackdrop: false, wig: false },
+    { name: 'THE LEGEND', price: 45000, duration: '2.5 hours', images: 15, outfits: 4, photobook: true, mount: false, balloonBackdrop: false, wig: true },
+    { name: 'THE QUEEN', price: 55000, duration: '3 hours', images: 20, outfits: 4, photobook: false, mount: true, balloonBackdrop: true, wig: true },
+    { name: 'THE EMPRESS', price: 70000, duration: '3.5 hours', images: 25, outfits: 4, photobook: true, mount: true, balloonBackdrop: true, wig: true },
+    { name: 'THE GODDESS', price: 120000, duration: '5 hours', images: 30, outfits: 5, photobook: true, mount: true, balloonBackdrop: true, wig: true },
+  ].map((pkg) => ({ ...pkg, deposit: 2000, makeup: true, styling: true, photobookSize: pkg.photobook ? '8x8"' : null, notes: null }));
+  let availablePackages = packages;
+  const originals = { many: prisma.package.findMany, first: prisma.package.findFirst, studio: prisma.studioInfo.findFirst, booking: prisma.booking.findFirst };
+  (prisma.package.findMany as any) = async () => availablePackages;
+  (prisma.package.findFirst as any) = async () => ({ name: 'THE BLOOM', deposit: 2000 });
+  (prisma.studioInfo.findFirst as any) = async () => ({ location: '4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi' });
+  (prisma.booking.findFirst as any) = async () => null;
+  context.after(() => {
+    prisma.package.findMany = originals.many;
+    prisma.package.findFirst = originals.first;
+    prisma.studioInfo.findFirst = originals.studio;
+    prisma.booking.findFirst = originals.booking;
+  });
+  const instance = withQuietAgent({ naturalAssistantMode: true, runAgent: async () => { assert.fail('money/policy replies must not invoke the model'); } });
+  const required = ['bookingProcess', 'postShootProcess', 'earliestImageDelivery', 'rawFiles', 'additions', 'packageCatalog', 'packageSelection', 'ambiguousDeposit', 'packageBudget'];
+  const routes = instance.createMessageRoutes('copy-customer', 'Hi', [], 'whatsapp', Date.now());
+  for (const name of required) assert.equal(routes.find((route: any) => route.name === name)?.replyMode, 'deterministic', name);
+  const process = await instance.handleMessage('copy-customer', "What's the booking process and your turnaround policy", [], 'whatsapp');
+  assert.match(process, /our 7 editions/);
+  assert.match(process, /a Ksh 2,000 deposit secures your slot/);
+  assert.doesNotMatch(process, /start(?:ing)? from/);
+  assert.match(process, /10 working days.*secure download link/);
+  assert.doesNotMatch(process, /%|six editions|4,500|7,500/);
+  const copyReview = readFileSync(path.join(__dirname, '../../../docs/PHASE_8_3_REPLY_REVIEW.md'), 'utf8').replace(/\r\n/g, '\n');
+  assert.ok(copyReview.includes(process), 'booking-process approval text must match the rendered reply');
+  for (const message of ['share the packages that you offer', 'what packages do you have', 'what do you offer', 'your editions']) {
+    const catalog = await instance.handleMessage('copy-customer', message, [], 'whatsapp');
+    assert.match(catalog, /Rate Card 2026/);
+    assert.ok(catalog.length < 800);
+    assert.doesNotMatch(catalog, /maternity packages|which package/);
+    assert.ok(copyReview.includes(catalog), 'catalog approval text must match the rendered reply');
+  }
+  const icon = await instance.handleMessage('copy-customer', 'What does THE ICON include?', [], 'whatsapp');
+  assert.ok(copyReview.includes(icon), 'detail-card approval text must match recorded fields');
+  const empress = await instance.handleMessage('copy-customer', 'What does THE EMPRESS include?', [], 'whatsapp');
+  assert.equal(empress, 'The team will confirm the exact inclusions for you.');
+  assert.doesNotMatch(empress, /3\.5|25|Power Suit|Reel|photobook|2 styled wigs/i);
+  for (const name of Object.keys(SEED_EDITION_INCLUSIONS)) {
+    const detail = await instance.getPackageCatalogReply(true, `What does ${name} include?`);
+    for (const item of SEED_EDITION_INCLUSIONS[name].inclusions) assert.ok(detail.includes(item), `${name}: ${item}`);
+    assert.doesNotMatch(detail, /quantity to be confirmed|size to be confirmed|design to be confirmed/);
+  }
+  assert.deepEqual(differingInclusionFields('THE ICON', { ...packages[2], images: 16 }), ['images']);
+  availablePackages = [{ ...packages[2], images: 16 }];
+  assert.equal(await instance.getPackageCatalogReply(true, 'THE ICON'), 'The team will confirm the exact inclusions for you.');
+  availablePackages = [{ ...packages[0], duration: '5 hours' }];
+  const mismatchedBloom = await instance.getPackageCatalogReply(true, 'THE BLOOM');
+  assert.equal(mismatchedBloom, 'The team will confirm the exact inclusions for you.');
+  assert.doesNotMatch(mismatchedBloom, /5 hours/);
+  availablePackages = packages.slice(0, 3);
+  assert.match(await instance.getBookingProcessReply(), /our 3 editions/);
+  availablePackages = [];
+  const unavailable = await instance.handleMessage('copy-customer', 'what packages do you have', [], 'whatsapp');
+  assert.match(unavailable, /studio team.*current rate card/i);
+});
+
+test('edition details fall back to seed inclusions when the column is absent or null', async (context) => {
+  const original = prisma.package.findMany;
+  context.after(() => { prisma.package.findMany = original; });
+  const { inclusions: seedText, ...fields } = SEED_EDITION_INCLUSIONS['THE ICON'];
+  const row = { ...fields, name: 'THE ICON', price: 35000, notes: null };
+  let fixture: any = row;
+  (prisma.package.findMany as any) = async ({ select }: any) => {
+    assert.equal(select.inclusions, undefined, 'the undeployed column must not be queried');
+    return [fixture];
+  };
+  const instance = new AgentService() as any;
+  for (const value of [undefined, null]) {
+    fixture = value === undefined ? row : { ...row, inclusions: value };
+    const direct = instance.buildPackageCard(fixture);
+    const reply = await instance.getPackageCatalogReply(true, 'What does THE ICON include?');
+    for (const item of seedText) {
+      assert.ok(direct.includes(item));
+      assert.ok(reply.includes(item));
+    }
+    assert.match(reply, /4 studio outfits with styling[\s\S]*1 A3 fine art mount/);
+    assert.equal(direct, reply);
+  }
+});
+
+test('booking-process deposits are flat, varying or unquoted according to every validated row', async (context) => {
+  const originals = { packages: prisma.package.findMany, studio: prisma.studioInfo.findFirst };
+  let deposits: (number | null)[] = [2000, 2000];
+  (prisma.package.findMany as any) = async () => deposits.map((deposit, index) => ({ name: `Edition ${index}`, deposit }));
+  (prisma.studioInfo.findFirst as any) = async () => ({ location: 'Studio' });
+  context.after(() => { prisma.package.findMany = originals.packages; prisma.studioInfo.findFirst = originals.studio; });
+  const instance = new AgentService() as any;
+  const flat = await instance.getBookingProcessReply();
+  assert.match(flat, /a Ksh 2,000 deposit secures your slot/);
+  assert.doesNotMatch(flat, /start(?:ing)? from|%/);
+  deposits = [3000, 2000];
+  const varying = await instance.getBookingProcessReply();
+  assert.match(varying, /deposits start from Ksh 2,000, and I'll quote the exact amount for your edition/);
+  for (const invalid of [null, 0, NaN]) {
+    deposits = [2000, invalid];
+    const reply = await instance.getBookingProcessReply();
+    assert.match(reply, /quote your deposit once you choose an edition; the studio team will confirm/);
+    assert.doesNotMatch(reply, /Ksh [\d,]+|start(?:ing)? from|%/);
+  }
+});
 
 test('early booking slots persist, newest wins, and protected draft steps remain unchanged', async (context) => {
   context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T09:00:00Z').getTime() });

@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
 import axios from 'axios';
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
+import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
+import { SERVICE_DURATIONS as SEED_COMPARISON_DURATIONS } from '../../config/constants';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { bookingService } from '../booking/booking.service';
@@ -1605,9 +1610,68 @@ test('renders package cards without corrupted markers or markdown', () => {
   assert.match(card, /THE ICON - Ksh 35,000/);
   assert.match(card, /Session length: 2\.5 hours/);
   assert.match(card, /15 final edited photos/);
-  assert.match(card, /4 studio outfits with styling/);
-  assert.match(card, /1 A3 fine art mount/);
+  assert.match(card, /4 outfits/);
+  assert.match(card, /Photo mount \(size to be confirmed\)/);
+  assert.doesNotMatch(card, /studio outfits|A3|with styling/);
   assert.doesNotMatch(card, /[âðï�]|\*|â€¢/);
+});
+
+test('six inclusion references agree with the actual seed and local FAQ facts', () => {
+  const seedPath = path.join(__dirname, '../../../scripts/seed-packages.ts');
+  const source = ts.createSourceFile(seedPath, readFileSync(seedPath, 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.filter(ts.isVariableStatement)
+    .flatMap((statement) => [...statement.declarationList.declarations])
+    .find((entry) => ts.isIdentifier(entry.name) && entry.name.text === 'packages');
+  assert.ok(declaration?.initializer && ts.isArrayLiteralExpression(declaration.initializer));
+  const rows: Record<string, unknown>[] = declaration.initializer.elements.map((element) => {
+    assert.ok(ts.isObjectLiteralExpression(element));
+    return Object.fromEntries(element.properties.map((property) => {
+      assert.ok(ts.isPropertyAssignment(property));
+      assert.ok(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name));
+      const value = property.initializer;
+      if (ts.isStringLiteral(value)) return [property.name.text, value.text];
+      if (ts.isNumericLiteral(value)) return [property.name.text, Number(value.text)];
+      if (value.kind === ts.SyntaxKind.TrueKeyword) return [property.name.text, true];
+      if (value.kind === ts.SyntaxKind.FalseKeyword) return [property.name.text, false];
+      assert.equal(value.kind, ts.SyntaxKind.NullKeyword);
+      return [property.name.text, null];
+    }));
+  });
+  const faq: { id: string; answer: string }[] = JSON.parse(readFileSync(path.join(__dirname, '../../../knowledge_base_rows.json'), 'utf8'));
+  for (const [name, reference] of Object.entries(SEED_EDITION_INCLUSIONS)) {
+    assert.equal(SEED_COMPARISON_DURATIONS[name.toLowerCase()], Number.parseFloat(reference.duration) * 60, `${name}: scheduling duration`);
+    const row = rows.find((entry) => entry.name === name);
+    assert.ok(row, name);
+    for (const [field, value] of Object.entries(reference)) {
+      if (field !== 'inclusions') assert.equal(row[field], value, `${name}: ${field}`);
+    }
+    const answer = faq.find((entry) => entry.id === `pkg_${name.replace(/^THE /, '').toLowerCase()}`)?.answer || '';
+    assert.ok(answer.includes(`${reference.duration} studio time`), `${name}: FAQ duration`);
+    assert.ok(answer.includes(`${reference.images} final edited photos`), `${name}: FAQ photos`);
+    assert.ok(answer.includes(`${reference.outfits} studio outfits + styling`), `${name}: FAQ outfits`);
+    for (const item of reference.inclusions) {
+      if (/styled wigs?$|fine art mount$|Power Suit|Reel/.test(item)) assert.ok(answer.includes(item.replace(/^5 studio outfits with styling, including the /, '')), `${name}: ${item}`);
+    }
+  }
+  assert.equal(Object.keys(SEED_EDITION_INCLUSIONS).length, 6);
+  assert.equal(SEED_EDITION_INCLUSIONS['THE EMPRESS'], undefined);
+});
+
+test('edition names cannot create unrecorded inclusions in cards', () => {
+  const row = { price: 35000, duration: '2.5 hours', images: 15, makeup: false, outfits: 0, styling: false,
+    photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null };
+  for (const name of ['THE ICON', 'THE EMPRESS', 'THE GODDESS']) {
+    const card = agent.buildPackageCard({ ...row, name });
+    assert.doesNotMatch(card, /wig|Power Suit|Reel|A2|A3|flowers|Sculpture|Signature|Flagship/);
+  }
+  const card = agent.buildPackageCard({ ...row, name: 'THE GODDESS', wig: true, mount: true, balloonBackdrop: true });
+  assert.match(card, /quantity to be confirmed/);
+  assert.match(card, /size to be confirmed/);
+  assert.match(card, /design to be confirmed/);
+  assert.doesNotMatch(card, /2 styled wigs|Power Suit|Reel|A2|A3|flowers|Sculpture/);
+  const explicit = agent.buildPackageCard({ ...row, name: 'An edition', inclusions: ['4 studio outfits with styling', '1 A3 fine art mount'] });
+  assert.match(explicit, /4 studio outfits with styling\n- 1 A3 fine art mount/);
+  assert.doesNotMatch(explicit, /15 final edited photos|quantity to be confirmed|size to be confirmed/);
 });
 
 test('answers package-inclusion follow-ups from stored package facts', async () => {
@@ -1615,19 +1679,23 @@ test('answers package-inclusion follow-ups from stored package facts', async () 
   (prisma.package.findMany as any) = async () => [
     {
       name: 'THE BLOOM', price: 15000, duration: '1.5 hours', images: 6, makeup: true, outfits: 2,
-      photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null,
+      styling: true, photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null,
     },
     {
       name: 'THE ICON', price: 35000, duration: '2.5 hours', images: 15, makeup: true, outfits: 4,
-      photobook: false, photobookSize: null, mount: true, balloonBackdrop: false, wig: false, notes: null,
+      styling: true, photobook: false, photobookSize: null, mount: true, balloonBackdrop: false, wig: false, notes: null,
     },
   ];
 
   try {
     const reply = await agent.getPackageCatalogReply(true);
-    assert.match(reply || '', /Here is what each package includes/);
-    assert.match(reply || '', /THE BLOOM - Ksh 15,000[\s\S]*Session length: 1\.5 hours[\s\S]*6 final edited photos/);
-    assert.match(reply || '', /THE ICON - Ksh 35,000[\s\S]*15 final edited photos[\s\S]*1 A3 fine art mount/);
+    assert.match(reply || '', /Here are our maternity editions/);
+    assert.match(reply || '', /THE BLOOM - Ksh 15,000 \| 1\.5 hours \| 6 edited photos/);
+    assert.equal(conversationFlows.isPackageInclusionFollowUp('so what does each come with', [{ role: 'assistant', content: reply! }]), true);
+    for (const term of ['packages', 'editions']) assert.equal(conversationFlows.isPackageCatalogRequest(`what ${term} do you have`), true);
+    const detail = await agent.getPackageCatalogReply(true, 'What does THE ICON include?');
+    assert.match(detail || '', /15 final edited photos[\s\S]*4 studio outfits with styling[\s\S]*1 A3 fine art mount/);
+    assert.doesNotMatch(detail || '', /THE BLOOM|size to be confirmed/);
     assert.doesNotMatch(reply || '', /THE BLOOM[\s\S]*?- 5 hours|THE BLOOM[\s\S]*?25 final edited photos/);
   } finally {
     prisma.package.findMany = originalFindMany;

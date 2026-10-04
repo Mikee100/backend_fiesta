@@ -1,7 +1,9 @@
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
 import { bookingService } from '../booking/booking.service';
-import { DEFAULT_DURATION, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
+import { DEFAULT_DURATION, EDITIONS_PENDING_OWNER_CONFIRMATION, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
+import { EDITION_CATALOG_HEADER, EDITION_CATALOG_INTRO, EDITION_CATALOG_FOLLOW_UP } from './constants';
+import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { inBusinessTimezone } from '../../utils/time';
 import { getDepositForPackage, getPackageForDeposit } from './booking-tools';
 
@@ -12,72 +14,51 @@ export function buildPackageCard(pkg: {
   images: number;
   makeup: boolean;
   outfits: number;
+  styling?: boolean;
   photobook: boolean;
   photobookSize: string | null;
   mount: boolean;
   balloonBackdrop: boolean;
   wig: boolean;
   notes: string | null;
+  inclusions?: readonly string[] | null;
 }): string {
-  const lowerName = pkg.name.toLowerCase();
-
-  let badge = '';
-  if (lowerName.includes('empress')) {
-    badge = ' (Signature Edition - Most Loved)';
-  } else if (lowerName.includes('goddess')) {
-    badge = ' (Flagship Edition)';
+  const inclusions = pkg.inclusions?.length ? pkg.inclusions
+    : differingInclusionFields(pkg.name, pkg).length === 0 ? SEED_EDITION_INCLUSIONS[pkg.name]?.inclusions : undefined;
+  if (inclusions) {
+    return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}\n${inclusions.map((item) => `- ${item}`).join('\n')}`;
   }
-
   const items: string[] = [];
   if (pkg.duration) items.push(`Session length: ${pkg.duration}`);
   if (pkg.images > 0) items.push(`${pkg.images} final edited photos`);
   if (pkg.makeup) items.push('Professional makeup');
 
   if (pkg.outfits > 0) {
-    if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-      items.push(`${pkg.outfits} studio outfits with styling, including the Power Suit`);
-    } else {
-      items.push(`${pkg.outfits} studio outfit${pkg.outfits > 1 ? 's' : ''} with styling`);
-    }
+    items.push(`${pkg.outfits} outfit${pkg.outfits > 1 ? 's' : ''}`);
   }
+  if (pkg.styling) items.push('Styling');
 
   if (pkg.wig) {
-    if (lowerName.includes('empress') || lowerName.includes('goddess')) {
-      items.push('2 styled wigs');
-    } else {
-      items.push('1 styled wig');
-    }
+    items.push('Styled wig included (quantity to be confirmed)');
   }
 
   if (pkg.balloonBackdrop) {
-    if (lowerName.includes('goddess')) {
-      items.push('Custom balloon backdrop or Goddess Sculpture Set');
-    } else {
-      items.push('Custom balloon backdrop with flowers');
-    }
-  }
-
-  if (lowerName.includes('goddess')) {
-    items.push('1 professionally produced Reel');
+    items.push('Balloon backdrop (design to be confirmed)');
   }
 
   if (pkg.photobook) {
     const size = pkg.photobookSize ? ` (${pkg.photobookSize})` : '';
-    items.push(`Hardcover photobook${size}`);
+    items.push(`Photobook${size}`);
   }
 
   if (pkg.mount) {
-    if (lowerName.includes('goddess')) {
-      items.push('1 A2 fine art mount');
-    } else {
-      items.push('1 A3 fine art mount');
-    }
+    items.push('Photo mount (size to be confirmed)');
   }
 
-  return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}${badge}\n${items.map((item) => `- ${item}`).join('\n')}`;
+  return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}\n${items.map((item) => `- ${item}`).join('\n')}`;
 }
 
-export async function getPackageCatalogReply(showInclusions = false): Promise<string | null> {
+export async function getPackageCatalogReply(_showInclusions = false, userMessage = ''): Promise<string | null> {
   try {
     const packages = await prisma.package.findMany({
       orderBy: [{ price: 'asc' }, { name: 'asc' }],
@@ -88,6 +69,7 @@ export async function getPackageCatalogReply(showInclusions = false): Promise<st
         images: true,
         makeup: true,
         outfits: true,
+        styling: true,
         photobook: true,
         photobookSize: true,
         mount: true,
@@ -99,12 +81,25 @@ export async function getPackageCatalogReply(showInclusions = false): Promise<st
 
     if (!packages.length) return null;
 
-    const cards = packages.map((pkg) => buildPackageCard(pkg));
-    const introduction = showInclusions ? 'Here is what each package includes:' : 'Here are our maternity packages:';
-    const closing = showInclusions
-      ? 'If one stands out, I can help you choose a date for it.'
-      : 'Tell me which package you are considering, and I can explain its inclusions or help check available dates.';
-    return `Fiesta House Maternity - Rate Card 2026\n\n${introduction}\n\n${cards.join('\n\n')}\n\n${closing}`;
+    const editions = packages.filter((pkg) => PACKAGE_NAMES_FOR_EXTRACTION.some((name) => name === pkg.name));
+    if (!editions.length) return null;
+    const needsReview = (pkg: typeof editions[number]) => {
+      const differences = differingInclusionFields(pkg.name, pkg);
+      if (differences.length) console.warn('Edition fields disagree with seed inclusion reference:', pkg.name, differences.join(', '));
+      return EDITIONS_PENDING_OWNER_CONFIRMATION.includes(pkg.name)
+        || differences.length > 0;
+    };
+    const requested = editions.filter((pkg) => new RegExp(`\\b${pkg.name.replace(/^THE /, '')}\\b`, 'i').test(userMessage));
+    if (requested.length === 1) {
+      const edition = requested[0];
+      return needsReview(edition)
+        ? 'The team will confirm the exact inclusions for you.'
+        : buildPackageCard({ ...edition, inclusions: SEED_EDITION_INCLUSIONS[edition.name]?.inclusions });
+    }
+    const overview = editions.map((pkg) => needsReview(pkg)
+      ? `${pkg.name} - Ksh ${pkg.price.toLocaleString()} | Ask me for details`
+      : `${pkg.name} - Ksh ${pkg.price.toLocaleString()} | ${pkg.duration} | ${pkg.images} edited photos`);
+    return `${EDITION_CATALOG_HEADER}\n\n${EDITION_CATALOG_INTRO}\n${overview.join('\n')}\n\n${EDITION_CATALOG_FOLLOW_UP}`;
   } catch (err) {
     console.error('Failed to build package catalog reply:', err);
     return null;

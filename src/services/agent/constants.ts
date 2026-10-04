@@ -11,3 +11,7 @@ export const PACKAGE_PRICING_FALLBACK = 'The Editions are THE BLOOM: Ksh 15,000,
 export const PAYMENT_CONFIRMATION_REQUIRED_REPLY = 'Before I send the M-Pesa deposit prompt, please reply yes to confirm the booking.';
 export const PAYMENT_PROMPT_UNRECORDED = 'PAYMENT_PROMPT_UNRECORDED';
 export const PAYMENT_PROMPT_UNRECORDED_REPLY = 'Please check your phone for an M-Pesa prompt before trying again. If nothing arrives in a few minutes, the studio team can help.';
+export const EDITION_TERM_PATTERN = '(?:packages?|editions?)';
+export const EDITION_CATALOG_HEADER = 'Fiesta House Maternity - Rate Card 2026';
+export const EDITION_CATALOG_INTRO = 'Here are our maternity editions:';
+export const EDITION_CATALOG_FOLLOW_UP = "Tell me which edition you're considering and I'll share its inclusions and anything the team still needs to confirm.";

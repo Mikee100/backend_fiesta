@@ -36,6 +36,8 @@ export const PACKAGE_NAMES_FOR_EXTRACTION = [
   'THE QUEEN', 'THE EMPRESS', 'THE GODDESS',
 ] as const;
 
+export const EDITIONS_PENDING_OWNER_CONFIRMATION: readonly string[] = ['THE EMPRESS'];
+
 /** Priced optional add-ons (settle with balance — not included in deposit) */
 export interface AddonCatalogItem {
   sku: string;

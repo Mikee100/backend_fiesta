@@ -132,9 +132,8 @@ type Case = {
 
 // Routes that only fire when natural assistant mode is off (allowDeterministicInfoReplies).
 const NATURAL_GATED_ROUTES = new Set([
-  'packageBudget', 'businessIntroduction', 'website', 'contactDetails', 'portfolio',
-  'socialMedia', 'rawFiles', 'additions', 'bespoke', 'travellingMothers', 'earliestImageDelivery',
-  'postShootProcess', 'bookingProcess', 'packageSelection', 'packageAdvice',
+  'businessIntroduction', 'website', 'contactDetails', 'portfolio',
+  'socialMedia', 'bespoke', 'travellingMothers', 'packageAdvice',
 ]);
 
 const CASES: Case[] = [
@@ -191,12 +190,12 @@ const CASES: Case[] = [
   { message: 'i would want 2 of them then', history: [EXTRA_OUTFIT_EXPLAINED], expected: 'selectedAddon' },
   { message: 'add an extra professional make-up for me', expected: 'selectedAddon' },
   { message: 'What add-ons do you have?', expected: 'additions' },
-  { message: 'remove the extra outfit', expected: 'additions', naturalExpected: 'runAgent', note: 'Phase 1: "remove" no longer reads as a reschedule in natural mode' },
+  { message: 'remove the extra outfit', expected: 'additions', note: 'Phase 8.3: add-on information stays deterministic without reading remove as reschedule' },
   { message: 'Do you do bespoke shoots?', expected: 'bespoke' },
   { message: "I'm travelling from abroad", expected: 'travellingMothers' },
   { message: 'When will I get the photos?', expected: 'earliestImageDelivery' },
   { message: 'How to book a session?', expected: 'bookingProcess' },
-  { message: 'How do I book?', expected: 'runAgent', knownBug: 'booking-process trigger only matches "how to book", so this phrasing misses the deterministic reply' },
+  { message: 'How do I book?', expected: 'bookingProcess' },
 
   // Reschedule
   { message: '3pm', history: [assistant('Of course. What time would work better for you that day?')], expected: 'timeOnlyRescheduleSelection' },
@@ -211,6 +210,10 @@ const CASES: Case[] = [
   { message: "I'll take the icon", expected: 'packageSelection' },
   { message: 'Which package do you recommend?', expected: 'packageAdvice' },
   { message: 'What packages do you offer?', expected: 'packageCatalog', note: 'catalog is not gated by natural mode' },
+  { message: 'share the packages that you offer', expected: 'packageCatalog' },
+  { message: 'what packages do you have', expected: 'packageCatalog' },
+  { message: 'what do you offer', expected: 'packageCatalog' },
+  { message: 'your editions', expected: 'packageCatalog' },
 
   // Confirmation
   { message: 'yes', history: [RESCHEDULE_PROPOSAL], expected: 'immediateConfirmation' },
@@ -320,7 +323,7 @@ test('message route order remains unchanged', () => {
   ]);
 });
 
-test('every deterministic-only route is skipped in natural mode', async () => {
+test('only routes marked natural defer to the model in natural mode', async () => {
   const agent = createHarness({ natural: true });
   const routes = agent.createMessageRoutes(
     'customer-test',
@@ -330,7 +333,7 @@ test('every deterministic-only route is skipped in natural mode', async () => {
     Date.now()
   );
   const gatedNames = routes
-    .filter((route: { deterministicOnly?: boolean }) => route.deterministicOnly)
+    .filter((route: { replyMode?: string }) => route.replyMode === 'natural')
     .map((route: { name: string }) => route.name);
 
   for (const routeName of gatedNames) {

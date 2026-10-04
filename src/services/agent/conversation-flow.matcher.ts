@@ -1,3 +1,6 @@
+import { PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
+import { EDITION_CATALOG_HEADER, EDITION_TERM_PATTERN } from './constants';
+
 export type ConversationMessage = {
   role: 'user' | 'assistant';
   content: string;
@@ -6,8 +9,16 @@ export type ConversationMessage = {
 export class ConversationFlowMatcher {
   isPackageCatalogRequest(message: string, history: ConversationMessage[] = []): boolean {
     const text = message.toLowerCase().trim();
+    const namesEdition = PACKAGE_NAMES_FOR_EXTRACTION.some((name) => new RegExp(`\\b${name.replace(/^THE /, '')}\\b`, 'i').test(text));
+    const editionQuestion = new RegExp(`\\b(?:what|which|share|show|list|tell)\\b.*\\b${EDITION_TERM_PATTERN}\\b|\\byour\\s+${EDITION_TERM_PATTERN}\\b`, 'i');
+    const requestedDetail = namesEdition && /\b(?:include|includes|inclusions|come with|tell me about|details)\b/i.test(text);
+    const editionNameOnly = PACKAGE_NAMES_FOR_EXTRACTION.some((name) => [name.toLowerCase(), name.replace(/^THE /, '').toLowerCase()].includes(text.replace(/[.!?]+$/, '')));
+    const choosesFromOverview = editionNameOnly
+      && history.some((entry) => entry.role === 'assistant' && entry.content.includes(EDITION_CATALOG_HEADER));
+    if ((editionQuestion.test(text) && !this.isPackageAdviceRequest(message)) || requestedDetail || choosesFromOverview) return true;
     const explicitCatalogRequest = /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages|tell\s+me\s+about\s+(the\s+)?(packages|services)|packages?\s+(or|and)\s+services|what\s+does\s+each\s+(package|edition)\s+(include|come\s+with))/i.test(text);
-    if (explicitCatalogRequest || this.isPackageInclusionFollowUp(message, history)) return true;
+    const shareCatalogRequest = /\bshare\s+(?:the\s+)?packages\b|\bwhat\s+do\s+you\s+offer\b|\byour\s+editions\b/i.test(text);
+    if (explicitCatalogRequest || shareCatalogRequest || this.isPackageInclusionFollowUp(message, history)) return true;
 
     const contextualFollowUp = /^(?:tell\s+me\s+about\s+(?:them|those)|what\s+about\s+(?:them|those)|can\s+you\s+tell\s+me\s+about\s+(?:them|those))\s*[?.!]*$/.test(text);
     if (!contextualFollowUp) return false;
@@ -27,10 +38,11 @@ export class ConversationFlowMatcher {
       .filter((entry) => entry.role === 'assistant')
       .slice(-3)
       .map((entry) => entry.content.toLowerCase());
-    const packageNamesMentioned = ['the bloom', 'the muse', 'the icon', 'the legend', 'the queen', 'the empress', 'the goddess']
-      .filter((name) => recentAssistantMessages.some((content) => content.includes(name)));
+    const packageNamesMentioned = PACKAGE_NAMES_FOR_EXTRACTION
+      .filter((name) => recentAssistantMessages.some((content) => content.includes(name.toLowerCase())));
 
     return packageNamesMentioned.length >= 2
+      || recentAssistantMessages.some((content) => content.includes(EDITION_CATALOG_HEADER.toLowerCase()))
       || recentAssistantMessages.some((content) => /all (?:the )?(?:current )?(?:packages|editions)/.test(content));
   }
 

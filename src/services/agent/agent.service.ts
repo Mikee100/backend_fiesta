@@ -1034,8 +1034,8 @@ export class AgentService {
     return formatPackageCard(pkg);
   }
 
-  private async getPackageCatalogReply(showInclusions = false): Promise<string | null> {
-    return buildPackageCatalogReply(showInclusions);
+  private async getPackageCatalogReply(showInclusions = false, userMessage = ''): Promise<string | null> {
+    return buildPackageCatalogReply(showInclusions, userMessage);
   }
 
   private async getPackageAdviceReply(userMessage: string): Promise<string | null> {
@@ -2017,7 +2017,7 @@ ${contextString}`;
     }
 
     for (const route of routes.slice(1)) {
-      if (route.deterministicOnly && naturalAssistantMode) continue;
+      if (route.replyMode === 'natural' && naturalAssistantMode) continue;
       if (!route.when()) continue;
       console.log(`[AGENT_FLOW] route=${route.name}`);
       const result = await route.handle();

@@ -25,7 +25,7 @@ export type MessageRoute = {
   name: string;
   when: () => boolean;
   handle: () => MessageRouteResult | Promise<MessageRouteResult>;
-  deterministicOnly?: boolean;
+  replyMode?: 'deterministic' | 'natural';
 };
 
 export function createMessageRoutes(
@@ -70,6 +70,7 @@ export function createMessageRoutes(
     },
     {
       name: 'ambiguousDeposit',
+      replyMode: 'deterministic',
       when: () => this.shouldClarifyAmbiguousDeposit(userMessage),
       handle: () => this.getAmbiguousDepositReply(),
     },
@@ -170,7 +171,7 @@ export function createMessageRoutes(
     },
     {
       name: 'packageBudget',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldUsePackageBudgetReply(userMessage),
       handle: () => this.getPackageBudgetReply(),
     },
@@ -194,7 +195,7 @@ export function createMessageRoutes(
     },
     {
       name: 'businessIntroduction',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => getInformationalFlow() === 'business_introduction',
       handle: () => this.getBusinessIntroductionReply(),
     },
@@ -205,31 +206,31 @@ export function createMessageRoutes(
     },
     {
       name: 'website',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => getInformationalFlow() === 'website',
       handle: () => this.getWebsiteReply(),
     },
     {
       name: 'contactDetails',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => getInformationalFlow() === 'contact_details',
       handle: () => this.getContactDetailsReply(),
     },
     {
       name: 'portfolio',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => getInformationalFlow() === 'portfolio',
       handle: () => this.getPortfolioReply(),
     },
     {
       name: 'socialMedia',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => this.shouldUseSocialMediaReply(userMessage),
       handle: () => this.getSocialMediaReply(),
     },
     {
       name: 'rawFiles',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldUseRawFilesReply(userMessage),
       handle: () => this.getRawFilesReply(),
     },
@@ -245,6 +246,7 @@ export function createMessageRoutes(
     },
     {
       name: 'addonListFollowUp',
+      replyMode: 'deterministic',
       when: () => this.isAddonListFollowUp(userMessage, history),
       handle: () => this.getAdditionsReply(),
     },
@@ -274,37 +276,37 @@ export function createMessageRoutes(
     },
     {
       name: 'additions',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldUseAdditionsReply(userMessage),
       handle: () => this.getAdditionsReply(),
     },
     {
       name: 'bespoke',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => this.shouldUseBespokeReply(userMessage),
       handle: () => this.getBespokeReply(),
     },
     {
       name: 'travellingMothers',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => this.shouldUseTravellingMothersReply(userMessage),
       handle: () => this.getTravellingMothersReply(),
     },
     {
       name: 'earliestImageDelivery',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldUseEarliestImageDeliveryReply(userMessage),
       handle: async () => this.getEarliestImageDeliveryReply(customerId),
     },
     {
       name: 'postShootProcess',
-      deterministicOnly: true,
-      when: () => this.shouldUsePostShootProcessReply(userMessage),
+      replyMode: 'deterministic',
+      when: () => this.shouldUsePostShootProcessReply(userMessage) && !this.shouldUseBookingProcessReply(userMessage),
       handle: () => this.getPostShootProcessReply(),
     },
     {
       name: 'bookingProcess',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldUseBookingProcessReply(userMessage),
       handle: async () => this.getBookingProcessReply(),
     },
@@ -338,22 +340,24 @@ export function createMessageRoutes(
     },
     {
       name: 'packageSelection',
-      deterministicOnly: true,
+      replyMode: 'deterministic',
       when: () => this.shouldResolvePackageSelectionImmediately(userMessage),
       handle: async () => this.getPackageSelectionReply(customerId, userMessage),
     },
     {
       name: 'packageAdvice',
-      deterministicOnly: true,
+      replyMode: 'natural',
       when: () => this.conversationFlows.isPackageAdviceRequest(userMessage),
       handle: async () => this.getPackageAdviceReply(userMessage),
     },
     {
       name: 'packageCatalog',
+      replyMode: 'deterministic',
       when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history),
       handle: async () => {
         const showInclusions = this.conversationFlows.isPackageInclusionFollowUp(userMessage, history);
-        return this.getPackageCatalogReply(showInclusions);
+        return await this.getPackageCatalogReply(showInclusions, userMessage)
+          || 'The studio team will share our current rate card and edition details. I cannot verify the catalog right now.';
       },
     },
     {
