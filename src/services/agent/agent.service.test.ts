@@ -10,7 +10,16 @@ import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
-import { buildAdditionsReply, isAddonListFollowUp } from './replies';
+import {
+  buildAdditionsReply,
+  buildBookingProposalConfirmation,
+  buildCancellationProposal,
+  buildPackageDepositProposal,
+  buildRescheduleProposalConfirmation,
+  buildTimeOnlyRescheduleProposal,
+  isAddonListFollowUp,
+  previousMessageRequestsConfirmation,
+} from './replies';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
 import { inBusinessTimezone } from '../../utils/time';
 const agent = new AgentService() as any;
@@ -878,6 +887,20 @@ test('the additions reply is recognized by its follow-up matcher', () => {
   const reply = buildAdditionsReply(null);
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true);
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: 'Your session is on Friday.' }]), false);
+});
+
+test('confirmation proposal builders remain recognized by the history matcher', () => {
+  const replies = [
+    buildBookingProposalConfirmation('THE ICON', '2026-10-10', '15:00', 3210),
+    buildRescheduleProposalConfirmation('THE ICON', '2026-10-17', '16:00'),
+    buildTimeOnlyRescheduleProposal('THE ICON', 'Saturday, October 10', '3:00 PM'),
+    buildPackageDepositProposal('THE ICON', 'Saturday, October 10', '3:00 PM', 3210),
+    buildCancellationProposal('THE ICON', 'THE ICON on Saturday, October 10 at 3:00 PM', 'It is eligible under policy.'),
+  ];
+
+  for (const reply of replies) {
+    assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: reply }]), true, reply);
+  }
 });
 
 test('recognizes an add-on selection without restarting booking', () => {

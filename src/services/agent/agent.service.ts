@@ -16,7 +16,16 @@ import {
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
-import { buildAdditionsReply, isAddonListFollowUp as matchesAddonListFollowUp } from './replies';
+import {
+  buildAdditionsReply,
+  buildBookingProposalConfirmation,
+  buildCancellationProposal,
+  buildPackageDepositProposal,
+  buildRescheduleProposalConfirmation,
+  buildTimeOnlyRescheduleProposal,
+  isAddonListFollowUp as matchesAddonListFollowUp,
+  previousMessageRequestsConfirmation as matchesConfirmationRequest,
+} from './replies';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import prisma from '../../config/prisma';
 import dayjs from 'dayjs';
@@ -1493,7 +1502,12 @@ export class AgentService {
         data: { service: selectedPackage.name, step: 'awaiting_confirmation' },
       });
 
-      return `${selectedPackage.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+      return buildPackageDepositProposal(
+        selectedPackage.name,
+        dayjs(draft.date).format('dddd, MMMM D'),
+        dayjs(draft.dateTimeIso).format('h:mm A'),
+        deposit
+      );
     }
 
     return `${selectedPackage.name} is a lovely choice. What date are you considering? Once you have a day in mind, I can check the available times for you.`;
@@ -1541,7 +1555,12 @@ export class AgentService {
       data: { service: packageToUse.name, step: 'awaiting_confirmation' },
     });
 
-    return `${packageToUse.name} works for ${dayjs(draft.date).format('dddd, MMMM D')} at ${dayjs(draft.dateTimeIso).format('h:mm A')}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+    return buildPackageDepositProposal(
+      packageToUse.name,
+      dayjs(draft.date).format('dddd, MMMM D'),
+      dayjs(draft.dateTimeIso).format('h:mm A'),
+      deposit
+    );
   }
 
   private async getRescheduleTimeReply(customerId: string): Promise<string | null> {
@@ -1597,7 +1616,11 @@ export class AgentService {
       newTime,
     });
 
-    return `I can move your ${result.service} session to ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${dayjs(`2000-01-01T${newTime}`).format('h:mm A')}. Would you like me to confirm that change?`;
+    return buildTimeOnlyRescheduleProposal(
+      result.service,
+      inBusinessTimezone(booking.dateTime).format('dddd, MMMM D'),
+      dayjs(`2000-01-01T${newTime}`).format('h:mm A')
+    );
   }
 
   private isRescheduleWithin72Hours(bookingDateTime: Date, now = new Date()): boolean {
@@ -2345,7 +2368,7 @@ ${contextString}`;
               const requestedDate = this.getAuthoritativeRequestedDate(userMessage, args.date, extracted.date, history);
               const result = await this.executeProposeBookingTool(customerId, args.customerName, args.service, `${requestedDate}T${args.time}`);
               proposedThisTurn = true;
-              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${requestedDate} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "Great, I can hold ${args.service} for ${requestedDate} at ${args.time}. The deposit is KSH ${result.depositAmount}. If that works for you, just reply yes and I'll send the M-Pesa prompt." Do NOT call confirm_booking in this same turn.`;
+              toolResponse = `PROPOSED (not yet charged): ${args.service} on ${requestedDate} at ${args.time}, deposit KSH ${result.depositAmount}. Use this exact customer-facing confirmation: "${buildBookingProposalConfirmation(args.service, requestedDate, args.time, result.depositAmount)}" Do NOT call confirm_booking in this same turn.`;
             }
             else if (functionName === 'confirm_booking') {
               if (proposedThisTurn) {
@@ -2376,7 +2399,7 @@ ${contextString}`;
                 const policyNotice = this.isRescheduleWithin72Hours(result.oldDateTime)
                   ? `${this.getReschedulePolicyMessage()} `
                   : '';
-                toolResponse = `${policyNotice}PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "Great, I can move your ${result.service} session to ${args.newDate} at ${args.newTime}. If that works for you, just reply yes and I'll confirm it." Do NOT call confirm_reschedule in this same turn.`;
+                toolResponse = `${policyNotice}PROPOSED (not yet applied): reschedule ${result.service} to ${args.newDate} at ${args.newTime}. Use this exact customer-facing confirmation: "${buildRescheduleProposalConfirmation(result.service, args.newDate, args.newTime)}" Do NOT call confirm_reschedule in this same turn.`;
               }
             }
             else if (functionName === 'confirm_reschedule') {
@@ -3284,7 +3307,7 @@ ${contextString}`;
       ? 'It is more than 72 hours away and is eligible for a refund under the policy. Eligibility does not confirm a refund amount or that money has been returned.'
       : 'It is 72 hours away or less and is not automatically refundable under the policy.';
     return {
-      reply: `You asked to cancel your ${describeBooking(booking)}. ${refundPosition} If you want me to cancel this booking, reply yes to confirm.`,
+      reply: buildCancellationProposal(booking.service, describeBooking(booking), refundPosition),
       proposed: true,
     };
   }
@@ -3303,8 +3326,7 @@ ${contextString}`;
   }
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
-    const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-    return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
+    return matchesConfirmationRequest(history);
   }
 
   private getDepositAmountFromProposalHistory(

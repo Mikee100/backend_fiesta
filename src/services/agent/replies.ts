@@ -41,3 +41,35 @@ export function isAddonListFollowUp(
     normalizeHyphens(lastAssistant.content)
   );
 }
+
+export function buildBookingProposalConfirmation(service: string, date: string, time: string, deposit: number): string {
+  return `Great, I can hold ${service} for ${date} at ${time}. The deposit is KSH ${deposit}. If that works for you, just reply yes and I'll send the M-Pesa prompt.`;
+}
+
+export function buildRescheduleProposalConfirmation(service: string, date: string, time: string): string {
+  return `Great, I can move your ${service} session to ${date} at ${time}. If that works for you, just reply yes and I'll confirm it.`;
+}
+
+export function buildTimeOnlyRescheduleProposal(service: string, date: string, time: string): string {
+  return `I can move your ${service} session to ${date} at ${time}. Would you like me to confirm that change?`;
+}
+
+export function buildPackageDepositProposal(
+  service: string,
+  date: string,
+  time: string,
+  deposit: number
+): string {
+  return `${service} works for ${date} at ${time}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+}
+
+export function buildCancellationProposal(service: string, session: string, refundPosition: string): string {
+  return `You asked to cancel your ${session}. ${refundPosition} If you want me to cancel this booking, reply yes to confirm.`;
+}
+
+export function previousMessageRequestsConfirmation(
+  history: { role: 'user' | 'assistant'; content: string }[]
+): boolean {
+  const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
+  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
+}
