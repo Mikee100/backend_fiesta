@@ -24,6 +24,7 @@ import { knowledgeRetrieval } from './src/services/knowledge/retrieval.service';
 import { agentService } from './src/services/agent/agent.service';
 import { requireApiAuthentication } from './src/middleware/auth';
 import { readAccessToken } from './src/services/auth/auth.service';
+import { DatabaseSchemaOutOfDateError, safeSchemaDetails, verifyBookingDraftSchema } from './src/config/schema-readiness';
 
 // Load .env only if it exists (for local dev)
 dotenv.config();
@@ -36,8 +37,6 @@ console.log('🔹 Node Version:', process.version);
 console.log('🔹 Platform:', process.platform);
 if (process.env.DATABASE_URL) {
   console.log('🔹 DATABASE_URL is present');
-  const maskedUrl = process.env.DATABASE_URL.replace(/:([^:@]+)@/, ':****@');
-  console.log('📡 Using URL:', maskedUrl);
 } else {
   console.warn('⚠️ WARNING: DATABASE_URL is missing!');
 }
@@ -159,8 +158,8 @@ app.use('/api/conversations', conversationRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/mpesa', paymentRoutes);
 
-app.get('/api/ai-instructions', (_req, res) => {
-  res.json({ instructions: agentService.getInstructionGuide() });
+app.get('/api/ai-instructions', async (_req, res) => {
+  res.json({ instructions: await agentService.getInstructionGuide() });
 });
 
 // Calendar Routes
@@ -1039,27 +1038,30 @@ app.delete('/api/knowledge-base/:id', async (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 async function checkDatabaseConnection() {
-  try {
-    await prisma.$connect();
-    console.log('✅ Database connected successfully');
-  } catch (error: any) {
-    console.error('❌ Database connection failed:', error.message);
-  }
+  await prisma.$connect();
+  await verifyBookingDraftSchema(prisma);
+  console.log('[STARTUP] Database connection and BookingDraft schema check passed.');
 }
 
 const PORT = process.env.PORT || 4000;
 
-httpServer.listen(PORT, async () => {
-  console.log(`Backend 2.0 running on http://localhost:${PORT}`);
-  
-  // Verify database connection
-  await checkDatabaseConnection();
-  
-  // Initialize automation cron jobs
-  cronService.init();
-
-  // Pre-warm local RAG embedding model asynchronously in background
-  knowledgeRetrieval.initEmbedder().catch((err: any) => {
-    console.warn('⚠️ Failed to pre-warm RAG embedder on boot:', err?.message || err);
+async function startBackend() {
+  try {
+    await checkDatabaseConnection();
+  } catch (error) {
+    const details = error instanceof DatabaseSchemaOutOfDateError ? error.details : safeSchemaDetails(error);
+    console.error('[STARTUP] FATAL: database readiness failed; listener and automation NOT started.', JSON.stringify(details));
+    await prisma.$disconnect().catch(() => {});
+    process.exitCode = 1;
+    return;
+  }
+  httpServer.listen(PORT, () => {
+    console.log(`Backend 2.0 running on http://localhost:${PORT}`);
+    cronService.init();
+    knowledgeRetrieval.initEmbedder().catch(() => {
+      console.warn('[STARTUP] RAG embedder pre-warm failed.');
+    });
   });
-});
+}
+
+void startBackend();

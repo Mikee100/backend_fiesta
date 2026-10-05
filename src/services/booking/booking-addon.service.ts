@@ -1,4 +1,4 @@
-import { ADDON_CATALOG } from '../../config/constants';
+import { ADDON_CATALOG, BOOKING_SLOT_RETENTION_MS } from '../../config/constants';
 import prisma from '../../config/prisma';
 
 function parseQuantity(note: string, fallback = 1): number {
@@ -37,12 +37,15 @@ export class BookingAddonService {
   /**
    * Detect priced add-ons mentioned in a free-text note and persist them
    * as BookingAddon line items linked to the customer (and booking when known).
+  * Unlinked rows are temporary customer-scoped storage, not draft-bound storage.
+  * Confirmation attaches only rows inside BOOKING_SLOT_RETENTION_MS (14 days).
    */
   async createFromNote(params: {
     customerId: string;
     bookingId?: string | null;
     note: string;
     sessionNoteId?: string;
+    incrementExistingSkus?: readonly string[];
   }): Promise<number> {
     const { customerId, bookingId, note, sessionNoteId } = params;
     const matches = ADDON_CATALOG.filter((item) => item.match.test(note));
@@ -64,7 +67,21 @@ export class BookingAddonService {
             : { bookingId: null, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } }),
         },
       });
-      if (existing) continue;
+      if (existing) {
+        if (!params.incrementExistingSkus?.includes(item.sku)) continue;
+        if (existing.unitPrice !== unitPrice || existing.quantity + quantity > 50) {
+          throw new Error('Existing add-on price or quantity requires studio review.');
+        }
+        await prisma.bookingAddon.update({
+          where: { id: existing.id },
+          data: {
+            quantity: { increment: quantity }, totalPrice: { increment: totalPrice },
+            ...(sessionNoteId ? { sessionNoteId } : {}),
+          },
+        });
+        created++;
+        continue;
+      }
 
       await prisma.bookingAddon.create({
         data: {
@@ -85,13 +102,14 @@ export class BookingAddonService {
     return created;
   }
 
-  /** Attach orphan pending add-ons for a customer onto a newly confirmed booking. */
+  /** Temporary 14-day orphan attachment; no draft identity until 8.1b. Excluded rows stay pending. */
   async attachPendingToBooking(customerId: string, bookingId: string): Promise<number> {
     const result = await prisma.bookingAddon.updateMany({
       where: {
         customerId,
         bookingId: null,
         status: 'pending',
+        createdAt: { gt: new Date(Date.now() - BOOKING_SLOT_RETENTION_MS), lte: new Date() },
       },
       data: {
         bookingId,
@@ -122,21 +140,22 @@ export class BookingAddonService {
       orderBy: { createdAt: 'asc' },
     });
 
-    const lineItems = addons.map((a) => ({
+    const pricedAddons = addons.filter((addon) => addon.unitPrice > 0);
+    const lineItems = pricedAddons.map((a) => ({
       name: a.quantity > 1 ? `${a.name} × ${a.quantity}` : a.name,
       quantity: a.quantity,
       unitPrice: a.unitPrice,
       totalPrice: a.totalPrice,
     }));
 
-    const addonsTotal = addons.reduce((sum, a) => sum + a.totalPrice, 0);
+    const addonsTotal = pricedAddons.reduce((sum, a) => sum + a.totalPrice, 0);
     return { addonsTotal, lineItems };
   }
 
   async markInvoiced(bookingId: string): Promise<void> {
     const bookingAddonScope = await this.getBookingAddonScope(bookingId);
     await prisma.bookingAddon.updateMany({
-      where: { ...bookingAddonScope, status: { in: ['pending', 'confirmed'] } },
+      where: { ...bookingAddonScope, status: { in: ['pending', 'confirmed'] }, unitPrice: { gt: 0 } },
       data: { status: 'invoiced' },
     });
   }

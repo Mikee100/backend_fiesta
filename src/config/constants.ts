@@ -25,6 +25,7 @@ export const SERVICE_DURATIONS: Record<string, number> = {
 
 export const DEFAULT_DURATION = 120;
 export const MINIMUM_BOOKING_DEPOSIT = 2000;
+export const BOOKING_SLOT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** Current Editions 2026 + legacy names for extraction / matching */
 export const PACKAGE_NAME_PATTERN =
@@ -34,6 +35,8 @@ export const PACKAGE_NAMES_FOR_EXTRACTION = [
   'THE BLOOM', 'THE MUSE', 'THE ICON', 'THE LEGEND',
   'THE QUEEN', 'THE EMPRESS', 'THE GODDESS',
 ] as const;
+
+export const EDITIONS_PENDING_OWNER_CONFIRMATION: readonly string[] = ['THE EMPRESS'];
 
 /** Priced optional add-ons (settle with balance — not included in deposit) */
 export interface AddonCatalogItem {

@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
 import axios from 'axios';
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
+import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
+import { SERVICE_DURATIONS as SEED_COMPARISON_DURATIONS } from '../../config/constants';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { bookingService } from '../booking/booking.service';
@@ -10,6 +15,40 @@ import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
+import {
+  buildBespokeReply,
+  buildBookingForSomeoneElseReply,
+  buildBusinessIntroductionReply,
+  buildContactDetailsReply,
+  buildMultiPersonBookingReply,
+  buildPackageBudgetReply,
+  buildPortfolioReply,
+  buildPostShootProcessReply,
+  buildRawFilesReply,
+  buildSocialMediaReply,
+  buildTravellingMothersReply,
+  buildWebsiteReply,
+  getReviewPageReply,
+  getSuspendingConceptGalleryReply,
+  buildAdditionsReply,
+  buildBookingProposalConfirmation,
+  buildCancellationProposal,
+  buildPackageDepositProposal,
+  buildRescheduleProposalConfirmation,
+  buildTimeOnlyRescheduleProposal,
+  isAddonListFollowUp,
+  isAdditionsRequest,
+  isBespokeRequest,
+  isBookingForSomeoneElseRequest,
+  isMultiPersonBookingRequest,
+  isPackageBudgetRequest,
+  isPostShootProcessRequest,
+  isRawFilesRequest,
+  isSocialMediaRequest,
+  isTravellingMothersRequest,
+  isBookingProcessRequest,
+  previousMessageRequestsConfirmation,
+} from './replies';
 import { whatsappService, normalizeWhatsappText } from '../messaging/whatsapp.service';
 import { inBusinessTimezone } from '../../utils/time';
 const agent = new AgentService() as any;
@@ -104,20 +143,38 @@ test('does not route invalid Groq credentials to Gemini', async () => {
   }
 });
 
-test('keeps all policy identifiers while omitting unrelated price tables', () => {
-  const fullPrompt = agent.getInstructionGuide();
-  const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
-  const pricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
+test('keeps hard policy identifiers while replacing redundant voice rules and omitting unrelated price tables', async () => {
+  const originalPackageFindMany = prisma.package.findMany;
+  (prisma.package.findMany as any) = async () => [
+    { name: 'THE BLOOM', price: 15555 },
+    { name: 'THE MUSE', price: 25000 },
+    { name: 'THE ICON', price: 35000 },
+    { name: 'THE LEGEND', price: 45000 },
+    { name: 'THE QUEEN', price: 55000 },
+    { name: 'THE EMPRESS', price: 70000 },
+    { name: 'THE GODDESS', price: 120000 },
+  ];
+  try {
+    const fullPrompt = await agent.getInstructionGuide();
+    const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
+    const fallbackPricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-  assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 29);
-  assert.match(fullPrompt, /THE BLOOM: Ksh 15,000/);
-  assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
-  assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
-  assert.equal(compactPrompt.includes('THE BLOOM: Ksh 15,000'), false);
-  assert.equal(compactPrompt.includes(agent.getAddonPricingLine()), false);
-  assert.match(pricingPrompt, /THE BLOOM: Ksh 15,000/);
-  assert.equal(pricingPrompt.includes(agent.getAddonPricingLine()), false);
-  assert.ok(compactPrompt.length < fullPrompt.length);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-C]\d+[a-z]?\./g) || []).length, 20);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 25);
+    assert.match(fullPrompt, /BRAND:.*Luxury, Safety, Convenience and Comfort/);
+    assert.match(fullPrompt, /VOICE:.*never photoshoot/);
+    assert.match(fullPrompt, /THE BLOOM: Ksh 15,555/);
+    assert.doesNotMatch(fullPrompt, /THE BLOOM: Ksh 15,000/);
+    assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
+    assert.match(fullPrompt, /Sus[p]?ending Concept|Sculpture Set|Concierge Services for Travelling Mothers/);
+    assert.equal(compactPrompt.includes('THE BLOOM: Ksh 15,000'), false);
+    assert.equal(compactPrompt.includes(agent.getAddonPricingLine()), false);
+    assert.match(fallbackPricingPrompt, /THE BLOOM: Ksh 15,000/);
+    assert.equal(fallbackPricingPrompt.includes(agent.getAddonPricingLine()), false);
+    assert.ok(compactPrompt.length < fullPrompt.length);
+  } finally {
+    prisma.package.findMany = originalPackageFindMany;
+  }
 });
 
 test('accepts natural confirmation wording for a pending booking', () => {
@@ -262,11 +319,13 @@ test('recognizes a time-only reschedule request and time response', () => {
 
 test('stores a reschedule proposal as an explicit Nairobi-time instant', async () => {
   const originals = {
+    bookingDraftFindUnique: prisma.bookingDraft.findUnique,
     bookingFindFirst: prisma.booking.findFirst,
     bookingDraftUpsert: prisma.bookingDraft.upsert,
     getAvailableSlots: bookingService.getAvailableSlots,
   };
   let savedDraft: any;
+  (prisma.bookingDraft.findUnique as any) = async () => null;
   (prisma.booking.findFirst as any) = async () => ({
     id: 'booking-123',
     service: 'THE ICON',
@@ -284,6 +343,7 @@ test('stores a reschedule proposal as an explicit Nairobi-time instant', async (
     assert.equal(savedDraft.dateTimeIso, '2026-10-06T10:00:00.000Z');
     assert.equal(inBusinessTimezone(savedDraft.dateTimeIso).format('YYYY-MM-DD HH:mm'), '2026-10-06 13:00');
   } finally {
+    prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
     prisma.booking.findFirst = originals.bookingFindFirst;
     prisma.bookingDraft.upsert = originals.bookingDraftUpsert;
     bookingService.getAvailableSlots = originals.getAvailableSlots;
@@ -328,15 +388,22 @@ test('uses the customer-stated day over a conflicting model-proposed date', () =
   );
 });
 
-test('allows low-value sandbox deposits but rejects them in production', () => {
+test('validates configured package deposits without substituting zero or null', async () => {
   const originalEnvironment = process.env.MPESA_ENVIRONMENT;
+  let configuredDeposit: number | null = 10;
   try {
     process.env.MPESA_ENVIRONMENT = 'sandbox';
-    assert.equal(agent.getConfiguredBookingDeposit(10), 10);
+    assert.equal(agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), 10);
+    configuredDeposit = 0;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /missing or invalid/);
+    configuredDeposit = null;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /missing or invalid/);
 
     process.env.MPESA_ENVIRONMENT = 'production';
-    assert.equal(agent.getConfiguredBookingDeposit(2000), 2000);
-    assert.throws(() => agent.getConfiguredBookingDeposit(10), /below the KSh 2,000 minimum/i);
+    configuredDeposit = 2000;
+    assert.equal(agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), 2000);
+    configuredDeposit = 10;
+    assert.throws(() => agent.getDepositForPackage({ name: 'THE ICON', deposit: configuredDeposit }), /below the KSh 2,000 minimum/i);
   } finally {
     if (originalEnvironment === undefined) delete process.env.MPESA_ENVIRONMENT;
     else process.env.MPESA_ENVIRONMENT = originalEnvironment;
@@ -391,6 +458,69 @@ test('handles a session mix-up correction without changing the existing booking'
   }
 });
 
+test('date-range availability is bounded and skips Mondays and fully booked days', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const originals = { bookings: prisma.booking.findMany, drafts: prisma.bookingDraft.findMany, events: googleCalendarService.getEvents };
+  const counts = { bookings: 0, drafts: 0, events: 0 };
+  let fullyBooked = false;
+  (prisma.booking.findMany as any) = async ({ where }: any) => {
+    counts.bookings++;
+    assert.ok(where.dateTime.gte instanceof Date && where.dateTime.lte instanceof Date);
+    return fullyBooked ? [{ dateTime: where.dateTime.gte, durationMinutes: 14 * 24 * 60 }]
+      : [{ dateTime: new Date('2026-10-07T06:00:00Z'), durationMinutes: 600 }];
+  };
+  (prisma.bookingDraft.findMany as any) = async ({ where }: any) => {
+    counts.drafts++;
+    assert.deepEqual(where.step.in, ['awaiting_confirmation', 'payment_pending']);
+    return [];
+  };
+  (googleCalendarService.getEvents as any) = async (from: Date, to: Date) => {
+    counts.events++;
+    assert.ok(from < to);
+    return [];
+  };
+  context.after(() => {
+    prisma.booking.findMany = originals.bookings;
+    prisma.bookingDraft.findMany = originals.drafts;
+    googleCalendarService.getEvents = originals.events;
+  });
+  const result = await bookingService.getAvailableDates('2026-10-05', '2026-10-11', 'THE BLOOM');
+  assert.deepEqual(counts, { bookings: 1, drafts: 1, events: 1 });
+  assert.equal(result.dates.some((date) => date.weekday === 'Monday'), false);
+  assert.equal(result.dates.some((date) => date.date === '2026-10-07'), false);
+  assert.deepEqual(result.dates[0], { date: '2026-10-06', weekday: 'Tuesday', slots: ['09:00', '09:30', '10:00'] });
+  const longRange = await bookingService.getAvailableDates('2026-10-05', '2026-10-18', 'THE BLOOM');
+  assert.deepEqual(counts, { bookings: 2, drafts: 2, events: 2 });
+  assert.ok(longRange.dates.every((date) => date.slots.length <= 3));
+  assert.ok(JSON.stringify(longRange).length < 1600);
+  const clamped = await bookingService.getAvailableDates('2026-10-03', '2026-10-06', 'THE BLOOM');
+  assert.equal(clamped.fromDate, '2026-10-04');
+  const beforePast = { ...counts };
+  const past = await bookingService.getAvailableDates('2026-10-01', '2026-10-03', 'THE BLOOM');
+  assert.equal(past.status, 'past');
+  assert.match(past.message, /has passed/);
+  assert.deepEqual(counts, beforePast);
+  fullyBooked = true;
+  const empty = await bookingService.getAvailableDates('2026-10-05', '2026-10-11', 'THE BLOOM');
+  assert.equal(empty.status, 'unavailable');
+  assert.match(empty.message, /closed or fully booked/);
+  assert.deepEqual(empty.dates, []);
+  const mondayOnly = await bookingService.getAvailableDates('2026-10-05', '2026-10-05', 'THE BLOOM');
+  assert.equal(mondayOnly.status, 'unavailable');
+  for (const [from, to, service] of [
+    ['2026-10-05', '2026-10-19', 'THE BLOOM'],
+    ['2026-10-11', '2026-10-05', 'THE BLOOM'],
+    ['2026-02-30', '2026-03-01', 'THE BLOOM'],
+    ['2026-10-05', '2026-10-11', 'not a package'],
+  ]) {
+    const before = { ...counts };
+    await assert.rejects(bookingService.getAvailableDates(from, to, service));
+    assert.deepEqual(counts, before);
+  }
+  assert.deepEqual(await bookingService.getAvailableSlots('2026-10-05', 90), { status: 'closed', reason: 'Closed on Mondays' });
+  assert.deepEqual(await bookingService.getAvailableSlots('2026-10-03', 90), { status: 'closed', reason: 'That date is in the past' });
+});
+
 test('availability excludes occupied appointments and competing booking drafts', async () => {
   const originals = {
     bookingFindMany: prisma.booking.findMany,
@@ -406,12 +536,19 @@ test('availability excludes occupied appointments and competing booking drafts',
   (prisma.booking.findMany as any) = async () => bookings;
   (prisma.bookingDraft.findMany as any) = async ({ where }: any) => {
     assert.deepEqual(where.step.in, ['awaiting_confirmation', 'payment_pending']);
-    return drafts.filter((draft) => draft.id !== where.id?.not);
+    return drafts.filter((draft) => draft.id !== where.id?.not
+      && where.step.in.includes(draft.step)
+      && draft.updatedAt >= where.updatedAt.gte
+      && draft.dateTimeIso !== null);
   };
   (googleCalendarService.getEvents as any) = async () => [];
 
   try {
-    let slots = await bookingService.getAvailableSlots('2026-10-06', 150);
+    const slotList = (result: Awaited<ReturnType<typeof bookingService.getAvailableSlots>>) => {
+      assert.ok(Array.isArray(result), 'expected an open day');
+      return result;
+    };
+    let slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
     assert.equal(slots.includes('13:00'), false);
 
     bookings = [];
@@ -419,11 +556,25 @@ test('availability excludes occupied appointments and competing booking drafts',
       id: 'competing-draft',
       service: 'THE ICON',
       dateTimeIso: '2026-10-06T10:00:00.000Z',
+      step: 'collecting_slots',
+      date: '2026-10-06',
+      time: '13:00',
+      updatedAt: new Date(),
     }];
-    slots = await bookingService.getAvailableSlots('2026-10-06', 150);
-    assert.equal(slots.includes('13:00'), false);
+    slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
+    assert.equal(slots.includes('13:00'), true, 'collection never holds a slot, even with an ISO value');
+    for (const step of ['awaiting_confirmation', 'payment_pending']) {
+      drafts[0].step = step;
+      drafts[0].updatedAt = new Date();
+      slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
+      assert.equal(slots.includes('13:00'), false, step);
+      drafts[0].updatedAt = new Date(Date.now() - 16 * 60 * 1000);
+      slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150));
+      assert.equal(slots.includes('13:00'), true, 'holds expire after fifteen minutes');
+    }
 
-    slots = await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft');
+    drafts[0].updatedAt = new Date();
+    slots = slotList(await bookingService.getAvailableSlots('2026-10-06', 150, undefined, 'competing-draft'));
     assert.equal(slots.includes('13:00'), true);
   } finally {
     prisma.booking.findMany = originals.bookingFindMany;
@@ -560,8 +711,10 @@ test('does not claim payment was received without a successful payment record', 
   const originals = {
     bookingFindFirst: prisma.booking.findFirst,
     paymentFindFirst: prisma.payment.findFirst,
+    draftFindUnique: prisma.bookingDraft.findUnique,
   };
   let payment: any = null;
+  (prisma.bookingDraft.findUnique as any) = async () => null;
   (prisma.booking.findFirst as any) = async () => ({
     id: 'confirmed-booking',
     service: 'THE ICON',
@@ -571,7 +724,7 @@ test('does not claim payment was received without a successful payment record', 
 
   try {
     const unpaidStatusReply = await agent.getBookingStatusReply('customer-123');
-    assert.match(unpaidStatusReply || '', /session is confirmed/i);
+    assert.match(unpaidStatusReply || '', /session for the Icon edition is confirmed/i);
     assert.match(unpaidStatusReply || '', /can't verify a successful payment/i);
     assert.doesNotMatch(unpaidStatusReply || '', /payment is received/i);
 
@@ -581,6 +734,7 @@ test('does not claim payment was received without a successful payment record', 
   } finally {
     prisma.booking.findFirst = originals.bookingFindFirst;
     prisma.payment.findFirst = originals.paymentFindFirst;
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
   }
 });
 
@@ -615,13 +769,14 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     bookingDraftFindUnique: prisma.bookingDraft.findUnique,
     bookingFindUnique: prisma.booking.findUnique,
     bookingUpdate: prisma.booking.update,
-    bookingDraftDelete: prisma.bookingDraft.delete,
+    bookingDraftDeleteMany: prisma.bookingDraft.deleteMany,
     updateCalendarEvent: googleCalendarService.updateEvent,
     notifyRescheduleAdmin: agent.notifyRescheduleAdmin,
   };
   let bookingUpdated = false;
   let draftCleared = false;
   (prisma.bookingDraft.findUnique as any) = async () => ({
+    id: 'reschedule-draft-123',
     step: 'reschedule_confirm',
     bookingId: 'booking-123',
     date: '2026-10-04',
@@ -639,15 +794,18 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     bookingUpdated = true;
     return {};
   };
-  (prisma.bookingDraft.delete as any) = async () => {
+  (prisma.bookingDraft.deleteMany as any) = async ({ where }: any) => {
+    assert.deepEqual(where, { id: 'reschedule-draft-123', customerId: 'customer-123', step: 'reschedule_confirm', bookingId: 'booking-123' });
     draftCleared = true;
-    return {};
+    return { count: 1 };
   };
   (googleCalendarService.updateEvent as any) = () => new Promise(() => {});
   agent.notifyRescheduleAdmin = () => new Promise(() => {});
 
   try {
-    const reply = await agent.tryImmediateConfirmation('customer-123');
+    const reply = await agent.tryImmediateConfirmation('customer-123', 'yes', [{
+      role: 'assistant', content: 'If that works for you, reply yes and I will confirm it.',
+    }]);
 
     assert.match(reply, /session has been moved/i);
     assert.equal(bookingUpdated, true);
@@ -656,7 +814,7 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
     prisma.booking.findUnique = originals.bookingFindUnique;
     prisma.booking.update = originals.bookingUpdate;
-    prisma.bookingDraft.delete = originals.bookingDraftDelete;
+    prisma.bookingDraft.deleteMany = originals.bookingDraftDeleteMany;
     googleCalendarService.updateEvent = originals.updateCalendarEvent;
     agent.notifyRescheduleAdmin = originals.notifyRescheduleAdmin;
   }
@@ -787,9 +945,15 @@ test('captures a recipient named before the clarification reply', () => {
   assert.equal(agent.shouldCaptureRecipientName('Maryanne Nuduta', history), true);
 });
 
-test('does not guess what an ambiguous 10k deposit means', () => {
+test('does not guess what an ambiguous 10k deposit means', async () => {
+  const originalPackageFindUnique = prisma.package.findUnique;
+  (prisma.package.findUnique as any) = async () => ({ name: 'THE BLOOM', deposit: 2000 });
+  try {
   assert.equal(agent.shouldClarifyAmbiguousDeposit('she wants the one with the 10 sh deposit in it'), true);
-  assert.match(agent.getAmbiguousDepositReply(), /Do you mean a Ksh 10,000 deposit|add-on/i);
+    assert.match(await agent.getAmbiguousDepositReply(), /Do you mean a Ksh 10,000 deposit|add-on/i);
+  } finally {
+    prisma.package.findUnique = originalPackageFindUnique;
+  }
 });
 
 test('anchors numeric booking dates to the customer message', () => {
@@ -826,12 +990,99 @@ test('uses the exact date when the offered weekday context includes it', () => {
   );
 });
 
-test('formats additions as plain WhatsApp text', () => {
-  const reply = agent.getAdditionsReply();
+test('formats additions as plain WhatsApp text and uses the package deposit helper', async () => {
+  const originalPackageFindFirst = prisma.package.findFirst;
+  (prisma.package.findFirst as any) = async () => ({ name: 'THE BLOOM', deposit: 2500 });
+  try {
+    const reply = await agent.getAdditionsReply();
 
-  assert.doesNotMatch(reply, /\|.*\|/);
-  assert.match(reply, /Extra edited photo: Ksh 1,000 each/);
-  assert.match(reply, /Nothing has been added yet/);
+    assert.doesNotMatch(reply, /\|.*\|/);
+    assert.match(reply, /Extra edited photo: Ksh 1,000 each/);
+    assert.match(reply, /not included in the Ksh 2,500 deposit/);
+    assert.match(reply, /Nothing has been added yet/);
+  } finally {
+    prisma.package.findFirst = originalPackageFindFirst;
+  }
+});
+
+test('the additions reply is recognized by its follow-up matcher', () => {
+  const reply = buildAdditionsReply(null);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true);
+  assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: 'Your session is on Friday.' }]), false);
+});
+
+test('earliest photo delivery replies stay paired with their request matcher', async () => {
+  const originalFindFirst = prisma.booking.findFirst;
+  try {
+    (prisma.booking.findFirst as any) = async () => null;
+    const noBookingReply = await agent.getEarliestImageDeliveryReply('customer-123');
+    assert.equal(agent.shouldUseEarliestImageDeliveryReply('When can I get the photos?'), true);
+    assert.match(noBookingReply, /share your booked date/i);
+
+    (prisma.booking.findFirst as any) = async () => ({ dateTime: new Date('2026-07-01T07:00:00.000Z') });
+    const bookedReply = await agent.getEarliestImageDeliveryReply('customer-123');
+    assert.equal(agent.shouldUseEarliestImageDeliveryReply('When is the delivery date for images?'), true);
+    assert.match(bookedReply, /earliest delivery date is/);
+  } finally {
+    prisma.booking.findFirst = originalFindFirst;
+  }
+});
+
+test('static reply builders remain paired with their request matchers', async () => {
+  const originalGetPackageForDeposit = agent.getPackageForDeposit;
+  const originalGetDepositForPackage = agent.getDepositForPackage;
+  const originalStudioInfoFindFirst = prisma.studioInfo.findFirst;
+  const originalPackageFindMany = prisma.package.findMany;
+  agent.getPackageForDeposit = async () => null;
+  agent.getDepositForPackage = () => null;
+  (prisma.studioInfo.findFirst as any) = async () => null;
+  (prisma.package.findMany as any) = async () => [];
+
+  try {
+    const bookingProcessReply = await agent.getBookingProcessReply();
+    const pairs: Array<{ message: string; matches: (message: string) => boolean; reply: string }> = [
+      { message: "What's your cheapest package?", matches: isPackageBudgetRequest, reply: buildPackageBudgetReply() },
+      { message: 'What add-ons do you have?', matches: isAdditionsRequest, reply: buildAdditionsReply(null) },
+      { message: 'What happens after the shoot?', matches: isPostShootProcessRequest, reply: buildPostShootProcessReply() },
+      { message: 'Can I get raw files?', matches: isRawFilesRequest, reply: buildRawFilesReply() },
+      { message: 'Do you do bespoke shoots?', matches: isBespokeRequest, reply: buildBespokeReply() },
+      { message: "I'm travelling from abroad", matches: isTravellingMothersRequest, reply: buildTravellingMothersReply() },
+      { message: "What's your instagram?", matches: isSocialMediaRequest, reply: buildSocialMediaReply() },
+      { message: 'How to book a session?', matches: isBookingProcessRequest, reply: bookingProcessReply },
+      { message: 'I want to book a session for my sister', matches: isBookingForSomeoneElseRequest, reply: buildBookingForSomeoneElseReply() },
+      { message: 'Can my sister join the shoot with me?', matches: isMultiPersonBookingRequest, reply: buildMultiPersonBookingReply() },
+    ];
+
+    for (const pair of pairs) {
+      assert.equal(pair.matches(pair.message), true, pair.message);
+      assert.ok(pair.reply.length > 0, pair.message);
+    }
+    assert.equal(buildBusinessIntroductionReply(), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
+    assert.match(buildContactDetailsReply(), /Parklands, Nairobi/);
+    assert.match(buildWebsiteReply(), /fiestahousematernity\.com/);
+    assert.match(buildPortfolioReply(), /portfolio/);
+    assert.match(getReviewPageReply('Where can I read your reviews?') || '', /\/reviews/);
+    assert.match(getSuspendingConceptGalleryReply('Where can I see the Suspending Concept?', []) || '', /\/gallery\/suspending-concept/);
+  } finally {
+    agent.getPackageForDeposit = originalGetPackageForDeposit;
+    agent.getDepositForPackage = originalGetDepositForPackage;
+    prisma.studioInfo.findFirst = originalStudioInfoFindFirst;
+    prisma.package.findMany = originalPackageFindMany;
+  }
+});
+
+test('confirmation proposal builders remain recognized by the history matcher', () => {
+  const replies = [
+    buildBookingProposalConfirmation('THE ICON', '2026-10-10', '15:00', 3210),
+    buildRescheduleProposalConfirmation('THE ICON', '2026-10-17', '16:00'),
+    buildTimeOnlyRescheduleProposal('THE ICON', 'Saturday, October 10', '3:00 PM'),
+    buildPackageDepositProposal('THE ICON', 'Saturday, October 10', '3:00 PM', 3210),
+    buildCancellationProposal('THE ICON', 'THE ICON on Saturday, October 10 at 3:00 PM', 'It is eligible under policy.'),
+  ];
+
+  for (const reply of replies) {
+    assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: reply }]), true, reply);
+  }
 });
 
 test('recognizes an add-on selection without restarting booking', () => {
@@ -1199,6 +1450,7 @@ test('includes add-ons linked through a booking session note when invoicing', as
     assert.deepEqual(addonUpdateWhere, {
       ...expectedScope,
       status: { in: ['pending', 'confirmed'] },
+      unitPrice: { gt: 0 },
     });
   } finally {
     prisma.customerSessionNote.findMany = originals.sessionNoteFindMany;
@@ -1375,9 +1627,68 @@ test('renders package cards without corrupted markers or markdown', () => {
   assert.match(card, /THE ICON - Ksh 35,000/);
   assert.match(card, /Session length: 2\.5 hours/);
   assert.match(card, /15 final edited photos/);
-  assert.match(card, /4 studio outfits with styling/);
-  assert.match(card, /1 A3 fine art mount/);
+  assert.match(card, /4 outfits/);
+  assert.match(card, /Photo mount \(size to be confirmed\)/);
+  assert.doesNotMatch(card, /studio outfits|A3|with styling/);
   assert.doesNotMatch(card, /[âðï�]|\*|â€¢/);
+});
+
+test('six inclusion references agree with the actual seed and local FAQ facts', () => {
+  const seedPath = path.join(__dirname, '../../../scripts/seed-packages.ts');
+  const source = ts.createSourceFile(seedPath, readFileSync(seedPath, 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.filter(ts.isVariableStatement)
+    .flatMap((statement) => [...statement.declarationList.declarations])
+    .find((entry) => ts.isIdentifier(entry.name) && entry.name.text === 'packages');
+  assert.ok(declaration?.initializer && ts.isArrayLiteralExpression(declaration.initializer));
+  const rows: Record<string, unknown>[] = declaration.initializer.elements.map((element) => {
+    assert.ok(ts.isObjectLiteralExpression(element));
+    return Object.fromEntries(element.properties.map((property) => {
+      assert.ok(ts.isPropertyAssignment(property));
+      assert.ok(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name));
+      const value = property.initializer;
+      if (ts.isStringLiteral(value)) return [property.name.text, value.text];
+      if (ts.isNumericLiteral(value)) return [property.name.text, Number(value.text)];
+      if (value.kind === ts.SyntaxKind.TrueKeyword) return [property.name.text, true];
+      if (value.kind === ts.SyntaxKind.FalseKeyword) return [property.name.text, false];
+      assert.equal(value.kind, ts.SyntaxKind.NullKeyword);
+      return [property.name.text, null];
+    }));
+  });
+  const faq: { id: string; answer: string }[] = JSON.parse(readFileSync(path.join(__dirname, '../../../knowledge_base_rows.json'), 'utf8'));
+  for (const [name, reference] of Object.entries(SEED_EDITION_INCLUSIONS)) {
+    assert.equal(SEED_COMPARISON_DURATIONS[name.toLowerCase()], Number.parseFloat(reference.duration) * 60, `${name}: scheduling duration`);
+    const row = rows.find((entry) => entry.name === name);
+    assert.ok(row, name);
+    for (const [field, value] of Object.entries(reference)) {
+      if (field !== 'inclusions') assert.equal(row[field], value, `${name}: ${field}`);
+    }
+    const answer = faq.find((entry) => entry.id === `pkg_${name.replace(/^THE /, '').toLowerCase()}`)?.answer || '';
+    assert.ok(answer.includes(`${reference.duration} studio time`), `${name}: FAQ duration`);
+    assert.ok(answer.includes(`${reference.images} final edited photos`), `${name}: FAQ photos`);
+    assert.ok(answer.includes(`${reference.outfits} studio outfits + styling`), `${name}: FAQ outfits`);
+    for (const item of reference.inclusions) {
+      if (/styled wigs?$|fine art mount$|Power Suit|Reel/.test(item)) assert.ok(answer.includes(item.replace(/^5 studio outfits with styling, including the /, '')), `${name}: ${item}`);
+    }
+  }
+  assert.equal(Object.keys(SEED_EDITION_INCLUSIONS).length, 6);
+  assert.equal(SEED_EDITION_INCLUSIONS['THE EMPRESS'], undefined);
+});
+
+test('edition names cannot create unrecorded inclusions in cards', () => {
+  const row = { price: 35000, duration: '2.5 hours', images: 15, makeup: false, outfits: 0, styling: false,
+    photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null };
+  for (const name of ['THE ICON', 'THE EMPRESS', 'THE GODDESS']) {
+    const card = agent.buildPackageCard({ ...row, name });
+    assert.doesNotMatch(card, /wig|Power Suit|Reel|A2|A3|flowers|Sculpture|Signature|Flagship/);
+  }
+  const card = agent.buildPackageCard({ ...row, name: 'THE GODDESS', wig: true, mount: true, balloonBackdrop: true });
+  assert.match(card, /quantity to be confirmed/);
+  assert.match(card, /size to be confirmed/);
+  assert.match(card, /design to be confirmed/);
+  assert.doesNotMatch(card, /2 styled wigs|Power Suit|Reel|A2|A3|flowers|Sculpture/);
+  const explicit = agent.buildPackageCard({ ...row, name: 'An edition', inclusions: ['4 studio outfits with styling', '1 A3 fine art mount'] });
+  assert.match(explicit, /4 studio outfits with styling\n- 1 A3 fine art mount/);
+  assert.doesNotMatch(explicit, /15 final edited photos|quantity to be confirmed|size to be confirmed/);
 });
 
 test('answers package-inclusion follow-ups from stored package facts', async () => {
@@ -1385,19 +1696,23 @@ test('answers package-inclusion follow-ups from stored package facts', async () 
   (prisma.package.findMany as any) = async () => [
     {
       name: 'THE BLOOM', price: 15000, duration: '1.5 hours', images: 6, makeup: true, outfits: 2,
-      photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null,
+      styling: true, photobook: false, photobookSize: null, mount: false, balloonBackdrop: false, wig: false, notes: null,
     },
     {
       name: 'THE ICON', price: 35000, duration: '2.5 hours', images: 15, makeup: true, outfits: 4,
-      photobook: false, photobookSize: null, mount: true, balloonBackdrop: false, wig: false, notes: null,
+      styling: true, photobook: false, photobookSize: null, mount: true, balloonBackdrop: false, wig: false, notes: null,
     },
   ];
 
   try {
     const reply = await agent.getPackageCatalogReply(true);
-    assert.match(reply || '', /Here is what each package includes/);
-    assert.match(reply || '', /THE BLOOM - Ksh 15,000[\s\S]*Session length: 1\.5 hours[\s\S]*6 final edited photos/);
-    assert.match(reply || '', /THE ICON - Ksh 35,000[\s\S]*15 final edited photos[\s\S]*1 A3 fine art mount/);
+    assert.match(reply || '', /Here are our maternity editions/);
+    assert.match(reply || '', /THE BLOOM - Ksh 15,000 \| 1\.5 hours \| 6 edited photos/);
+    assert.equal(conversationFlows.isPackageInclusionFollowUp('so what does each come with', [{ role: 'assistant', content: reply! }]), true);
+    for (const term of ['packages', 'editions']) assert.equal(conversationFlows.isPackageCatalogRequest(`what ${term} do you have`), true);
+    const detail = await agent.getPackageCatalogReply(true, 'What does THE ICON include?');
+    assert.match(detail || '', /15 final edited photos[\s\S]*4 studio outfits with styling[\s\S]*1 A3 fine art mount/);
+    assert.doesNotMatch(detail || '', /THE BLOOM|size to be confirmed/);
     assert.doesNotMatch(reply || '', /THE BLOOM[\s\S]*?- 5 hours|THE BLOOM[\s\S]*?25 final edited photos/);
   } finally {
     prisma.package.findMany = originalFindMany;
