@@ -718,7 +718,7 @@ test('canned replies and exact tool proposals bypass verification and cannot be 
     return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 3 } } };
   };
   const receipt = await instance.runAgent('exact-proposal', 'confirm', [{ role: 'assistant', content: 'The deposit is KSH 2000. Reply yes to confirm.' }], 'whatsapp');
-  assert.match(receipt.content, /initiated a deposit payment request of KSH 2000/);
+  assert.match(receipt.content, /initiated a deposit payment request of Ksh 2,000/);
   assert.doesNotMatch(receipt.content, /No payment|30%/);
   assert.equal(confirmations, 1);
   assert.equal(completions, 2);
@@ -2104,13 +2104,15 @@ test('reschedule completion only cleans up its own proposal, preserving a replac
 });
 
 test('payment-pending reply uses a real apostrophe', async () => {
-  const original = prisma.bookingDraft.findUnique;
-  (prisma.bookingDraft.findUnique as any) = async () => ({ step: 'payment_pending', service: 'THE ICON' });
+  const originals = { draft: prisma.bookingDraft.findUnique, payment: prisma.payment.findFirst };
+  (prisma.bookingDraft.findUnique as any) = async () => ({ id: 'draft-1', step: 'payment_pending', service: 'THE ICON', version: 2, updatedAt: new Date() });
+  (prisma.payment.findFirst as any) = async () => ({ id: 'payment-1', amount: 2000, phone: '254700000123', status: 'pending', updatedAt: new Date() });
   try {
     const reply = await agent.tryImmediateConfirmation('customer-1', 'yes');
     assert.match(reply, /^I’ve already sent the M-Pesa deposit prompt/);
   } finally {
-    prisma.bookingDraft.findUnique = original;
+    prisma.bookingDraft.findUnique = originals.draft;
+    prisma.payment.findFirst = originals.payment;
   }
 });
 
@@ -2230,7 +2232,7 @@ test('"yes" after a booking proposal still sends the M-Pesa prompt', async () =>
   try {
     const reply = await instance.handleMessage('customer-1', 'yes', [PAYMENT_PROPOSAL], 'whatsapp');
     assert.equal(paymentStarted, true);
-    assert.match(reply, /sent the M-Pesa deposit prompt of KSH 2000/);
+    assert.match(reply, /sent the M-Pesa deposit prompt of Ksh 2,000/);
   } finally {
     prisma.bookingDraft.findUnique = original;
   }

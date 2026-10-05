@@ -18,6 +18,8 @@ import {
   OFFICIAL_WEBSITE_URLS,
   PACKAGE_PRICING_FALLBACK,
   PAYMENT_CONFIRMATION_REQUIRED_REPLY,
+  PAYMENT_ALREADY_PENDING,
+  PAYMENT_ATTEMPTS_EXHAUSTED,
   PAYMENT_PROMPT_UNRECORDED,
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
@@ -113,6 +115,7 @@ import {
   touchCustomerMemory as updateCustomerMemory,
 } from './usage-and-memory';
 import { buildBookingProcessReply } from './booking-process-reply';
+import { handlePaymentRecovery, paymentAttemptsExhaustedReply, type PaymentMessageKind } from './payment-recovery';
 import {
   extractInvoiceNumber as parseInvoiceNumber,
   extractInvoiceSessionDateRange as parseInvoiceSessionDateRange,
@@ -846,11 +849,6 @@ export class AgentService {
     return isSocialMediaRequest(userMessage);
   }
 
-  private shouldHandleResendRequest(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(resend|send\s+again|retry|repeat|send\s+it\s+again)/.test(text);
-  }
-
   private shouldUseMultiPersonBookingReply(userMessage: string): boolean {
     return isMultiPersonBookingRequest(userMessage);
   }
@@ -1482,7 +1480,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
         ? `PAYMENT SUCCEEDED via M-Pesa${paidPayment.mpesaReceipt ? ` (Receipt: ${paidPayment.mpesaReceipt})` : ''}. The booking is confirmed. Do NOT claim the payment is pending.`
         : 'The booking is confirmed, but no successful payment is recorded. Do not say the deposit was paid or received; tell the customer the studio team can verify payment status.';
     } else if (draftBeforeThisTurn?.step === 'payment_pending') {
-      paymentSummary = 'Payment pending user M-Pesa PIN entry for booking draft.';
+      paymentSummary = 'A deposit payment step is open for the booking draft. Do not say whether a prompt is pending, failed, cancelled or paid, and do not offer to resend it; payment questions are answered from payment records.';
     }
 
     // 1b. Long-term memory beyond the last 10 messages of raw history
@@ -1749,7 +1747,7 @@ ${contextString}`;
                 const result = await this.executeConfirmBookingTool(customerId, initialDraftStep, expectedDeposit);
                 if (Number.isInteger(result.depositAmount) && result.depositAmount > 0) verifiedToolDeposits.add(result.depositAmount);
                 confirmedActionThisTurn = true;
-                exactProposalReply = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed.`;
+                exactProposalReply = `I've initiated a deposit payment request of Ksh ${result.depositAmount.toLocaleString()} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed.`;
                 toolResponse = `${exactProposalReply} This is DONE - do not call any more booking tools this turn.`;
               }
             }
@@ -2443,7 +2441,8 @@ ${contextString}`;
     if (['reschedule_confirm', 'cancel_confirm'].includes(draft.step) && !this.previousMessageRequestsConfirmation(history)) return null;
 
     if (draft.step === 'payment_pending') {
-      return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
+      const consent = !userMessage || this.isPaymentConfirmation(userMessage);
+      return this.getPaymentRecoveryReply(customerId, userMessage, consent ? 'consent' : 'status_check');
     }
 
     if (draft.step === 'awaiting_confirmation') {
@@ -2454,8 +2453,20 @@ ${contextString}`;
       if (expectedDeposit === null || !this.previousMessageRequestsConfirmation(history)) {
         return this.getBookingStatusReply(customerId);
       }
-      const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
-      return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
+      let result;
+      try {
+        result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
+      } catch (error: any) {
+        if (error?.code === PAYMENT_ATTEMPTS_EXHAUSTED) {
+          await this.escalate(customerId, 'booking', `Payment prompt limit reached for ${draft.service || 'the booking'} on ${draft.date || 'unknown date'} ${draft.time || ''}. No further prompts will be sent automatically. Contact the customer to finish the booking.`);
+          return paymentAttemptsExhaustedReply();
+        }
+        if (error?.code === PAYMENT_ALREADY_PENDING) {
+          return this.getPaymentRecoveryReply(customerId, userMessage, 'consent');
+        }
+        throw error;
+      }
+      return `I've sent the M-Pesa deposit prompt of Ksh ${result.depositAmount.toLocaleString()} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
 
     if (draft.step === 'reschedule_confirm' && this.previousMessageRequestsConfirmation(history)) {
@@ -2493,58 +2504,9 @@ ${contextString}`;
     return null;
   }
 
-  private async tryHandlePaymentResend(customerId: string): Promise<string | null> {
-    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-
-    // Valid resend path: customer has a pending payment draft.
-    if (draft?.step === 'payment_pending') {
-      const payment = await prisma.payment.findFirst({
-        where: { bookingDraftId: draft.id, status: { in: ['pending', 'failed'] } },
-        orderBy: { updatedAt: 'desc' },
-      });
-
-      if (!payment) {
-        return 'I cannot find an active payment request to resend right now. Please say "book" and I will re-open the booking payment step for you.';
-      }
-
-      try {
-        const mpesaResponse = await mpesaService.initiateStkPush(customerId, payment.amount, draft.id);
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: 'pending',
-            checkoutRequestId: mpesaResponse.CheckoutRequestID,
-            updatedAt: new Date(),
-          }
-        });
-
-        return `Done - I've resent the M-Pesa deposit prompt of KSH ${payment.amount} to your phone. Please enter your PIN to complete payment.`;
-      } catch (error: any) {
-        console.error('Failed to resend M-Pesa STK push:', error);
-        return `I couldn't resend the payment prompt right now. Please try again in a minute, or I can have the team assist immediately.`;
-      }
-    }
-
-    // If a successful payment already exists for an upcoming confirmed booking,
-    // never offer to resend payment.
-    const confirmedPaidBooking = await prisma.payment.findFirst({
-      where: {
-        status: 'success',
-        booking: {
-          customerId,
-          status: 'confirmed',
-          dateTime: { gte: new Date() },
-        }
-      },
-      include: { booking: true },
-      orderBy: { updatedAt: 'desc' },
-    });
-
-    if (confirmedPaidBooking?.booking) {
-      return `Your payment is already successful and your booking is confirmed for ${confirmedPaidBooking.booking.service} on ${dayjs(confirmedPaidBooking.booking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. No resend is needed.`;
-    }
-
-    return null;
+  /** Payment questions are answered from the draft step and payment row only; they never reach the model. */
+  private async getPaymentRecoveryReply(customerId: string, userMessage: string, forcedKind?: PaymentMessageKind): Promise<string | null> {
+    return handlePaymentRecovery.call(this, customerId, userMessage, forcedKind);
   }
 
   /**

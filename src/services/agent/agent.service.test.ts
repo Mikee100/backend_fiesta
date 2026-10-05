@@ -201,19 +201,25 @@ test('only applies confirmation after the assistant presented a proposal', () =>
 
 test('ignores duplicate yes replies after a payment prompt has already been sent', async () => {
   const originalFindUnique = prisma.bookingDraft.findUnique;
+  const originalPaymentFindFirst = prisma.payment.findFirst;
   (prisma.bookingDraft.findUnique as any) = async () => ({
+    id: 'draft-123',
     customerId: 'customer-123',
     service: 'THE ICON',
     step: 'payment_pending',
     date: '2026-09-19',
-    time: '15:00'
+    time: '15:00',
+    version: 2,
+    updatedAt: new Date(),
   });
+  (prisma.payment.findFirst as any) = async () => ({ id: 'payment-123', amount: 2000, phone: 'customer-123', status: 'pending', updatedAt: new Date() });
 
   try {
     const result = await agent.tryImmediateConfirmation('customer-123');
     assert.match(result || '', /already sent the M-Pesa.*prompt|already sent the M-Pesa/i);
   } finally {
     prisma.bookingDraft.findUnique = originalFindUnique;
+    prisma.payment.findFirst = originalPaymentFindFirst;
   }
 });
 

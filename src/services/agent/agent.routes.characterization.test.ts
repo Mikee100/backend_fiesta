@@ -6,7 +6,7 @@ import { AgentService } from './agent.service';
 import { ADDON_MAKEUP_CLARIFICATION } from './constants';
 
 type Msg = { role: 'user' | 'assistant'; content: string };
-type HarnessOptions = { natural?: boolean; nullRoutes?: string[] };
+type HarnessOptions = { natural?: boolean; nullRoutes?: string[]; paymentPending?: boolean };
 
 const ASYNC_HANDLERS: Record<string, string> = {
   getBookingIdentityCorrectionReply: 'identityCorrection',
@@ -17,7 +17,6 @@ const ASYNC_HANDLERS: Record<string, string> = {
   getUpcomingAppointmentDetailsReply: 'upcomingAppointmentDetails',
   sendStoredInvoiceToCustomer: 'invoice',
   getPastAppointmentReply: 'pastAppointment',
-  tryHandlePaymentResend: 'paymentResend',
   getPreviousAddonReply: 'previousAddon',
   getEarliestImageDeliveryReply: 'earliestImageDelivery',
   getBookingProcessReply: 'bookingProcess',
@@ -77,6 +76,8 @@ function createHarness(options: HarnessOptions = {}) {
     captureRecipientName: async () => (nullRoutes.has('recipientName') ? null : 'Jane Wanjiku'),
     proposeCancellation: async () => ({ reply: reply('cancellationProposal'), proposed: !nullRoutes.has('cancellationProposal') }),
     runAgent: async () => ({ content: 'ROUTE:runAgent', tokensUsed: 0 }),
+    // The payment handler answers only while a payment_pending draft exists; otherwise it yields.
+    getPaymentRecoveryReply: async () => (options.paymentPending ? reply('paymentRecovery') : null),
   });
 
   for (const [method, route] of Object.entries(ASYNC_HANDLERS)) agent[method] = async () => reply(route);
@@ -125,6 +126,7 @@ type Case = {
   history?: Msg[];
   platform?: string;
   nullRoutes?: string[];
+  paymentPending?: boolean;
   expected: string;
   /** Route in natural assistant mode; defaults to `expected`, or runAgent for natural-gated routes. */
   naturalExpected?: string;
@@ -173,7 +175,12 @@ const CASES: Case[] = [
 
   // Packages / budget / payment resend
   { message: "What's your cheapest package?", expected: 'packageBudget' },
-  { message: 'Can you resend the payment prompt?', expected: 'paymentResend' },
+  { message: 'Can you resend the payment prompt?', paymentPending: true, expected: 'paymentRecovery' },
+  { message: 'Can you resend the payment prompt?', expected: 'runAgent', note: 'no open payment step falls through' },
+  { message: 'yes', paymentPending: true, expected: 'immediateConfirmation', note: 'explicit yes reaches immediateConfirmation, which delegates payment_pending drafts to payment recovery' },
+  { message: 'It has not arrived', paymentPending: true, expected: 'paymentRecovery' },
+  { message: 'Kindly do it the last time', paymentPending: true, expected: 'paymentRecovery' },
+  { message: 'i want to finish the payment', paymentPending: true, expected: 'paymentRecovery' },
 
   // Static info
   { message: 'Where can I see the suspending concept?', expected: 'suspendingConceptGallery' },
@@ -248,11 +255,12 @@ for (const natural of [false, true]) {
       testCase.history?.length ? `(history ${testCase.history.length})` : '',
       testCase.platform ? `[${testCase.platform}]` : '',
       testCase.nullRoutes?.length ? `[null: ${testCase.nullRoutes.join(',')}]` : '',
+      testCase.paymentPending ? '[payment_pending]' : '',
       `-> ${expected}`,
     ].filter(Boolean).join(' ');
 
     test(`route: ${label}`, async () => {
-      const agent = createHarness({ natural, nullRoutes: testCase.nullRoutes });
+      const agent = createHarness({ natural, nullRoutes: testCase.nullRoutes, paymentPending: testCase.paymentPending });
       const reply = await agent.handleMessage('customer-test', testCase.message, testCase.history ?? [], testCase.platform ?? 'whatsapp');
       assert.equal(routeOf(reply), expected, testCase.knownBug ?? testCase.note);
     });
@@ -279,6 +287,7 @@ test('message route order remains unchanged', () => {
     'identityCorrection',
     'recipientName',
     'ambiguousDeposit',
+    'paymentRecovery',
     'rescheduleWithdrawalConfirmation',
     'postActionAcknowledgement',
     'cancellationDeclined',
@@ -295,7 +304,6 @@ test('message route order remains unchanged', () => {
     'bookingForSomeoneElse',
     'multiPersonBooking',
     'packageBudget',
-    'paymentResend',
     'suspendingConceptGallery',
     'reviewPage',
     'businessIntroduction',

@@ -7,7 +7,7 @@
   },
   "main": "server.js",
   "scripts": {
-    "test": "node --require ts-node/register --test --test-reporter=spec src/services/agent/resilience.service.test.ts src/services/agent/agent.service.test.ts src/services/agent/agent.routes.characterization.test.ts src/services/agent/agent.service.regressions.test.ts src/services/agent/agent.respond.test.ts src/services/automation/automation.service.test.ts src/services/messaging/debounce.service.test.ts src/services/messaging/customer-reply.templates.test.ts src/utils/prisma-retry.test.ts src/utils/time.test.ts",
+    "test": "node --require ts-node/register --test --test-reporter=spec src/services/agent/resilience.service.test.ts src/services/agent/agent.service.test.ts src/services/agent/agent.routes.characterization.test.ts src/services/agent/agent.service.regressions.test.ts src/services/agent/agent.respond.test.ts src/services/agent/payment-recovery.test.ts src/services/automation/automation.service.test.ts src/services/messaging/debounce.service.test.ts src/services/messaging/customer-reply.templates.test.ts src/utils/prisma-retry.test.ts src/utils/time.test.ts",
     "test:replay": "node --require ts-node/register --test --test-reporter=spec src/services/agent/agent.conversation-replay.test.ts",
     "build": "npx prisma generate && tsc",
     "postinstall": "prisma generate",

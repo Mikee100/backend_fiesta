@@ -8,8 +8,9 @@ import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, inBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import dayjs from 'dayjs';
-import { PAYMENT_PROMPT_UNRECORDED } from './constants';
+import { PAYMENT_ATTEMPTS_EXHAUSTED, PAYMENT_PROMPT_UNRECORDED } from './constants';
 import { sanitizeSlotValue } from './slot-memory';
+import { draftVersion, MAX_PAYMENT_ATTEMPTS } from './payment-recovery';
 
 export async function executeProposeBookingTool(this: any, customerId: string, name: string, service: string, date: string) {
   name = sanitizeSlotValue(name || '');
@@ -118,8 +119,11 @@ export async function executeConfirmBookingTool(
   if (expectedDeposit === null || expectedDeposit !== depositAmount) {
     throw new Error('The package deposit no longer matches the amount in the customer-visible proposal. Do not start payment; prepare a new proposal and ask for confirmation again.');
   }
+  if (draftVersion(draft) - 1 >= MAX_PAYMENT_ATTEMPTS) {
+    throw Object.assign(new Error('The M-Pesa prompt limit for this booking has been reached. Do not send another prompt; the studio team will follow up.'), { code: PAYMENT_ATTEMPTS_EXHAUSTED });
+  }
 
-  await bookingDraftService.markPaymentPending(customerId);
+  await bookingDraftService.markPaymentPending(customerId, draft.version);
 
   let mpesaResponse: any;
   try {
@@ -128,7 +132,7 @@ export async function executeConfirmBookingTool(
     console.error('Failed to initiate M-Pesa STK Push:', error);
     await prisma.bookingDraft.update({
       where: { customerId },
-      data: { step: 'awaiting_confirmation' },
+      data: { step: 'awaiting_confirmation', ...(Number.isInteger(draft.version) ? { version: draft.version } : {}) },
     }).catch((restoreError) => console.error('Failed to restore booking draft after STK push failure:', restoreError));
     throw new Error(`We couldn't initiate the payment request. Error: ${error.message}`);
   }
