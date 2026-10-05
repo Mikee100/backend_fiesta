@@ -18,7 +18,9 @@ import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
-import { buildAdditionsReply, isAddonListFollowUp } from './replies';
+import { buildAdditionsReply, isAddonListFollowUp, formatCustomerTime } from './replies';
+import { shouldUseBookingStatusReply, getBookingStatusReply } from './appointment-replies';
+import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
 import { DAILY_TOKEN_CAP } from './resilience.service';
 import { BUDGET_HANDOFF_REPLY } from './constants';
@@ -30,6 +32,132 @@ import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIF
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('family styling questions are deterministic team-confirm topics, not invented services', async () => {
+  const instance = withQuietAgent({ runAgent: async () => assert.fail('family styling must not reach the model') });
+  for (const question of ['Do you dress family members?', 'Do you groom my husband?', 'Do partners get outfits and accessories?', 'Can you do makeup for my children?', 'Do you dress my husband for the session?']) {
+    assert.equal(await instance.handleMessage('synthetic-family', question, [], 'whatsapp'), FAMILY_STYLING_TEAM_REPLY);
+  }
+  assert.equal(familyStylingReply('Can you style them?', [{ role: 'user', content: 'My partner and children are joining.' }]), FAMILY_STYLING_TEAM_REPLY);
+  assert.equal(familyStylingReply('What makeup is included in Icon?'), null);
+  const facts = { amounts: [], deposits: [], editions: [] };
+  for (const text of ['Family members can bring their own outfits.', 'We can arrange partner styling as an optional add-on.', 'Outfits and accessories for partners are included.']) {
+    assert.ok(verifyModelReply(text, facts).reasons.includes('unverified_family_styling'));
+  }
+  assert.deepEqual(verifyModelReply(FAMILY_STYLING_TEAM_REPLY, facts).reasons, []);
+});
+
+test('verifier blocks internal-fault explanations to customers', () => {
+  for (const text of ['There was a misunderstanding with my system.', 'We have a technical issue.', 'Sorry for the hiccup.', 'There is a glitch.']) {
+    assert.ok(verifyModelReply(text, { amounts: [], deposits: [], editions: [] }).reasons.includes('internal_fault_language'));
+  }
+});
+
+test('where are we uses the active draft, and only no draft gets the process explainer', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findFirst };
+  context.after(() => { prisma.bookingDraft.findUnique = originals.draft; prisma.booking.findFirst = originals.booking; });
+  let draft: any = { step: 'awaiting_confirmation', service: 'THE ICON', date: '2026-10-06', time: '15:00', name: 'Joan' };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.booking.findFirst as any) = async () => null;
+  const instance = withQuietAgent({
+    getPackageForDeposit: async () => ({ name: 'THE ICON', deposit: 2000 }),
+    getBookingProcessReply: async () => 'PROCESS EXPLAINER',
+    runAgent: async () => assert.fail('booking progress status must not invoke the model'),
+  });
+  const reply = await instance.handleMessage('synthetic-progress', 'So where are we at on our booking process?', [], 'whatsapp');
+  assert.match(reply, /Icon edition.*Tuesday, 6 October 2026.*3:00 PM/);
+  assert.match(reply, /deposit is Ksh 2,000.*Reply yes.*confirmed once the deposit is received/);
+  assert.doesNotMatch(reply, /PROCESS EXPLAINER/);
+  draft = null;
+  assert.equal(await instance.handleMessage('synthetic-progress', 'So where are we at on our booking process?', [], 'whatsapp'), 'PROCESS EXPLAINER');
+});
+
+test('lets do it then confirms an existing visible proposal, or repeats it without lost history', async (context) => {
+  const original = prisma.bookingDraft.findUnique;
+  context.after(() => { prisma.bookingDraft.findUnique = original; });
+  const draft = { step: 'awaiting_confirmation', service: 'THE ICON', date: '2026-10-06', time: '15:00', name: 'Joan' };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  let calls = 0;
+  const instance = withQuietAgent({
+    getPackageForDeposit: async () => ({ name: 'THE ICON', deposit: 2000 }),
+    executeConfirmBookingTool: async (_customer: string, step: string, deposit: number) => {
+      calls++; assert.equal(step, 'awaiting_confirmation'); assert.equal(deposit, 2000);
+      return { depositAmount: 2000, service: 'THE ICON' };
+    },
+    runAgent: async () => assert.fail('payment retry must not restart through the model'),
+  });
+  const history = [{ role: 'assistant' as const, content: buildBookingProposalConfirmation('THE ICON', '2026-10-06', '15:00', 2000) }];
+  assert.match(await instance.handleMessage('synthetic-consent', 'lets do it then', history, 'whatsapp'), /sent the M-Pesa deposit prompt/);
+  assert.equal(calls, 1);
+  const repeated = await instance.handleMessage('synthetic-consent', 'lets do it then', [], 'whatsapp');
+  assert.match(repeated, /still ready for Tuesday, 6 October 2026 at 3:00 PM.*deposit is Ksh 2,000.*Reply yes/);
+  assert.equal(calls, 1, 'lost price context must repeat a proposal, not send payment');
+  assert.equal(instance.isPaymentConfirmation('lets do it then but wait'), false);
+});
+
+test('failed STK retry retains Icon date time and returns a proposal instead of restarting', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, update: prisma.bookingDraft.update, get: bookingDraftService.get, slots: bookingService.getAvailableSlots, pkg: prisma.package.findUnique, stk: mpesaService.initiateStkPush, payment: prisma.payment.upsert };
+  context.after(() => {
+    prisma.bookingDraft.findUnique = originals.draft; prisma.bookingDraft.update = originals.update;
+    bookingDraftService.get = originals.get; bookingService.getAvailableSlots = originals.slots;
+    prisma.package.findUnique = originals.pkg; mpesaService.initiateStkPush = originals.stk; prisma.payment.upsert = originals.payment;
+  });
+  const draft = { id: 'synthetic-failed-push', step: 'awaiting_confirmation', service: 'THE ICON', date: '2026-10-06', time: '15:00', name: 'Joan' };
+  const before = { ...draft };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (bookingDraftService.get as any) = async () => draft;
+  (prisma.bookingDraft.update as any) = async ({ data }: any) => Object.assign(draft, data);
+  (bookingService.getAvailableSlots as any) = async () => ['15:00'];
+  (prisma.package.findUnique as any) = async () => ({ name: 'THE ICON', deposit: 2000 });
+  let attempts = 0;
+  let payments = 0;
+  (mpesaService.initiateStkPush as any) = async () => {
+    if (++attempts === 1) throw new Error('Failed to authenticate with M-Pesa');
+    return { CheckoutRequestID: 'synthetic-success' };
+  };
+  (prisma.payment.upsert as any) = async () => { payments++; return {}; };
+  const instance = withQuietAgent({ runAgent: async () => assert.fail('failed payment must not restart through the model') });
+  const history = [{ role: 'assistant' as const, content: buildBookingProposalConfirmation('THE ICON', '2026-10-06', '15:00', 2000) }];
+  const reply = await instance.handleMessage('synthetic-failed-push', 'lets do it then', history, 'whatsapp');
+  assert.deepEqual(draft, before);
+  assert.equal(payments, 0);
+  assert.match(reply, /Icon edition.*still ready for Tuesday, 6 October 2026 at 3:00 PM.*Reply yes/);
+  assert.doesNotMatch(reply, /my system|technical issue|hiccup|glitch|what date|what time/i);
+  const retried = await instance.handleMessage('synthetic-failed-push', 'yes', [{ role: 'assistant', content: reply }], 'whatsapp');
+  assert.match(retried, /sent the M-Pesa deposit prompt/);
+  assert.equal(attempts, 2);
+  assert.equal(payments, 1);
+  assert.equal(draft.step, 'payment_pending');
+  assert.equal(draft.date, before.date); assert.equal(draft.time, before.time); assert.equal(draft.service, before.service);
+});
+
+test('customer-facing slot times use AM/PM without changing stored slot values', () => {
+  for (const [stored, display] of [['00:00', '12:00 AM'], ['10:30', '10:30 AM'], ['12:00', '12:00 PM'], ['15:00', '3:00 PM'], ['3:00 PM', '3:00 PM']]) {
+    assert.equal(formatCustomerTime(stored), display);
+  }
+  assert.match(buildBookingProposalConfirmation('THE ICON', '2026-10-06', '15:00', 2000), /at 3:00 PM\./);
+});
+
+test('have you booked it reports missing current slots, never a stale Monday closure', async (context) => {
+  assert.equal(shouldUseBookingStatusReply('have you booked it...is that it?'), true);
+  const original = prisma.bookingDraft.findUnique;
+  context.after(() => { prisma.bookingDraft.findUnique = original; });
+  const draft = { step: 'collecting_slots', name: 'Joan', service: 'THE ICON', date: '2026-10-05', time: null as string | null };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  const reply = await getBookingStatusReply('synthetic-status');
+  assert.match(reply || '', /not booked or confirmed yet.*still need a time/);
+  assert.doesNotMatch(reply || '', /Monday|Closed/);
+  const instance = withQuietAgent({
+    getBookingProgressReply: async () => assert.fail('status questions must precede booking progression'),
+    runAgent: async () => assert.fail('status questions must not invoke the model'),
+  });
+  assert.equal(await instance.handleMessage('synthetic-status', 'have you booked it...is that it?', [], 'whatsapp'), reply);
+  draft.time = '15:00';
+  const complete = await instance.handleMessage('synthetic-status', 'have you booked it...is that it?', [], 'whatsapp');
+  assert.match(complete, /not booked or confirmed yet/);
+  assert.doesNotMatch(complete, /Monday|Closed/);
+  assert.equal(extractStatedSlots('lets go with 6th').time, undefined);
+});
 
 test('brand and voice replace redundant rules while retaining the complete client brief', () => {
   const instance = new AgentService() as any;
@@ -60,8 +188,9 @@ test('reworded replies preserve confirmation and add-on matchers', () => {
 });
 
 test('warm booking closing requires both a confirmed booking and successful payment', async (context) => {
-  const originals = { booking: prisma.booking.findFirst, payment: prisma.payment.findFirst };
-  context.after(() => { prisma.booking.findFirst = originals.booking; prisma.payment.findFirst = originals.payment; });
+  const originals = { booking: prisma.booking.findFirst, payment: prisma.payment.findFirst, draft: prisma.bookingDraft.findUnique };
+  context.after(() => { prisma.booking.findFirst = originals.booking; prisma.payment.findFirst = originals.payment; prisma.bookingDraft.findUnique = originals.draft; });
+  (prisma.bookingDraft.findUnique as any) = async () => null;
   (prisma.booking.findFirst as any) = async () => ({ id: 'confirmed', service: 'THE BLOOM', dateTime: new Date('2026-10-06T07:00:00Z') });
   let paid: any = null;
   (prisma.payment.findFirst as any) = async () => paid;
@@ -189,6 +318,167 @@ test('plain information keeps tool schemas off while action/date turns expose th
   }
 });
 
+test('confirmed-session claims cannot conflate an older appointment with a new request', () => {
+  const existing = { status: 'confirmed', dateTime: new Date('2026-10-08T13:00:00Z') };
+  const bad = 'Everything else is set for your confirmed session on 8 Oct 2026 at 4 PM.';
+  assert.equal(agent.isUnverifiedBookingConfirmation(bad, 'okay, so is that it?', [], existing), true);
+  assert.equal(agent.isUnverifiedBookingConfirmation(bad, 'Tell me about my existing session', [], existing), false);
+  assert.equal(agent.isUnverifiedBookingConfirmation('Your confirmed session is on 6 Oct 2026 at 3pm.', 'Tell me about my existing session', [], existing), true);
+  assert.equal(agent.isUnverifiedBookingConfirmation(bad, 'Tell me about my existing session', []), true);
+});
+
+test('add-on list quotes the selected edition deposit and never displays sandbox Ksh 10', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, first: prisma.package.findFirst, unique: prisma.package.findUnique };
+  context.after(() => { prisma.bookingDraft.findUnique = originals.draft; prisma.package.findFirst = originals.first; prisma.package.findUnique = originals.unique; });
+  (prisma.bookingDraft.findUnique as any) = async () => ({ service: 'THE ICON' });
+  (prisma.package.findUnique as any) = async ({ where }: any) => { assert.equal(where.name, 'THE ICON'); return { name: 'THE ICON', deposit: 2000 }; };
+  (prisma.package.findFirst as any) = async ({ where }: any) => { assert.ok(where.name.in.includes('THE ICON')); assert.equal(where.name.in.includes('economy'), false); return { name: 'THE ICON', deposit: 2000 }; };
+  const instance = new AgentService() as any;
+  const expected = instance.getDepositForPackage({ name: 'THE ICON', deposit: 2000 });
+  assert.ok((await instance.getAdditionsReply('deposit-list')).includes(`Ksh ${expected.toLocaleString()} deposit`));
+  assert.ok((await instance.getAdditionsReply()).includes('Ksh 2,000 deposit'));
+  assert.doesNotMatch(buildAdditionsReply(10), /Ksh 10 deposit/);
+  assert.match(buildAdditionsReply(10), /studio team can confirm/);
+});
+
+test('Joan correction retains Icon and closed Monday is answered without model calls', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const originals = { draft: prisma.bookingDraft.findUnique, update: prisma.bookingDraft.updateMany, customer: prisma.customer.findUnique, rename: prisma.customer.update };
+  context.after(() => { prisma.bookingDraft.findUnique = originals.draft; prisma.bookingDraft.updateMany = originals.update; prisma.customer.findUnique = originals.customer; prisma.customer.update = originals.rename; });
+  let draft: any = { id: 'new-icon', step: 'collecting_slots', createdAt: new Date(), name: null, service: null, date: null, time: null };
+  let customer = { id: 'synthetic-joan', name: 'Miriam' };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.updateMany as any) = async ({ data }: any) => { draft = { ...draft, ...data }; return { count: 1 }; };
+  (prisma.customer.findUnique as any) = async () => customer;
+  (prisma.customer.update as any) = async ({ data }: any) => customer = { ...customer, ...data };
+  const instance = withQuietAgent({ rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots, naturalAssistantMode: true,
+    runAgent: async () => { assert.fail('Monday closure must not invoke the model'); },
+  });
+  await instance.rememberBookingSlots('synthetic-joan', 'I would want the Icon', []);
+  assert.equal(draft.service, 'THE ICON');
+  const reply = await instance.handleMessage('synthetic-joan', '5th at 3pm', [], 'whatsapp');
+  assert.match(reply, /2026-10-05 is Monday.*Closed on Mondays/);
+  await instance.rememberBookingSlots('synthetic-joan', 'No its Joan', [{ role: 'assistant', content: 'I have your name as Miriam. Is that correct?' }]);
+  assert.equal(draft.name, 'Joan');
+  assert.equal(customer.name, 'Joan');
+  assert.equal(draft.service, 'THE ICON');
+  assert.equal(draft.time, '15:00');
+  assert.equal(draft.date, '2026-10-05');
+  assert.equal(extractStatedSlots('The icon package').service, 'THE ICON');
+  const mixed = await instance.handleMessage('synthetic-joan', 'Your husband / 5th at 3pm', [], 'whatsapp');
+  assert.match(mixed, /2026-10-05 is Monday.*Closed on Mondays/);
+});
+
+test('reported Joan turns retain current slots and finish with a proposal, never the older booking', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  let customer: any = { id: 'synthetic-run', name: 'Miriam', bookings: [{ id: 'older', status: 'confirmed', service: 'THE BLOOM', dateTime: new Date('2026-10-08T13:00:00Z'), bookingAddons: [], sessionNotes: [] }] };
+  let draft: any = null;
+  const notes: any[] = [];
+  const packages = [{ name: 'THE ICON', price: 35000, deposit: 2000, duration: '2.5 hours' }];
+  stub(prisma.customer, 'findUnique', async () => customer);
+  stub(prisma.customer, 'update', async ({ data }: any) => customer = { ...customer, ...data });
+  stub(prisma.bookingDraft, 'findUnique', async () => draft);
+  stub(prisma.bookingDraft, 'create', async ({ data }: any) => draft = { id: 'current', createdAt: new Date(), ...data });
+  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { draft = { ...draft, ...data }; return { count: 1 }; });
+  stub(prisma.package, 'findMany', async () => packages);
+  stub(prisma.package, 'findUnique', async () => packages[0]);
+  stub(prisma.package, 'findFirst', async () => packages[0]);
+  stub(prisma.booking, 'findFirst', async () => null);
+  stub(prisma.payment, 'findFirst', async () => ({ amount: 2000, mpesaReceipt: 'OLD-TEST' }));
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(prisma.customerSessionNote, 'findFirst', async () => notes.at(-1) || null);
+  stub(bookingService, 'getAvailableSlots', async () => ['15:00']);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  const prompts: string[] = [];
+  let proposed = 0;
+  const instance = withQuietAgent({ naturalAssistantMode: true,
+    rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots,
+    getBookingProgressReply: (AgentService.prototype as any).getBookingProgressReply,
+    runAgent: (AgentService.prototype as any).runAgent,
+    getPackagePricingLine: async () => 'THE ICON: Ksh 35,000.',
+    executeAddNoteTool: async (_customer: string, _date: string, description: string) => { notes.push({ id: 'saved-addon', description }); return { created: true }; },
+    executeProposeBookingTool: async (_customer: string, name: string, service: string, date: string) => {
+      proposed++; assert.equal(name, 'Joan Mwangi'); assert.equal(service, 'THE ICON'); assert.equal(date, '2026-10-06T15:00');
+      draft = { ...draft, step: 'awaiting_confirmation' }; return { depositAmount: 2000 };
+    },
+    executeConfirmBookingTool: async () => { assert.fail('this replay must never send a payment prompt'); },
+    createCompletionWithToolNameGuard: async (params: any) => { prompts.push(params.messages[0].content); return { provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant', content: 'Everything else is set for your confirmed session on 8 Oct 2026 at 4 PM.' } }], usage: { total_tokens: 1 } } }; },
+  });
+  const history: { role: 'user' | 'assistant'; content: string }[] = [];
+  const replies: string[] = [];
+  for (const message of ['I would want the Icon', 'The icon package', '5th at 3pm', 'No its Joan', 'how about 6th at 3pm', 'yess', 'i want the wig styling', 'okay, so is that it?', 'Joan Mwangi']) {
+    const reply = await instance.handleMessage('synthetic-run', message, history.slice(-6), 'whatsapp');
+    replies.push(reply); history.push({ role: 'user', content: message }, { role: 'assistant', content: reply });
+  }
+  assert.equal(draft.service, 'THE ICON'); assert.equal(draft.name, 'Joan Mwangi'); assert.equal(draft.date, '2026-10-06'); assert.equal(draft.time, '15:00');
+  assert.ok(replies.some((reply) => /Monday.*Closed on Mondays/.test(reply)));
+  assert.ok(replies.some((reply) => /full name/.test(reply)));
+  assert.match(replies.at(-1) || '', /the Icon edition.*Tuesday, 6 October 2026.*3:00 PM/);
+  assert.match(replies.at(-1) || '', /deposit is Ksh 2,000/);
+  assert.equal(proposed, 1);
+  assert.ok(replies.every((reply) => !/your confirmed session on 8 Oct/i.test(reply)));
+  draft = { ...draft, step: 'collecting_slots' };
+  const direct = await instance.runAgent('synthetic-run', 'okay, so is that it?', [], 'whatsapp');
+  assert.doesNotMatch(direct.content, /your confirmed session/);
+  assert.match(prompts.at(-1) || '', /SEPARATE EXISTING BOOKING, NOT the current unbooked request/);
+  assert.match(prompts.at(-1) || '', /collecting_slots request is NOT confirmed or paid/);
+  assert.match(prompts.at(-1) || '', /Payment Status: SEPARATE EXISTING BOOKING ONLY/);
+  assert.match(prompts.at(-1) || '', /No payment is verified for the current collecting_slots request/);
+  assert.match(await instance.getBookingStatusReply('synthetic-run'), /current request is not booked or confirmed yet/);
+  draft = { ...draft, name: 'Joan Mwangi', step: 'collecting_slots' };
+  const noExtras = await instance.getBookingProgressReply('synthetic-run', 'no thanks', [{ role: 'assistant', content: 'Would you like optional add-ons?' }]);
+  assert.match(noExtras, /deposit is Ksh 2,000/);
+  assert.equal(proposed, 2);
+  assert.equal(await instance.getBookingProgressReply('synthetic-run', 'okay, so is that it?', []), null);
+  assert.equal(proposed, 2, 'pending proposals must not be recreated');
+});
+
+test('a repeated usable first name after the proposal name request does not create a name loop', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
+  const originals = { draft: prisma.bookingDraft.findUnique, slots: bookingService.getAvailableSlots };
+  context.after(() => { prisma.bookingDraft.findUnique = originals.draft; bookingService.getAvailableSlots = originals.slots; });
+  (prisma.bookingDraft.findUnique as any) = async () => ({ id: 'first-name-only', step: 'collecting_slots', name: 'Joan', service: 'THE ICON', date: '2026-10-06', time: '15:00', createdAt: new Date() });
+  bookingService.getAvailableSlots = async () => ['15:00'];
+  let proposals = 0;
+  const instance = withQuietAgent({ getBookingProgressReply: (AgentService.prototype as any).getBookingProgressReply,
+    executeProposeBookingTool: async (_customer: string, name: string) => { proposals++; assert.equal(name, 'Joan'); return { depositAmount: 2000 }; },
+  });
+  const question = await instance.getBookingProgressReply('first-name-only', 'okay, so is that it?', [], true);
+  assert.match(question, /full name/);
+  const reply = await instance.getBookingProgressReply('first-name-only', 'Joan', [{ role: 'assistant', content: question }], true);
+  assert.match(reply, /deposit is Ksh 2,000/);
+  assert.doesNotMatch(reply, /May I have your full name/);
+  assert.equal(proposals, 1);
+});
+
+test('Icon sandbox deposit ten would be proposed as ten while production rejects it before saving', async (context) => {
+  const originals = { customer: prisma.customer.findUnique, draft: prisma.bookingDraft.findUnique, pkg: prisma.package.findUnique, slots: bookingService.getAvailableSlots, save: bookingDraftService.saveBookingProposal, environment: process.env.MPESA_ENVIRONMENT };
+  context.after(() => {
+    prisma.customer.findUnique = originals.customer; prisma.bookingDraft.findUnique = originals.draft; prisma.package.findUnique = originals.pkg;
+    bookingService.getAvailableSlots = originals.slots; bookingDraftService.saveBookingProposal = originals.save;
+    if (originals.environment === undefined) delete process.env.MPESA_ENVIRONMENT; else process.env.MPESA_ENVIRONMENT = originals.environment;
+  });
+  (prisma.customer.findUnique as any) = async () => ({ id: 'synthetic-icon-ten', name: 'Joan' });
+  (prisma.bookingDraft.findUnique as any) = async () => null;
+  (prisma.package.findUnique as any) = async ({ where }: any) => { assert.equal(where.name, 'THE ICON'); return { name: 'THE ICON', deposit: 10 }; };
+  bookingService.getAvailableSlots = async () => ['15:00'];
+  let saved = 0;
+  (bookingDraftService.saveBookingProposal as any) = async () => { saved++; };
+  process.env.MPESA_ENVIRONMENT = 'sandbox';
+  const result = await agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-10-06T15:00');
+  assert.equal(result.depositAmount, 10);
+  assert.match(buildBookingProposalConfirmation('THE ICON', '2026-10-06', '15:00', result.depositAmount), /deposit is Ksh 10\./);
+  assert.equal(saved, 1);
+  process.env.MPESA_ENVIRONMENT = 'production';
+  await assert.rejects(agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-10-06T15:00'), /below the KSh 2,000 minimum/);
+  assert.equal(saved, 1, 'production must not save a low-deposit proposal');
+});
+
 test('budget cutoff requests a human handoff without exposing limits or invoking the model', async () => {
   const capBefore = DAILY_TOKEN_CAP;
   const escalations: any[] = [];
@@ -262,7 +552,7 @@ test('verifier permits attributed quotes and checked totals without blessing inv
   assert.ok(verifyModelReply('The deposit is 4500.', facts).reasons.includes('deposit_mismatch'));
   assert.deepEqual(verifyModelReply('Saturday 10 October 2026. Tuesday 6 October 2026.', facts).reasons, []);
   assert.ok(verifyModelReply('Saturday 10 October 2026. Monday 6 October 2026.', facts).reasons.includes('weekday_mismatch'));
-  assert.deepEqual(verifyModelReply('We dress your husband in custom outfits.', facts).reasons, [], 'the numeric/date verifier does not certify inclusion promises');
+  assert.ok(verifyModelReply('We dress your husband in custom outfits.', facts).reasons.includes('unverified_family_styling'));
 });
 
 for (const [name, text, reason] of [
@@ -1032,7 +1322,7 @@ test('calendar tools use stored packages and code-owned next-week and weekday re
   assert.equal(instance.getAuthoritativeRequestedDate('2025-10-06', '2026-10-06', '2025-10-06'), '2025-10-06');
   const dateReply = await instance.handleMessage('calendar-customer', '6th October, 10am', [], 'whatsapp');
   assert.match(dateReply, /2026-10-06 is Tuesday/);
-  assert.match(dateReply, /10:00 is available/);
+  assert.match(dateReply, /10:00 AM is available/);
   assert.doesNotMatch(dateReply, /Monday|closed|your name|package\?/);
   assert.equal(draft.date, '2026-10-06');
   assert.equal(draft.time, '10:00');
@@ -1051,6 +1341,23 @@ test('calendar tools use stored packages and code-owned next-week and weekday re
   assert.deepEqual(exposed.at(-1), []);
   assert.equal(queries.length, before);
   assert.equal(rangeLookups, 1);
+
+  let unrelatedCalls = 0;
+  let rejectedTool = '';
+  instance.createCompletionWithToolNameGuard = async (params: any) => {
+    rejectedTool = params.messages.find((message: any) => message.role === 'tool')?.content || '';
+    const message = unrelatedCalls++ === 0
+      ? { role: 'assistant', content: null, tool_calls: [{ id: 'stale-calendar', type: 'function', function: {
+        name: 'get_available_slots', arguments: JSON.stringify({ date: '2026-10-05', service: 'THE BLOOM' }),
+      } }] }
+      : { role: 'assistant', content: '' };
+    return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 1 } } };
+  };
+  const unrelated = await instance.runAgent('calendar-customer', 'have you booked it...is that it?', [], 'whatsapp');
+  assert.match(rejectedTool, /has not requested availability/);
+  assert.equal(queries.length, before);
+  assert.equal(rangeLookups, 1);
+  assert.doesNotMatch(unrelated.content, /Monday|Closed|Available slots/);
 
   draft = { ...draft, service: 'THE BLOOM', createdAt: new Date() };
   for (const [fromDate, toDate, expected] of [
@@ -1092,7 +1399,7 @@ test('collecting_slots ignores confirmations and reports nothing pending', async
     assert.equal(await instance.tryImmediateConfirmation('early-customer', message, [PAYMENT_PROPOSAL]), null);
     assert.equal(await instance.handleMessage('early-customer', message, [PAYMENT_PROPOSAL], 'whatsapp'), 'LLM');
   }
-  assert.equal(await instance.getBookingStatusReply('early-customer'), null);
+  assert.match(await instance.getBookingStatusReply('early-customer'), /current request is not booked or confirmed yet/);
   await assert.rejects(agent.executeConfirmBookingTool('early-customer', EARLY_SLOT_STEP, 2000), /No pending booking proposal/);
   await assert.rejects(agent.executeConfirmRescheduleTool('early-customer', EARLY_SLOT_STEP), /No pending reschedule proposal/);
   await assert.rejects(agent.executeConfirmCancellationTool('early-customer', EARLY_SLOT_STEP), /pending cancellation proposal/);
@@ -1130,6 +1437,7 @@ function withQuietAgent(overrides: Record<string, unknown>) {
   const instance = new AgentService() as any;
   Object.assign(instance, {
     rememberBookingSlots: async () => null,
+    getBookingProgressReply: async () => null,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
     logAiJobMetric: async () => {},
@@ -1142,6 +1450,26 @@ function withQuietAgent(overrides: Record<string, unknown>) {
   });
   return instance;
 }
+
+test('generic agent failure preserves collected booking slots during an unrelated question', async (context) => {
+  const draft = { id: 'current-request', step: 'collecting_slots', name: 'Joan Mwangi', service: 'THE ICON', date: '2026-11-12', time: '10:00' };
+  const before = { ...draft };
+  const originals = { find: prisma.bookingDraft.findUnique, remove: prisma.bookingDraft.deleteMany, upsert: prisma.bookingDraft.upsert, update: prisma.bookingDraft.updateMany };
+  context.after(() => {
+    prisma.bookingDraft.findUnique = originals.find;
+    prisma.bookingDraft.deleteMany = originals.remove;
+    prisma.bookingDraft.upsert = originals.upsert;
+    prisma.bookingDraft.updateMany = originals.update;
+  });
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.deleteMany as any) = async () => assert.fail('fallback must not clear booking slots');
+  (prisma.bookingDraft.upsert as any) = async () => assert.fail('fallback must not replace booking slots');
+  (prisma.bookingDraft.updateMany as any) = async () => assert.fail('fallback must not change booking slots');
+  const instance = withQuietAgent({ runAgent: async () => { throw new Error('synthetic provider failure'); } });
+  const reply = await instance.handleMessage('synthetic-memory', 'Tell me about studio lighting.', [], 'whatsapp');
+  assert.match(reply, /could not process that request/);
+  assert.deepEqual(draft, before);
+});
 
 // #1 Encoding
 test('agent.service.ts contains no mojibake or C1 control characters', () => {
@@ -1632,7 +1960,7 @@ test('a cancellation proposal expires after one hour and a later yes cannot canc
   }
 });
 
-test('cancellation proposals preserve awaiting_confirmation and payment_pending drafts', async () => {
+test('cancellation proposals preserve collected slots and payment drafts', async () => {
   const originalFindUnique = prisma.bookingDraft.findUnique;
   const originalUpsert = prisma.bookingDraft.upsert;
   let activeDraft: any;
@@ -1641,11 +1969,11 @@ test('cancellation proposals preserve awaiting_confirmation and payment_pending 
   (prisma.bookingDraft.upsert as any) = async () => { upserts++; };
 
   try {
-    for (const step of ['awaiting_confirmation', 'payment_pending']) {
+    for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending']) {
       activeDraft = { id: 'active-draft', step, service: 'THE ICON', updatedAt: new Date() };
       const result = await agent.proposeCancellation('customer-1', 'cancel', []);
       assert.equal(result.proposed, false);
-      assert.match(result.reply, step === 'payment_pending' ? /M-Pesa payment prompt is already pending/ : /booking proposal is already awaiting your confirmation/);
+      assert.match(result.reply, step === 'payment_pending' ? /M-Pesa payment prompt is already pending/ : step === 'collecting_slots' ? /booking is already being prepared/ : /booking proposal is already awaiting your confirmation/);
       assert.equal(activeDraft.step, step);
     }
     assert.equal(upserts, 0);
@@ -1653,6 +1981,31 @@ test('cancellation proposals preserve awaiting_confirmation and payment_pending 
     prisma.bookingDraft.findUnique = originalFindUnique;
     prisma.bookingDraft.upsert = originalUpsert;
   }
+});
+
+test('reschedule proposals cannot overwrite collected slots or another pending flow', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findFirst, upsert: prisma.bookingDraft.upsert, slots: bookingService.getAvailableSlots };
+  context.after(() => {
+    prisma.bookingDraft.findUnique = originals.draft;
+    prisma.booking.findFirst = originals.booking;
+    prisma.bookingDraft.upsert = originals.upsert;
+    bookingService.getAvailableSlots = originals.slots;
+  });
+  let draft: any;
+  let writes = 0;
+  let availabilityChecks = 0;
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.booking.findFirst as any) = async () => ({ id: 'older-booking', service: 'THE BLOOM', dateTime: new Date('2026-11-10T12:00:00Z') });
+  (bookingService.getAvailableSlots as any) = async () => { availabilityChecks++; return ['15:00']; };
+  (prisma.bookingDraft.upsert as any) = async ({ update }: any) => { writes++; draft = { ...draft, ...update }; return draft; };
+  for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending', 'cancel_confirm']) {
+    draft = { id: 'current-request', step, name: 'Joan Mwangi', service: 'THE ICON', date: '2026-11-12', time: '10:00' };
+    const before = { ...draft };
+    await assert.rejects(agent.executeProposeRescheduleTool('customer-1', '2026-11-14', '15:00'), /not changed.*request.*reschedule/i);
+    assert.deepEqual(draft, before);
+  }
+  assert.equal(writes, 0);
+  assert.equal(availabilityChecks, 0);
 });
 
 test('system prompt requires a separate explicit cancellation confirmation', async () => {
@@ -1691,6 +2044,7 @@ test('cancellation notification flags a successful deposit for manual refund rev
     notificationCreate: prisma.notification.create,
   };
   let notificationData: any;
+  let cleanupWhere: any;
   (prisma.booking.findMany as any) = async () => [{
     id: 'booking-paid',
     service: 'THE ICON',
@@ -1699,7 +2053,7 @@ test('cancellation notification flags a successful deposit for manual refund rev
     googleEventId: null,
   }];
   (prisma.booking.update as any) = async () => ({});
-  (prisma.bookingDraft.deleteMany as any) = async () => ({ count: 1 });
+  (prisma.bookingDraft.deleteMany as any) = async ({ where }: any) => { cleanupWhere = where; return { count: 1 }; };
   (prisma.payment.findFirst as any) = async () => ({ amount: 2000, mpesaReceipt: 'TEST-RECEIPT' });
   (prisma.notification.create as any) = async ({ data }: any) => {
     notificationData = data;
@@ -1708,6 +2062,7 @@ test('cancellation notification flags a successful deposit for manual refund rev
 
   try {
     const result = await agent.executeCancelBookingTool('customer-1', undefined, 'booking-paid');
+    assert.deepEqual(cleanupWhere, { customerId: 'customer-1', step: 'cancel_confirm', bookingId: 'booking-paid' });
     assert.equal(result.depositPaid, true);
     assert.equal(notificationData.metadata.successfulDepositRecorded, true);
     assert.equal(notificationData.metadata.depositAmount, 2000);
@@ -1722,6 +2077,30 @@ test('cancellation notification flags a successful deposit for manual refund rev
     prisma.payment.findFirst = originals.paymentFindFirst;
     prisma.notification.create = originals.notificationCreate;
   }
+});
+
+test('reschedule completion only cleans up its own proposal, preserving a replacement draft', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findUnique, update: prisma.booking.update, remove: prisma.bookingDraft.delete, removeMany: prisma.bookingDraft.deleteMany };
+  context.after(() => {
+    prisma.bookingDraft.findUnique = originals.draft;
+    prisma.booking.findUnique = originals.booking;
+    prisma.booking.update = originals.update;
+    prisma.bookingDraft.delete = originals.remove;
+    prisma.bookingDraft.deleteMany = originals.removeMany;
+  });
+  const collecting = { id: 'new-request', step: 'collecting_slots', name: 'Joan Mwangi', service: 'THE ICON', date: '2026-11-12', time: '10:00' };
+  let draft: any = { id: 'reschedule-request', step: 'reschedule_confirm', bookingId: 'older-booking', date: '2026-11-14', time: '15:00', dateTimeIso: '2026-11-14T12:00:00Z' };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.booking.findUnique as any) = async () => ({ id: 'older-booking', service: 'THE BLOOM', dateTime: new Date('2026-11-10T12:00:00Z'), googleEventId: null });
+  (prisma.booking.update as any) = async () => { draft = { ...collecting }; return {}; };
+  (prisma.bookingDraft.delete as any) = async () => { draft = null; return {}; };
+  (prisma.bookingDraft.deleteMany as any) = async ({ where }: any) => {
+    assert.deepEqual(where, { id: 'reschedule-request', customerId: 'customer-1', step: 'reschedule_confirm', bookingId: 'older-booking' });
+    if (draft?.id === where.id && draft.step === where.step) { draft = null; return { count: 1 }; }
+    return { count: 0 };
+  };
+  await agent.executeConfirmRescheduleTool('customer-1', 'reschedule_confirm');
+  assert.deepEqual(draft, collecting);
 });
 
 test('payment-pending reply uses a real apostrophe', async () => {
@@ -1887,10 +2266,12 @@ test('post-shoot questions are excluded from upcoming appointment details', () =
 test('a failed immediate confirmation gives a generic reply, not a reschedule-specific one', async () => {
   const instance = withQuietAgent({
     tryImmediateConfirmation: async () => { throw new Error('db down'); },
+    getBookingStatusReply: async () => null,
   });
   const reply = await instance.handleMessage('customer-1', 'yes', [PAYMENT_PROPOSAL], 'whatsapp');
   assert.doesNotMatch(reply, /reschedul/i);
-  assert.match(reply, /couldn’t finish that step/);
+  assert.match(reply, /booking has not been confirmed.*team will help with the deposit prompt/);
+  assert.doesNotMatch(reply, /system|technical issue|hiccup|glitch/i);
 });
 
 // Follow-up #2: date signals

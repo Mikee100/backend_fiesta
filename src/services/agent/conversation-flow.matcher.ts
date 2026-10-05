@@ -54,7 +54,8 @@ export class ConversationFlowMatcher {
   }
 
   isPackageSelection(message: string): boolean {
-    return /(i\s+(like|want|choose|will take|would like)|i(?:'ll|\s+will)\s+(go with|take)|let'?s\s+(go with|do))\s+(the\s+)?(bloom|muse|icon|legend|queen|empress|goddess|standard|economy|executive|gold|platinum|vip|vvip)(\s+(package|edition))?\b/.test(message.toLowerCase());
+    if (/^\s*(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+(?:package|edition))?[.! ]*$/i.test(message)) return true;
+    return /(i\s+(like|want|choose|will take|would like|would want)|i(?:'ll|\s+will)\s+(go with|take)|let'?s\s+(go with|do))\s+(the\s+)?(bloom|muse|icon|legend|queen|empress|goddess|standard|economy|executive|gold|platinum|vip|vvip)(\s+(package|edition))?\b/.test(message.toLowerCase());
   }
 
   isSameBookingSlotRequest(message: string): boolean {

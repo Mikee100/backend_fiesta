@@ -1,6 +1,7 @@
 import prisma from '../../config/prisma';
 import { BOOKING_SLOT_RETENTION_MS, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { resolveCalendarDate } from './extraction';
+import { bookingDateFacts } from '../../utils/time';
 
 export const SLOT_MEMORY_WINDOW_MS = BOOKING_SLOT_RETENTION_MS;
 export const EARLY_SLOT_STEP = 'collecting_slots';
@@ -22,12 +23,16 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
   const slots: Slots = {};
   const named = message.match(/\bmy name is\s+([a-z][a-z' -]{1,79})(?=[.!?,;\r\n]|$)/i);
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
+  const recentNameQuestion = history.filter((entry) => entry.role === 'assistant').slice(-3)
+    .some((entry) => /\bname\b[\s\S]{0,100}\b(?:correct|right)\b/i.test(entry.content));
+  const nameCorrection = recentNameQuestion
+    ? message.match(/^\s*no[, ]+\s*(?:it['’]?s|it is|my name is)\s+([a-z][a-z' -]{1,79})[.! ]*$/i) : null;
   const question = /\?|^\s*(?:what|which|how|can|could|do|does|is|are)\b/i.test(message);
-  const choice = /\b(?:interested in|i want|i choose|i would like|i'll take|please book|actually|let'?s (?:do|go with))\b/i.test(message)
+  const choice = /\b(?:interested in|i want|i would want|i choose|i would like|i'll take|please book|actually|let'?s (?:do|go with))\b/i.test(message)
     || /^(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+package)?[.! ]*$/i.test(message);
   const nameAnswer = !question && !choice && /\b(?:your name|full name|what name)\b/i.test(lastAssistant)
     && /^[a-z][a-z' -]{1,79}$/i.test(message.trim());
-  if (named || nameAnswer) slots.name = sanitizeSlotValue(named?.[1] || message);
+  if (named || nameCorrection || nameAnswer) slots.name = sanitizeSlotValue(named?.[1] || nameCorrection?.[1] || message);
   if (!question && choice) {
     const selected = PACKAGE_NAMES_FOR_EXTRACTION.find((name) => {
       const word = name.replace(/^THE /, '');
@@ -36,7 +41,7 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
     if (selected) slots.service = selected;
   }
 
-  if (!question) {
+  if (!question || /^\s*(?:how|what)\s+about\s+/i.test(message)) {
     const date = resolveCalendarDate(message);
     if (date) slots.date = date;
     const time = message.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
@@ -100,6 +105,12 @@ export async function rememberBookingSlots(customerId: string, message: string, 
     await prisma.customer.update({ where: { id: customerId }, data: { name: stated.name } });
   }
   const service = stated.service || draft?.service;
+  if (stated.date) {
+    const facts = bookingDateFacts(stated.date);
+    if (facts.isMonday || facts.isPast) {
+      return `${facts.date} is ${facts.weekday}. ${facts.isPast ? 'That date is in the past' : 'Closed on Mondays'}. Which other date would work for you?`;
+    }
+  }
   if (profileDefault) {
     return `I have your name as ${profileName}. Is that correct?`;
   }

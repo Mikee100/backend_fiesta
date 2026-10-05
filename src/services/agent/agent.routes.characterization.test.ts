@@ -62,6 +62,7 @@ function createHarness(options: HarnessOptions = {}) {
 
   Object.assign(agent, {
     rememberBookingSlots: async () => null,
+    getBookingProgressReply: async () => null,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
     logAiJobMetric: async () => {},
@@ -221,7 +222,7 @@ const CASES: Case[] = [
   // Confirmation
   { message: 'yes', history: [RESCHEDULE_PROPOSAL], expected: 'immediateConfirmation' },
   { message: 'okay', history: [RESCHEDULE_PROPOSAL], expected: 'immediateConfirmation', note: 'acknowledgement yields while a confirmation is pending' },
-  { message: 'yes', expected: 'runAgent', note: 'no pending proposal in history' },
+  { message: 'yes', expected: 'immediateConfirmation', note: 'handler checks the draft; without visible proposal context it repeats details rather than charging' },
   { message: 'yes', history: [RESCHEDULE_PROPOSAL], platform: 'instagram', expected: 'runAgent' },
 
   // LLM fallthrough
@@ -273,6 +274,7 @@ test('message route order remains unchanged', () => {
   );
 
   assert.deepEqual(routes.map((route: { name: string }) => route.name), [
+    'familyStyling',
     'scopeBoundary',
     'identityCorrection',
     'recipientName',

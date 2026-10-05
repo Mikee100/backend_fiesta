@@ -29,6 +29,8 @@ import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
 import { editionInText, repeatedCollectionQuestion } from './reply-voice';
 import { enforceSlogan } from './slogan-guard';
+import { bookingProgressReply } from './booking-progress';
+import { createSchemaAlertLimiter, isMissingColumnError, safeSchemaDetails, SCHEMA_MAINTENANCE_REPLY } from '../../config/schema-readiness';
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { EDITIONS_PENDING_OWNER_CONFIRMATION } from '../../config/constants';
@@ -47,6 +49,7 @@ import {
   buildTravellingMothersReply,
   buildWebsiteReply,
   buildAdditionsReply,
+  formatCustomerTime,
   buildBookingProposalConfirmation,
   buildCancellationProposal,
   buildPackageDepositProposal,
@@ -173,6 +176,7 @@ export class AgentService {
   private readonly conversationFlows = new ConversationFlowMatcher();
   private readonly conversationFlowHandler = new ConversationFlowHandler(this.conversationFlows);
   private readonly shouldEscalateVerifier = createVerifierEscalationLimiter();
+  private readonly shouldAlertSchemaMismatch = createSchemaAlertLimiter();
 
   private isNaturalAssistantModeEnabled(): boolean {
     return this.naturalAssistantMode;
@@ -522,17 +526,24 @@ export class AgentService {
   private isUnverifiedBookingConfirmation(
     reply: string,
     userMessage: string,
-    history: { role: 'user' | 'assistant'; content: string }[]
+    history: { role: 'user' | 'assistant'; content: string }[],
+    existingBooking?: { dateTime: Date; status: string }
   ): boolean {
-    const claimsConfirmed = /\b(?:session is all set|booking is confirmed|session is confirmed|successfully booked|payment has gone through|payment is received and confirmed)\b/i.test(reply);
+    const claimsConfirmed = /\b(?:confirmed\s+(?:session|appointment|booking)|(?:booking|session|appointment)\s+(?:is|has been)\s+confirmed|session is all set|successfully booked|payment has gone through|payment is received and confirmed)\b/i.test(reply);
     if (!claimsConfirmed) return false;
-
-    const bookingFlowInProgress = /\b(book|booking|reserve|package|new session|new appointment)\b/i.test(userMessage)
-      || history.slice(-6).some((message) =>
-        message.role === 'assistant'
-        && /\b(?:which|what|share|tell me|let me know).{0,80}\b(?:package|date|time|slot)\b|check availability/i.test(message.content)
-      );
-    return bookingFlowInProgress;
+    const asksExisting = /\b(?:existing|upcoming|already booked|confirmed)\b.*\b(?:session|appointment|booking)\b|\b(?:session|appointment|booking)\b.*\b(?:existing|upcoming|already booked)\b/i.test(userMessage);
+    if (!asksExisting || existingBooking?.status !== 'confirmed' || /\b(?:payment|deposit)\b/i.test(reply)) return true;
+    try {
+      const date = resolveCalendarDate(reply);
+      const timeMatch = reply.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
+      if (!date || !timeMatch) return true;
+      const hour = timeMatch[4] ? Number(timeMatch[4]) : Number(timeMatch[1]) % 12 + (timeMatch[3].toLowerCase() === 'pm' ? 12 : 0);
+      const minute = Number(timeMatch[5] || timeMatch[2] || 0);
+      const stored = inBusinessTimezone(existingBooking.dateTime);
+      return date !== stored.format('YYYY-MM-DD') || hour !== stored.hour() || minute !== stored.minute();
+    } catch {
+      return true;
+    }
   }
 
   private isBookingIdentityCorrection(userMessage: string): boolean {
@@ -1120,10 +1131,11 @@ export class AgentService {
     return buildRawFilesReply();
   }
 
-  private async getAdditionsReply(): Promise<string> {
+  private async getAdditionsReply(customerId?: string): Promise<string> {
     let deposit: number | null = null;
     try {
-      deposit = this.getDepositForPackage(await this.getPackageForDeposit());
+      const draft = customerId ? await prisma.bookingDraft.findUnique({ where: { customerId }, select: { service: true } }) : null;
+      deposit = this.getDepositForPackage(await this.getPackageForDeposit(draft?.service || undefined));
     } catch {
       console.warn('Unable to resolve starting deposit for add-ons reply.');
     }
@@ -1194,7 +1206,7 @@ export class AgentService {
   }
 
   private async getBookingStatusReply(customerId: string): Promise<string | null> {
-    return buildBookingStatusReply(customerId);
+    return buildBookingStatusReply.call(this, customerId);
   }
 
   private async getPastAppointmentReply(customerId: string): Promise<string | null> {
@@ -1419,6 +1431,8 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
     const nextWeekAvailability = /\bnext\s+week\b/i.test(userMessage)
       && /\b(dates?|availability|available|slots?|book|session)\b/i.test(userMessage)
       && (platform === 'whatsapp' || platform === 'web');
+    const calendarRequested = Boolean(requestedCalendarDate || statedSlots.time || nextWeekAvailability
+      || /\b(available|availability|slots?|open|closed|weekday|dates?)\b/i.test(userMessage));
     if (nextWeekAvailability && !knownService) {
       return { content: 'Which package would you like for your session?', tokensUsed: 0 };
     }
@@ -1432,7 +1446,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
         dateRangeResults.set(key, result);
       }
       calendarReply = result.dates.length
-        ? `Available dates for ${service}:\n${result.dates.map((entry) => `${entry.weekday}, ${entry.date}: ${entry.slots.join(', ')}`).join('\n')}\nWhich date and time would work for you?`
+        ? `Available dates for ${service}:\n${result.dates.map((entry) => `${entry.weekday}, ${entry.date}: ${entry.slots.map(formatCustomerTime).join(', ')}`).join('\n')}\nWhich date and time would work for you?`
         : `${result.message} Which other date range would work for you?`;
       return result;
     };
@@ -1450,9 +1464,9 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
       }
       const requestedTime = statedSlots.time || currentSlots?.time;
       calendarReply = requestedTime && result.includes(requestedTime)
-        ? `${label}. ${requestedTime} is available for ${editionInText(service)}. Would you like to go ahead with that time?`
+        ? `${label}. ${formatCustomerTime(requestedTime)} is available for ${editionInText(service)}. Would you like to go ahead with that time?`
         : result.length
-          ? `${label}. Available slots for ${service}: ${result.join(', ')}. Which time would work for you?`
+          ? `${label}. Available slots for ${service}: ${result.map(formatCustomerTime).join(', ')}. Which time would work for you?`
           : `${label}. No slots are available for ${service}. Which other date would work for you?`;
       return { ...facts, slots: result };
     };
@@ -1487,9 +1501,9 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
   ${knownSlotsLine(draftBeforeThisTurn, customer?.name)}
   Computed calendar facts (authoritative, never infer weekdays): today=${nowInBusinessTimezone().format('YYYY-MM-DD dddd')}; requested=${requestedCalendarDate ? JSON.stringify(bookingDateFacts(requestedCalendarDate)) : 'none'}; next week=${JSON.stringify(nextWeekRange())}.
   Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
-Upcoming Booking (their next appointment, if any): ${upcomingBookingSummary}
+Upcoming Booking (their next appointment, if any): ${currentSlots?.step === 'collecting_slots' ? `SEPARATE EXISTING BOOKING, NOT the current unbooked request: ${upcomingBookingSummary}. The collecting_slots request is NOT confirmed or paid; do not substitute this older appointment.` : upcomingBookingSummary}
 Other Upcoming Bookings: ${otherUpcomingBookings}
-Payment Status: ${paymentSummary}
+Payment Status: ${currentSlots?.step === 'collecting_slots' ? `SEPARATE EXISTING BOOKING ONLY: ${paymentSummary} No payment is verified for the current collecting_slots request.` : paymentSummary}
 Past Bookings: ${pastBookings}
 Customer Memory: ${memorySummary}
 
@@ -1821,6 +1835,9 @@ ${contextString}`;
                 toolResponse = `INFO: Note not queued (${noteResult.reason || 'non-actionable'}).`;
               }
             }
+            else if (['get_available_dates', 'get_available_slots'].includes(functionName) && !calendarRequested) {
+              toolResponse = 'ERROR: The customer has not requested availability on this turn. Do not replay an older draft date as an answer to an unrelated question.';
+            }
             else if (functionName === 'get_available_dates') {
               const range = nextWeekAvailability ? nextWeekRange() : args;
               toolResponse = JSON.stringify(await checkDateRange(range.fromDate, range.toDate, knownService || args.service));
@@ -1905,7 +1922,7 @@ ${contextString}`;
       ? repeatedCollectionQuestion(modelContent, currentSlots, customer?.name, userMessage) : null;
     const codeOwnedReply = cancellationReply || exactProposalReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
       ? unverifiedActionReply
-      : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history)
+      : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history, upcomingBooking)
       && !rescheduleAppliedThisTurn
       ? 'I can’t confirm a new booking from that message alone. No new appointment has been confirmed or paid for. I can check whether the requested date and time are available.'
       : null) || repeatedQuestionReply;
@@ -1956,7 +1973,7 @@ ${contextString}`;
         if (message.tool_calls?.length) throw new Error('Verifier correction must not call tools.');
         const reply = message.content?.trim() || '';
         if (this.getUnverifiedActionReply(reply, { rescheduled: rescheduleAppliedThisTurn, cancelled: cancelledThisTurn, noteSaved: noteSavedThisTurn })
-          || this.isUnverifiedBookingConfirmation(reply, userMessage, history) && !rescheduleAppliedThisTurn) {
+          || this.isUnverifiedBookingConfirmation(reply, userMessage, history, upcomingBooking) && !rescheduleAppliedThisTurn) {
           throw new Error('Verifier correction claimed an unverified action.');
         }
         return this.formatCustomerReply(reply, userMessage, history);
@@ -1977,6 +1994,10 @@ ${contextString}`;
       customerRef: this.customerReference(customerId), model: CHAT_MODEL,
       completionCalls: usage.completionCalls, toolCalls,
       verifierChecked: !codeOwnedReply && !emptyResponse,
+      verifierBypassReason: !codeOwnedReply ? emptyResponse ? 'empty_model_reply' : null
+        : cancellationReply || exactProposalReply ? 'exact_tool_reply'
+        : calendarReply && !proposedThisTurn && !confirmedActionThisTurn ? 'backend_calendar_reply'
+        : codeOwnedReply === repeatedQuestionReply ? 'known_slot_question_guard' : 'backend_action_guard',
       verifierRetries, correctionChars,
       inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens,
       latencyMs: Date.now() - modelRunStartedAt, rateLimited: false,
@@ -2011,7 +2032,14 @@ ${contextString}`;
     const startedAt = Date.now();
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
-    const cancellationDraftReply = await this.clearStaleCancellationDraftBeforeRouting(customerId, userMessage, history);
+    let cancellationDraftReply: string | null;
+    try {
+      cancellationDraftReply = await this.clearStaleCancellationDraftBeforeRouting(customerId, userMessage, history);
+    } catch (error) {
+      if (!isMissingColumnError(error)) throw error;
+      const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+      return this.respond(ctx, failure.reply, failure.outcome);
+    }
     if (cancellationDraftReply) return this.respond(ctx, cancellationDraftReply);
     const routes = this.createMessageRoutes(customerId, userMessage, history, platform, startedAt);
     const scopeBoundaryRoute = routes[0];
@@ -2069,7 +2097,11 @@ ${contextString}`;
       try {
         const slotReply = await this.rememberBookingSlots(customerId, userMessage, history);
         if (slotReply) return this.respond(ctx, slotReply);
-      } catch {
+      } catch (error) {
+        if (isMissingColumnError(error)) {
+          const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+          return this.respond(ctx, failure.reply, failure.outcome);
+        }
         console.warn('[AGENT_FLOW] Early booking slot persistence failed; requesting team assistance.');
         await this.escalate(customerId, 'booking', 'Early booking details could not be saved. Review the customer message before continuing.');
         return this.respond(ctx, 'The studio team will help save those details and continue your booking.', {
@@ -2082,13 +2114,38 @@ ${contextString}`;
       if (route.replyMode === 'natural' && naturalAssistantMode) continue;
       if (!route.when()) continue;
       console.log(`[AGENT_FLOW] route=${route.name}`);
-      const result = await route.handle();
+      let result;
+      try {
+        result = await route.handle();
+      } catch (error) {
+        if (!isMissingColumnError(error)) throw error;
+        result = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+      }
       if (result === null) continue;
       if (typeof result === 'string') return this.respond(ctx, result);
       return this.respond(ctx, result.reply, result.outcome);
     }
 
     return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'no_matching_route' });
+  }
+
+  private async handleSchemaMismatch(customerId: string, userMessage: string, platform: string, error: unknown) {
+    const details = safeSchemaDetails(error);
+    console.error('[AGENT_FLOW] SCHEMA_OUT_OF_DATE: booking automation requires an operator-reviewed migration.', JSON.stringify(details));
+    if (this.shouldAlertSchemaMismatch()) {
+      await this.escalate(customerId, 'error', JSON.stringify({
+        event: 'database_schema_out_of_date', ...details, platform,
+        customerMessage: userMessage.slice(0, 1000), requiresOperatorAction: true,
+        note: 'Stop live automated testing. Review any booking/payment side effects before retrying. Verify target and backup, then apply only approved SQL; do not run prisma db push.',
+      }));
+    } else {
+      console.warn('[AGENT_FLOW] schema_alert=suppressed reason=cooldown');
+    }
+    return { reply: SCHEMA_MAINTENANCE_REPLY, outcome: { success: false, isFallback: true, failureReason: 'database_schema_out_of_date' } };
+  }
+
+  private async getBookingProgressReply(customerId: string, message: string, history: { role: 'user' | 'assistant'; content: string }[], decisionJustSaved = false): Promise<string | null> {
+    return bookingProgressReply.call(this, customerId, message, history, decisionJustSaved);
   }
 
   private async rememberBookingSlots(
@@ -2116,6 +2173,7 @@ ${contextString}`;
       'yes', 'y', 'yep', 'yeah', 'yess', 'yesss',
       'ok', 'okay', 'confirm', 'confirmed',
       'go ahead', 'go-ahead', 'proceed', 'continue',
+      'lets do it', "let's do it", 'lets do it then', "let's do it then", 'let us do it then',
       'that works', 'works for me', 'that one', 'same one', 'lets do that', "let's do that", 'let us do that',
       'sawa', 'ndio'
     ]);
@@ -2159,7 +2217,8 @@ ${contextString}`;
   private isPaymentConfirmation(userMessage: string): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, ' ').replace(/\s+/g, ' ');
     if (/\b(no|not|don't|dont|cancel|wait|hold)\b/.test(normalized)) return false;
-    return /\b(?:yes+|yeah|yep|ndio|confirm(?:ed)?|go[\s-]?ahead|proceed)\b/.test(normalized);
+    return /\b(?:yes+|yeah|yep|ndio|confirm(?:ed)?|go[\s-]?ahead|proceed)\b/.test(normalized)
+      || /^(?:let['’]?s|let us) do it(?: then)?$/.test(normalized.trim());
   }
 
   private isCancellationConfirmation(userMessage: string): boolean {
@@ -2381,6 +2440,8 @@ ${contextString}`;
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (!draft?.step) return null;
 
+    if (['reschedule_confirm', 'cancel_confirm'].includes(draft.step) && !this.previousMessageRequestsConfirmation(history)) return null;
+
     if (draft.step === 'payment_pending') {
       return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
     }
@@ -2390,11 +2451,14 @@ ${contextString}`;
         return PAYMENT_CONFIRMATION_REQUIRED_REPLY;
       }
       const expectedDeposit = this.getDepositAmountFromProposalHistory(history);
+      if (expectedDeposit === null || !this.previousMessageRequestsConfirmation(history)) {
+        return this.getBookingStatusReply(customerId);
+      }
       const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
       return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
 
-    if (draft.step === 'reschedule_confirm') {
+    if (draft.step === 'reschedule_confirm' && this.previousMessageRequestsConfirmation(history)) {
       const result = await this.executeConfirmRescheduleTool(customerId, 'reschedule_confirm');
       void this.notifyRescheduleAdmin({
         customerId,

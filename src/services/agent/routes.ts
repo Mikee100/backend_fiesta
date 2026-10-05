@@ -13,6 +13,8 @@ import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './co
 import { addonInquiryReply, addonRecipient, addonSelectionClarification } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { needsUnchangedReassurance } from './reply-voice';
+import { isMissingColumnError } from '../../config/schema-readiness';
+import { familyStylingReply } from './replies';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -51,6 +53,12 @@ export function createMessageRoutes(
   };
 
   return [
+    {
+      name: 'familyStyling',
+      replyMode: 'deterministic',
+      when: () => Boolean(familyStylingReply(userMessage, history)),
+      handle: () => familyStylingReply(userMessage, history),
+    },
     {
       name: 'scopeBoundary',
       when: () => Boolean(scopeBoundaryReply = this.getScopeBoundaryReply(userMessage, history)),
@@ -251,7 +259,7 @@ export function createMessageRoutes(
       name: 'addonListFollowUp',
       replyMode: 'deterministic',
       when: () => this.isAddonListFollowUp(userMessage, history) && !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history),
-      handle: () => this.getAdditionsReply(),
+      handle: () => this.getAdditionsReply(customerId),
     },
     {
       name: 'selectedAddon',
@@ -281,19 +289,23 @@ export function createMessageRoutes(
           }
         }
         if (choices.length === 1 && saved.length === 1) {
-          return this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]), needsUnchangedReassurance(userMessage));
+          const acknowledgement = this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]), needsUnchangedReassurance(userMessage));
+          const next = await this.getBookingProgressReply(customerId, userMessage, history, true);
+          return next ? `${acknowledgement}\n${next}` : acknowledgement;
         }
-        return [saved.length ? `${ADDON_NOTED_PREFIX} ${saved.join('; ')}.` : '',
+        const acknowledgement = [saved.length ? `${ADDON_NOTED_PREFIX} ${saved.join('; ')}.` : '',
           existing.length ? `Already recorded: ${existing.join('; ')}. I have not added these twice.` : '',
           failed.length ? `Not saved: ${failed.join('; ')}. The team can help confirm these.` : '',
           `${ADDON_BALANCE_REPLY}${needsUnchangedReassurance(userMessage) ? ` ${ADDON_UNCHANGED_REPLY}` : ''}`].filter(Boolean).join('\n');
+        const next = !failed.length && (saved.length || existing.length) ? await this.getBookingProgressReply(customerId, userMessage, history, true) : null;
+        return next ? `${acknowledgement}\n${next}` : acknowledgement;
       },
     },
     {
       name: 'additions',
       replyMode: 'deterministic',
       when: () => this.shouldUseAdditionsReply(userMessage),
-      handle: () => this.getAdditionsReply(),
+      handle: () => this.getAdditionsReply(customerId),
     },
     {
       name: 'bespoke',
@@ -379,17 +391,20 @@ export function createMessageRoutes(
       name: 'immediateConfirmation',
       when: () => (platform === 'whatsapp' || platform === 'web')
         && this.isExplicitConfirmation(userMessage)
-        && this.previousMessageRequestsConfirmation(history),
+        && (this.previousMessageRequestsConfirmation(history) || this.isPaymentConfirmation(userMessage)),
       handle: async () => {
         try {
           const immediate = await this.tryImmediateConfirmation(customerId, userMessage, history);
           return immediate;
         } catch (error: any) {
+          if (isMissingColumnError(error)) return this.handleSchemaMismatch(customerId, userMessage, platform, error);
           console.error('[AGENT_FLOW] Immediate confirmation failed:', error);
+          const recovery = error?.code === PAYMENT_PROMPT_UNRECORDED ? null
+            : await this.getBookingStatusReply(customerId).catch(() => null);
           return {
             reply: error?.code === PAYMENT_PROMPT_UNRECORDED
               ? PAYMENT_PROMPT_UNRECORDED_REPLY
-              : 'Sorry, something went wrong and I couldn’t finish that step just now. Please try again in a moment, or the studio team can help.',
+              : recovery || 'Your booking has not been confirmed. The studio team will help with the deposit prompt.',
             outcome: {
               success: false,
               isFallback: true,
@@ -404,6 +419,8 @@ export function createMessageRoutes(
       when: () => true,
       handle: async () => {
         try {
+          const progress = platform === 'whatsapp' || platform === 'web' ? await this.getBookingProgressReply(customerId, userMessage, history) : null;
+          if (progress) return progress;
           console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
           const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
           console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
@@ -419,6 +436,7 @@ export function createMessageRoutes(
           this.touchCustomerMemory(customerId, userMessage, platform).catch((err: unknown) => console.error('Customer memory update failed:', err));
           return content;
         } catch (error: any) {
+          if (isMissingColumnError(error)) return this.handleSchemaMismatch(customerId, userMessage, platform, error);
           console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
           const rateLimitType = classifyProviderRateLimit(error);
           console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({

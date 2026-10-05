@@ -11,6 +11,10 @@ Use the detailed STAGING_AI_TEST_PLAN.md for the exact forty questions and evide
   keys; verify retrieval no longer surfaces its price.
 - Obtain owner answers: Empress inclusions, Bloom duration/photo count, flat/varying
   Ksh 2,000 deposit, exact-72-hour rules, team claim and refund/handoff ownership.
+  Add "Do you dress/groom/style family members?": what is available for partners
+  and children, any clothing/accessories, and any verified optional services/prices.
+  The owner has not answered. Keep the deterministic team-confirm reply until the
+  answer is signed off; only then add the verified FAQ row and refresh retrieval.
   No package data has been owner-confirmed in this thread.
 - Create the non-production PostgreSQL DB, back up/baseline migrations, approve/apply
   cancelProposedAt, 8.1b fields and packages.inclusions together; verify client parity

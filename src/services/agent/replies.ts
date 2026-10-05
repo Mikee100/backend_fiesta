@@ -1,10 +1,27 @@
-import { ADDON_CATALOG } from '../../config/constants';
+import { ADDON_CATALOG, MINIMUM_BOOKING_DEPOSIT } from '../../config/constants';
 import { OFFICIAL_WEBSITE_URLS, ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { businessDay } from '../../utils/time';
 import { editionInText } from './reply-voice';
 export { isBookingProcessRequest } from './booking-process-reply';
 
+export const FAMILY_STYLING_TEAM_REPLY = 'Your partner and children are welcome. The team will confirm what styling is available for them.';
+
+export function familyStylingReply(message: string, history: { role: 'user' | 'assistant'; content: string }[] = []): string | null {
+  const family = /\b(?:family|partners?|husbands?|wives|wife|children|kids|sons?|daughters?|fathers?|dads?|brothers?|sisters?)\b/i;
+  const styling = /\b(?:dress(?:ing|ed|es)?|groom(?:ing|ed)?|styl(?:ing|e|ed)|outfits?|clothes|clothing|attire|accessories|hair|make[ -]?up)\b/i;
+  const extraMakeup = ADDON_CATALOG.find(item => item.sku === 'extra_makeup');
+  const needsConfirmation = message.split(/[.!?;]|\band\b/i).some(clause => {
+    const recipient = family.test(clause) || /\b(?:them|him|her|their|his)\b/i.test(clause)
+      && history.slice(-4).some(entry => family.test(entry.content));
+    const catalogSelection = extraMakeup && clause.match(extraMakeup.match)
+      && !/\?/.test(message) && /\b(?:want|add|include|noted)\b/i.test(clause);
+    return recipient && styling.test(clause) && !catalogSelection;
+  });
+  return needsConfirmation ? FAMILY_STYLING_TEAM_REPLY : null;
+}
+
 export function buildAdditionsReply(deposit: number | null): string {
+  const displayDeposit = typeof deposit === 'number' && Number.isInteger(deposit) && deposit >= MINIMUM_BOOKING_DEPOSIT ? deposit : null;
   const pricedLines = ADDON_CATALOG
     .filter((item) => item.unitPrice > 0)
     .map((item) => `${item.name}: Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}`);
@@ -19,9 +36,9 @@ export function buildAdditionsReply(deposit: number | null): string {
     'Quoted by package tier:',
     ...quotedLines,
     '',
-    deposit === null
+    displayDeposit === null
       ? 'They are optional and are added to the balance, not the deposit. The studio team can confirm the deposit amount. Nothing has been added yet.'
-      : `They are optional, are added to the balance, and are not included in the Ksh ${deposit.toLocaleString()} deposit. Nothing has been added yet.`,
+      : `They are optional, are added to the balance, and are not included in the Ksh ${displayDeposit.toLocaleString()} deposit. Nothing has been added yet.`,
     '',
     'Which, if any, would you like me to note for the session?'
   ].join('\n');
@@ -48,16 +65,23 @@ export function isAddonListFollowUp(
   );
 }
 
+export function formatCustomerTime(time: string): string {
+  const match = time.match(/^(\d{2}):(\d{2})$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return time;
+  const hour = Number(match[1]);
+  return `${hour % 12 || 12}:${match[2]} ${hour >= 12 ? 'PM' : 'AM'}`;
+}
+
 export function buildBookingProposalConfirmation(service: string, date: string, time: string, deposit: number): string {
-  return `Your details for ${editionInText(service)} are ready for ${businessDay(date).format('dddd, D MMMM YYYY')} at ${time}. The deposit is Ksh ${deposit.toLocaleString()}. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.`;
+  return `Your details for ${editionInText(service)} are ready for ${businessDay(date).format('dddd, D MMMM YYYY')} at ${formatCustomerTime(time)}. The deposit is Ksh ${deposit.toLocaleString()}. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.`;
 }
 
 export function buildRescheduleProposalConfirmation(service: string, date: string, time: string): string {
-  return `I can move your session for ${editionInText(service)} to ${businessDay(date).format('dddd, D MMMM YYYY')} at ${time}. If that works for you, reply yes and I'll confirm it.`;
+  return `I can move your session for ${editionInText(service)} to ${businessDay(date).format('dddd, D MMMM YYYY')} at ${formatCustomerTime(time)}. If that works for you, reply yes and I'll confirm it.`;
 }
 
 export function buildTimeOnlyRescheduleProposal(service: string, date: string, time: string): string {
-  return `I can move your ${service} session to ${date} at ${time}. Would you like me to confirm that change?`;
+  return `I can move your ${service} session to ${date} at ${formatCustomerTime(time)}. Would you like me to confirm that change?`;
 }
 
 export function buildPackageDepositProposal(
@@ -66,7 +90,7 @@ export function buildPackageDepositProposal(
   time: string,
   deposit: number
 ): string {
-  return `${service} works for ${date} at ${time}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
+  return `${service} works for ${date} at ${formatCustomerTime(time)}. The deposit is Ksh ${deposit.toLocaleString()}. If you are happy with that, reply yes and I will send the M-Pesa prompt.`;
 }
 
 export function buildCancellationProposal(service: string, session: string, refundPosition: string): string {

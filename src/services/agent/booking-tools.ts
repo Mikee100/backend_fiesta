@@ -172,6 +172,7 @@ export async function executeConfirmBookingTool(
 export async function getPackageForDeposit(packageName?: string): Promise<{ name: string; deposit: number | null } | null> {
   if (!packageName) {
     return prisma.package.findFirst({
+      where: { name: { in: [...PACKAGE_NAMES_FOR_EXTRACTION] } },
       orderBy: { deposit: 'asc' },
       select: { name: true, deposit: true },
     });
@@ -206,6 +207,10 @@ export function getDepositForPackage(pkg: { name: string; deposit: number | null
 }
 
 export async function executeProposeRescheduleTool(this: any, customerId: string, newDate: string, newTime: string) {
+  const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  if (existingDraft && existingDraft.step !== 'reschedule_confirm') {
+    throw new Error('I have not changed your current request or started a reschedule. Please finish that step or ask the studio team to help.');
+  }
   const upcomingBooking = await prisma.booking.findFirst({
     where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
     orderBy: { dateTime: 'asc' }
@@ -313,7 +318,9 @@ export async function executeConfirmRescheduleTool(this: any, customerId: string
     });
   }
 
-  await prisma.bookingDraft.delete({ where: { customerId } }).catch((err: unknown) => console.error('Failed to clear reschedule draft:', err));
+  await prisma.bookingDraft.deleteMany({
+    where: { id: draft.id, customerId, step: 'reschedule_confirm', bookingId: upcomingBooking.id },
+  }).catch((err: unknown) => console.error('Failed to clear reschedule draft:', err));
 
   return {
     newDateTime,
@@ -407,7 +414,7 @@ export async function executeCancelBookingTool(this: any, customerId: string, da
       ...(calendarEventRemoved ? { googleEventId: null } : {}),
     }
   });
-  await prisma.bookingDraft.deleteMany({ where: { customerId } });
+  await prisma.bookingDraft.deleteMany({ where: { customerId, step: 'cancel_confirm', bookingId: booking.id } });
 
   const refundEligible = getBookingPolicyWindow(booking.dateTime).cancellationRefundEligible;
   await notifyAdmin(

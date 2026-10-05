@@ -33,6 +33,15 @@ export class MpesaService {
    * Generates or retrieves cached OAuth Access Token
    */
   private async getAccessToken(forceRefresh = false): Promise<string> {
+    if (!['sandbox', 'production'].includes(ENVIRONMENT)) {
+      throw new Error('MPESA_ENVIRONMENT must be exactly sandbox or production');
+    }
+    if (!CONSUMER_KEY || !CONSUMER_SECRET) {
+      throw new Error('M-Pesa OAuth credentials missing');
+    }
+    if ([CONSUMER_KEY, CONSUMER_SECRET].some(value => /\s|["']/.test(value))) {
+      throw new Error('M-Pesa OAuth credentials contain whitespace or quotes; check the configured Daraja app');
+    }
     const now = Date.now();
     if (!forceRefresh && this.cachedToken && now < this.tokenExpiryTime) {
       return this.cachedToken;
@@ -55,8 +64,26 @@ export class MpesaService {
 
       return token;
     } catch (error: any) {
-      const errorMsg = error.response?.data?.errorMessage || error.response?.data || error.message;
-      console.error('M-Pesa Auth Error:', errorMsg);
+      const body = error.response?.data;
+      const diagnostics: Record<string, string | number> = { environment: ENVIRONMENT };
+      if (typeof error.response?.status === 'number') diagnostics.status = error.response.status;
+      const redact = (text: string) => {
+        let value = text;
+        for (const sensitive of [auth, `${CONSUMER_KEY}:${CONSUMER_SECRET}`, CONSUMER_KEY, CONSUMER_SECRET, PASSKEY, this.cachedToken]) {
+          if (sensitive) value = value.split(sensitive).join('[REDACTED]');
+        }
+        return value.replace(/[A-Za-z0-9+/_=-]{20,}/g, '[REDACTED]').replace(/[\r\n]/g, ' ').slice(0, 500);
+      };
+      for (const field of ['errorCode', 'errorMessage', 'error', 'error_description']) {
+        if (body && typeof body === 'object' && typeof body[field] === 'string') {
+          diagnostics[field] = redact(body[field]);
+        }
+      }
+      if (typeof body?.fault?.faultstring === 'string') diagnostics.fault = redact(body.fault.faultstring);
+      if (typeof body?.fault?.detail?.errorcode === 'string') diagnostics.faultCode = redact(body.fault.detail.errorcode);
+      if (typeof body === 'string') diagnostics.body = body ? redact(body) : '(empty response body)';
+      if (Object.keys(diagnostics).length <= 2) diagnostics.reason = 'No recognised Daraja error fields; response body omitted';
+      console.error('M-Pesa Auth Error:', diagnostics);
       throw new Error('Failed to authenticate with M-Pesa');
     }
   }

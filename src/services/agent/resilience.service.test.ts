@@ -1,6 +1,144 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
+import ts from 'typescript';
 import { scoreSentiment, circuitBreaker, classifyProviderRateLimit } from './resilience.service';
+import { createSchemaAlertLimiter, DatabaseSchemaOutOfDateError, safeSchemaDetails, verifyBookingDraftSchema } from '../../config/schema-readiness';
+
+function isolatedMpesa(environment = 'sandbox', key = 'fake-key', secret = 'fake-secret') {
+  const file = path.join(__dirname, '../payment/mpesa.service.ts');
+  const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+  const declaration = source.statements.find(ts.isClassDeclaration)!;
+  const script = ts.transpileModule(`${declaration.getText(source)}\nnew MpesaService();`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const calls: { url: string; config: any }[] = [];
+  const logs: unknown[][] = [];
+  const http = { get: async (url: string, config: any): Promise<any> => {
+    calls.push({ url, config });
+    return { data: { access_token: 'fake-token', expires_in: '3600' } };
+  } };
+  const service = new vm.Script(script).runInNewContext({
+    exports: {}, axios: { create: () => http }, Buffer,
+    ENVIRONMENT: environment, CONSUMER_KEY: key, CONSUMER_SECRET: secret, PASSKEY: 'fake-passkey', BASE_URL: 'https://unused.invalid',
+    console: { error: (...args: unknown[]) => logs.push(args) },
+  });
+  return { service, http, calls, logs };
+}
+
+test('M-Pesa OAuth uses Basic key:secret, client_credentials and a cached token', async () => {
+  const { service, calls } = isolatedMpesa();
+  assert.equal(await service.getAccessToken(), 'fake-token');
+  assert.equal(await service.getAccessToken(), 'fake-token');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/oauth/v1/generate?grant_type=client_credentials');
+  assert.equal(calls[0].config.headers.Authorization, `Basic ${Buffer.from('fake-key:fake-secret').toString('base64')}`);
+});
+
+test('M-Pesa rejects invalid environment, missing and malformed OAuth credentials before HTTP', async () => {
+  for (const args of [['live'], ['Production'], ['sandbox', ''], ['sandbox', ' fake-key'], ['sandbox', 'fake-key', '"fake-secret"']]) {
+    const { service, calls } = isolatedMpesa(...args);
+    await assert.rejects(service.getAccessToken(), /MPESA_ENVIRONMENT|credentials/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('M-Pesa OAuth failure logs bounded Daraja diagnostics without secrets or arbitrary response fields', async () => {
+  const { service, http, logs } = isolatedMpesa();
+  const encoded = Buffer.from('fake-key:fake-secret').toString('base64');
+  http.get = async () => { throw { response: { status: 400, data: {
+    errorCode: 'invalid_client', errorMessage: `Wrong app fake-key fake-secret fake-passkey ${encoded}\n${'x'.repeat(700)}`,
+    access_token: 'must-not-log-token', headers: { Authorization: encoded },
+  } }, message: 'must-not-log-request' }; };
+  await assert.rejects(service.getAccessToken(), /Failed to authenticate/);
+  const output = JSON.stringify(logs);
+  assert.match(output, /invalid_client/);
+  assert.match(output, /400/);
+  assert.doesNotMatch(output, /fake-key|fake-secret|fake-passkey|must-not-log/);
+  assert.equal(output.includes(encoded), false);
+  assert.ok((logs[0][1] as any).errorMessage.length <= 500);
+});
+
+test('M-Pesa reports empty, plain-text and nested Daraja faults safely', async () => {
+  for (const body of ['', 'Invalid client fake-secret', { fault: { faultstring: 'Invalid client fake-key', detail: { errorcode: 'invalid_client' } } }]) {
+    const { service, http, logs } = isolatedMpesa();
+    http.get = async () => { throw { response: { status: 400, data: body } }; };
+    await assert.rejects(service.getAccessToken(), /Failed to authenticate/);
+    const output = JSON.stringify(logs);
+    assert.match(output, /empty response body|Invalid client/);
+    assert.doesNotMatch(output, /fake-key|fake-secret/);
+  }
+});
+
+test('startup schema probe rejects P2022 safely even when no booking drafts exist', async () => {
+  let calls = 0;
+  await verifyBookingDraftSchema({ bookingDraft: { findFirst: async ({ select }) => {
+    calls++;
+    assert.deepEqual(select, { id: true, cancelProposedAt: true });
+    return null;
+  } } });
+  assert.equal(calls, 1);
+  await assert.rejects(verifyBookingDraftSchema({ bookingDraft: { findFirst: async () => {
+    throw { code: 'P2022', message: 'unsafe connection details must not escape', meta: { modelName: 'BookingDraft', column: 'booking_drafts.cancelProposedAt' } };
+  } } }), (error: unknown) => {
+    assert.ok(error instanceof DatabaseSchemaOutOfDateError);
+    assert.equal(error.code, 'SCHEMA_OUT_OF_DATE');
+    assert.equal(error.details.column, 'booking_drafts.cancelProposedAt');
+    assert.doesNotMatch(error.message, /unsafe connection/);
+    return true;
+  });
+  assert.deepEqual(safeSchemaDetails({ code: 'P2022', meta: { column: 'postgres://private-data' } }).column, null);
+});
+
+test('schema alerts use a bounded process cooldown rather than flooding every message', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: 0 });
+  const notify = createSchemaAlertLimiter();
+  assert.equal(notify(), true);
+  assert.equal(notify(), false);
+  context.mock.timers.tick(10 * 60_000);
+  assert.equal(notify(), true);
+});
+
+test('actual startup functions refuse listener and cron before database readiness', async () => {
+  const file = path.join(__dirname, '../../../app.ts');
+  const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+  const functions = source.statements.filter(ts.isFunctionDeclaration)
+    .filter((node) => ['checkDatabaseConnection', 'startBackend'].includes(node.name?.text || ''));
+  assert.equal(functions.length, 2);
+  const script = ts.transpileModule(`${functions.map((node) => node.getText(source)).join('\n')}\nstartBackend();`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  for (const code of [null, 'P2022', 'P1001']) {
+    const calls: string[] = [];
+    const log: string[] = [];
+    const processState = { exitCode: 0 };
+    const client = {
+      $connect: async () => { calls.push('connect'); if (code === 'P1001') throw { code, message: 'unsafe connection string' }; },
+      $disconnect: async () => { calls.push('disconnect'); },
+      bookingDraft: { findFirst: async () => { calls.push('probe'); if (code === 'P2022') throw { code, meta: { column: 'booking_drafts.cancelProposedAt' }, message: 'unsafe connection string' }; return null; } },
+    };
+    await new vm.Script(script).runInNewContext({
+      prisma: client, verifyBookingDraftSchema, DatabaseSchemaOutOfDateError, safeSchemaDetails,
+      httpServer: { listen: (_port: unknown, ready: () => void) => { calls.push('listen'); ready(); } },
+      cronService: { init: () => { calls.push('cron'); } },
+      knowledgeRetrieval: { initEmbedder: async () => { calls.push('embedder'); } },
+      PORT: 4000, process: processState,
+      console: { log: () => {}, warn: () => {}, error: (...args: unknown[]) => { log.push(args.join(' ')); } },
+    }, { timeout: 1000 });
+    if (code) {
+      assert.equal(processState.exitCode, 1);
+      assert.equal(calls.includes('listen'), false);
+      assert.equal(calls.includes('cron'), false);
+      assert.equal(calls.includes('embedder'), false);
+      assert.equal(calls.includes('disconnect'), true);
+      assert.doesNotMatch(log.join('\n'), /unsafe connection string/);
+    } else {
+      assert.deepEqual(calls, ['connect', 'probe', 'listen', 'cron', 'embedder']);
+    }
+  }
+});
 
 test('classifies a Groq daily TPD response without treating it as retryable work', () => {
   const error = {

@@ -61,7 +61,7 @@ export function addonSelectionClarification(message: string, history: Message[] 
   const choices = selectedAddons(message, history);
   if (choices.some((item) => item.sku === 'extra_makeup') && !addonRecipient(message, 'extra_makeup')) return ADDON_MAKEUP_CLARIFICATION;
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
-  if (/^(?:yes|yeah|yep|sure|ok|okay)[.! ]*$/i.test(message.trim())
+  if (/^(?:yes+|yeah|yep|sure|ok|okay)[.! ]*$/i.test(message.trim())
     && ADDON_CATALOG.filter((item) => item.match.test(lastAssistant)).length > 1) return ADDON_MULTI_CLARIFICATION;
   return null;
 }

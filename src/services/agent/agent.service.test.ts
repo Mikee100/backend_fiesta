@@ -319,11 +319,13 @@ test('recognizes a time-only reschedule request and time response', () => {
 
 test('stores a reschedule proposal as an explicit Nairobi-time instant', async () => {
   const originals = {
+    bookingDraftFindUnique: prisma.bookingDraft.findUnique,
     bookingFindFirst: prisma.booking.findFirst,
     bookingDraftUpsert: prisma.bookingDraft.upsert,
     getAvailableSlots: bookingService.getAvailableSlots,
   };
   let savedDraft: any;
+  (prisma.bookingDraft.findUnique as any) = async () => null;
   (prisma.booking.findFirst as any) = async () => ({
     id: 'booking-123',
     service: 'THE ICON',
@@ -341,6 +343,7 @@ test('stores a reschedule proposal as an explicit Nairobi-time instant', async (
     assert.equal(savedDraft.dateTimeIso, '2026-10-06T10:00:00.000Z');
     assert.equal(inBusinessTimezone(savedDraft.dateTimeIso).format('YYYY-MM-DD HH:mm'), '2026-10-06 13:00');
   } finally {
+    prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
     prisma.booking.findFirst = originals.bookingFindFirst;
     prisma.bookingDraft.upsert = originals.bookingDraftUpsert;
     bookingService.getAvailableSlots = originals.getAvailableSlots;
@@ -708,8 +711,10 @@ test('does not claim payment was received without a successful payment record', 
   const originals = {
     bookingFindFirst: prisma.booking.findFirst,
     paymentFindFirst: prisma.payment.findFirst,
+    draftFindUnique: prisma.bookingDraft.findUnique,
   };
   let payment: any = null;
+  (prisma.bookingDraft.findUnique as any) = async () => null;
   (prisma.booking.findFirst as any) = async () => ({
     id: 'confirmed-booking',
     service: 'THE ICON',
@@ -729,6 +734,7 @@ test('does not claim payment was received without a successful payment record', 
   } finally {
     prisma.booking.findFirst = originals.bookingFindFirst;
     prisma.payment.findFirst = originals.paymentFindFirst;
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
   }
 });
 
@@ -763,13 +769,14 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     bookingDraftFindUnique: prisma.bookingDraft.findUnique,
     bookingFindUnique: prisma.booking.findUnique,
     bookingUpdate: prisma.booking.update,
-    bookingDraftDelete: prisma.bookingDraft.delete,
+    bookingDraftDeleteMany: prisma.bookingDraft.deleteMany,
     updateCalendarEvent: googleCalendarService.updateEvent,
     notifyRescheduleAdmin: agent.notifyRescheduleAdmin,
   };
   let bookingUpdated = false;
   let draftCleared = false;
   (prisma.bookingDraft.findUnique as any) = async () => ({
+    id: 'reschedule-draft-123',
     step: 'reschedule_confirm',
     bookingId: 'booking-123',
     date: '2026-10-04',
@@ -787,15 +794,18 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     bookingUpdated = true;
     return {};
   };
-  (prisma.bookingDraft.delete as any) = async () => {
+  (prisma.bookingDraft.deleteMany as any) = async ({ where }: any) => {
+    assert.deepEqual(where, { id: 'reschedule-draft-123', customerId: 'customer-123', step: 'reschedule_confirm', bookingId: 'booking-123' });
     draftCleared = true;
-    return {};
+    return { count: 1 };
   };
   (googleCalendarService.updateEvent as any) = () => new Promise(() => {});
   agent.notifyRescheduleAdmin = () => new Promise(() => {});
 
   try {
-    const reply = await agent.tryImmediateConfirmation('customer-123');
+    const reply = await agent.tryImmediateConfirmation('customer-123', 'yes', [{
+      role: 'assistant', content: 'If that works for you, reply yes and I will confirm it.',
+    }]);
 
     assert.match(reply, /session has been moved/i);
     assert.equal(bookingUpdated, true);
@@ -804,7 +814,7 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
     prisma.bookingDraft.findUnique = originals.bookingDraftFindUnique;
     prisma.booking.findUnique = originals.bookingFindUnique;
     prisma.booking.update = originals.bookingUpdate;
-    prisma.bookingDraft.delete = originals.bookingDraftDelete;
+    prisma.bookingDraft.deleteMany = originals.bookingDraftDeleteMany;
     googleCalendarService.updateEvent = originals.updateCalendarEvent;
     agent.notifyRescheduleAdmin = originals.notifyRescheduleAdmin;
   }

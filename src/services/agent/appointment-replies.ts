@@ -1,9 +1,9 @@
 import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
 import { DEFAULT_DURATION } from '../../config/constants';
-import { inBusinessTimezone } from '../../utils/time';
+import { bookingDateFacts, businessDay, inBusinessTimezone } from '../../utils/time';
 import { customerReplyTemplates } from '../messaging/customer-reply.templates';
-import { isBookingProcessRequest, isPostShootProcessRequest } from './replies';
+import { buildBookingProposalConfirmation, formatCustomerTime, isBookingProcessRequest, isPostShootProcessRequest } from './replies';
 import { editionInText } from './reply-voice';
 import { BOOKING_WELCOME_CLOSING } from './constants';
 
@@ -11,6 +11,8 @@ type ConversationMessage = { role: 'user' | 'assistant'; content: string };
 
 export function shouldUseBookingStatusReply(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
+  if (/\bwhere\s+(?:are|am)\s+(?:we|i)\b|\b(?:booking|session)\s+(?:progress|status)\b/i.test(text)) return true;
+  if (/\b(?:have you|did you)\s+book(?:ed)?\s+(?:it|this|that|my\s+(?:session|appointment|booking))\b/i.test(text)) return true;
   return /(have you done it|did you do it|is it done|is it confirmed|did it go through|have you confirmed|did you confirm|is my booking confirmed|is my session confirmed|have i paid|did i pay|is it paid|is my payment (received|confirmed|done|through)|has (my|the) payment been received|did (my|the) payment go through|did you receive (my|the) payment|did you get (my|the) (money|payment)|have you received (my|the) (money|payment))/i.test(text);
 }
 
@@ -150,7 +152,28 @@ export async function getUpcomingAppointmentTimeReply(customerId: string): Promi
   return `Your ${upcomingBooking.service} session starts on ${inBusinessTimezone(upcomingBooking.dateTime).format('dddd, MMMM D, YYYY')} at ${inBusinessTimezone(upcomingBooking.dateTime).format('h:mm A')}. Please arrive about 30 minutes early.`;
 }
 
-export async function getBookingStatusReply(customerId: string): Promise<string | null> {
+export async function getBookingStatusReply(this: any, customerId: string): Promise<string | null> {
+  const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  const usableDate = draft?.date && !bookingDateFacts(draft.date).isMonday && !bookingDateFacts(draft.date).isPast;
+  const details = draft?.service && usableDate && draft.time
+    ? `You chose ${editionInText(draft.service)} for ${businessDay(draft.date!).format('dddd, D MMMM YYYY')} at ${formatCustomerTime(draft.time)}. ` : '';
+  if (draft?.step === 'collecting_slots') {
+    const missing = [!draft.name && 'your name', !draft.service && 'your edition', !draft.date && 'a date', !draft.time && 'a time'].filter(Boolean);
+    return `${details}Your current request is not booked or confirmed yet. ${missing.length ? `I still need ${missing.join(', ')}.` : 'The details still need a deposit proposal and payment.'}`;
+  }
+  if (draft?.step === 'reschedule_confirm') return customerReplyTemplates.rescheduleAwaitingConfirmation();
+  if (draft?.step === 'awaiting_confirmation') {
+    if (draft.service && draft.date && draft.time && this?.getPackageForDeposit) {
+      try {
+        const deposit = this.getDepositForPackage(await this.getPackageForDeposit(draft.service));
+        return buildBookingProposalConfirmation(draft.service, draft.date, draft.time, deposit).replace('are ready for', 'are still ready for');
+      } catch {
+        return `${details}Your booking is not confirmed. The team will verify the deposit before we continue.`;
+      }
+    }
+    return `${details}${customerReplyTemplates.bookingAwaitingConfirmation()}`;
+  }
+  if (draft?.step === 'payment_pending') return `${details}Your current request is awaiting payment verification. The studio team can confirm its status.`;
   const upcomingConfirmed = await prisma.booking.findFirst({
     where: {
       customerId,
@@ -171,18 +194,6 @@ export async function getBookingStatusReply(customerId: string): Promise<string 
     return successfulPayment
       ? `Your payment is received and confirmed${receiptNote}. ${sessionDetails} ${BOOKING_WELCOME_CLOSING}`
       : `${sessionDetails} I can't verify a successful payment from the records I can see; the studio team can confirm the payment status.`;
-  }
-
-  const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-  if (draft?.step === 'reschedule_confirm') return customerReplyTemplates.rescheduleAwaitingConfirmation();
-  if (draft?.step === 'awaiting_confirmation') return customerReplyTemplates.bookingAwaitingConfirmation();
-
-  if (draft?.step === 'payment_pending') {
-    const pendingPayment = await prisma.payment.findFirst({
-      where: { bookingDraftId: draft.id, status: 'pending' },
-      orderBy: { updatedAt: 'desc' },
-    });
-    if (pendingPayment) return customerReplyTemplates.paymentPending();
   }
 
   return null;

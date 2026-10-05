@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AgentService } from './agent.service';
+import { SCHEMA_MAINTENANCE_REPLY } from '../../config/schema-readiness';
 
 const PAYMENT_PROPOSAL = {
   role: 'assistant' as const,
@@ -16,6 +17,7 @@ function createAgent(overrides: Record<string, unknown> = {}) {
   const agent = new AgentService() as any;
   Object.assign(agent, {
     checkTokenBudget: async () => true,
+    getBookingProgressReply: async () => null,
     trackSentiment: async () => {},
     escalate: async () => {},
     touchCustomerMemory: async () => {},
@@ -27,6 +29,50 @@ function createAgent(overrides: Record<string, unknown> = {}) {
   });
   return { agent, metrics, learnings };
 }
+
+test('missing-column failures alert schema mismatch instead of suggesting a retry', async (context) => {
+  const alerts: any[] = [];
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  context.after(() => { console.error = originalError; });
+  const error = { code: 'P2022', message: 'connection details must never be logged', meta: { modelName: 'BookingDraft', column: 'booking_drafts.cancelProposedAt' } };
+  const { agent, metrics } = createAgent({
+    runAgent: async () => { throw error; },
+    escalate: async (_customer: string, _type: string, description: string) => { alerts.push(JSON.parse(description)); },
+  });
+  const first = await agent.handleMessage('schema-customer', 'Hello', [], 'whatsapp');
+  const second = await agent.handleMessage('schema-customer', 'Hello again', [], 'whatsapp');
+  await settle();
+  assert.equal(first, SCHEMA_MAINTENANCE_REPLY);
+  assert.equal(second, SCHEMA_MAINTENANCE_REPLY);
+  assert.doesNotMatch(first, /try again|cancelProposedAt|P2022/);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].event, 'database_schema_out_of_date');
+  assert.equal(alerts[0].column, 'booking_drafts.cancelProposedAt');
+  assert.equal(alerts[0].customerMessage, 'Hello');
+  assert.ok(metrics.every((metric) => metric.failureReason === 'database_schema_out_of_date'));
+  assert.match(logged.join('\n'), /SCHEMA_OUT_OF_DATE/);
+  assert.doesNotMatch(logged.join('\n'), /connection details must never be logged/);
+});
+
+test('schema mismatch in draft pre-guard or slot capture uses the same maintenance path', async () => {
+  const error = { code: 'P2022', meta: { modelName: 'BookingDraft', column: 'booking_drafts.cancelProposedAt' } };
+  for (const boundary of ['clearStaleCancellationDraftBeforeRouting', 'rememberBookingSlots', 'tryImmediateConfirmation']) {
+    const alerts: unknown[] = [];
+    const { agent, metrics } = createAgent({
+      [boundary]: async () => { throw error; },
+      runAgent: async () => { assert.fail('schema failure must stop before provider work'); },
+      escalate: async (_customer: string, _type: string, description: string) => { alerts.push(JSON.parse(description)); },
+    });
+    const confirming = boundary === 'tryImmediateConfirmation';
+    const reply = await agent.handleMessage('schema-boundary', confirming ? 'yes' : 'Hello', confirming ? [PAYMENT_PROPOSAL] : [], 'whatsapp');
+    await settle();
+    assert.equal(reply, SCHEMA_MAINTENANCE_REPLY);
+    assert.equal(alerts.length, 1);
+    assert.equal(metrics[0].failureReason, 'database_schema_out_of_date');
+  }
+});
 
 test('the reply is returned without waiting for logging to finish', async () => {
   const { agent } = createAgent({
