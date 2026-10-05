@@ -20,7 +20,6 @@ const ASYNC_HANDLERS: Record<string, string> = {
   getPreviousAddonReply: 'previousAddon',
   getEarliestImageDeliveryReply: 'earliestImageDelivery',
   getBookingProcessReply: 'bookingProcess',
-  getRescheduleTimeProposalReply: 'timeOnlyRescheduleSelection',
   getSameBookingSlotReply: 'sameBookingSlot',
   getPackageSelectionReply: 'packageSelection',
   getPackageAdviceReply: 'packageAdvice',
@@ -82,6 +81,9 @@ function createHarness(options: HarnessOptions = {}) {
 
   for (const [method, route] of Object.entries(ASYNC_HANDLERS)) agent[method] = async () => reply(route);
   for (const [method, route] of Object.entries(SYNC_HANDLERS)) agent[method] = () => reply(route);
+  // The real handler yields unless a reschedule is in progress; here the history stands in for that state.
+  agent.getRescheduleSelectionReply = async (_customer: string, _message: string, history: Msg[]) =>
+    (agent.conversationFlows.isRescheduleQuestion(history) ? reply('rescheduleSelection') : null);
   for (const [method, route] of Object.entries(PREDICATE_HANDLERS)) {
     const original = agent[method].bind(agent);
     agent[method] = (...args: any[]) => (original(...args) ? reply(route) : null);
@@ -209,7 +211,8 @@ const CASES: Case[] = [
   { message: 'How do I book?', expected: 'bookingProcess' },
 
   // Reschedule
-  { message: '3pm', history: [assistant('Of course. What time would work better for you that day?')], expected: 'timeOnlyRescheduleSelection' },
+  { message: '3pm', history: [assistant('Of course. What time would work better for you that day?')], expected: 'rescheduleSelection' },
+  { message: 'same day but from 5pm', history: [assistant('Sure! What date and time would you like to move your session to?')], expected: 'rescheduleSelection', note: 'reschedule replies keep the existing booking instead of starting a new one' },
   { message: "Let's not reschedule", history: [POLICY_72H], expected: 'rescheduleWithdrawal' },
   { message: 'Can I change the time?', expected: 'timeOnlyRescheduleRequest' },
   { message: "I'd like to move my appointment", expected: 'rescheduleRequest' },
@@ -323,7 +326,7 @@ test('message route order remains unchanged', () => {
     'earliestImageDelivery',
     'postShootProcess',
     'bookingProcess',
-    'timeOnlyRescheduleSelection',
+    'rescheduleSelection',
     'rescheduleWithdrawal',
     'timeOnlyRescheduleRequest',
     'rescheduleRequest',

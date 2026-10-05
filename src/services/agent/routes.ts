@@ -354,9 +354,10 @@ export function createMessageRoutes(
       handle: async () => this.getBookingProcessReply(),
     },
     {
-      name: 'timeOnlyRescheduleSelection',
-      when: () => this.conversationFlows.isTimeOnlyRescheduleSelection(userMessage, history),
-      handle: async () => this.getRescheduleTimeProposalReply(customerId, userMessage),
+      name: 'rescheduleSelection',
+      replyMode: 'deterministic',
+      when: () => this.conversationFlows.hasRescheduleSlotSignal(userMessage),
+      handle: async () => this.getRescheduleSelectionReply(customerId, userMessage, history),
     },
     {
       name: 'rescheduleWithdrawal',

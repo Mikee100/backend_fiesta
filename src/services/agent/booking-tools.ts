@@ -2,13 +2,14 @@ import prisma from '../../config/prisma';
 import { bookingService } from '../booking/booking.service';
 import { bookingDraftService } from '../booking/booking-draft.service';
 import { googleCalendarService } from '../calendar/calendar.service';
+import { invoiceService } from '../invoice/invoice.service';
 import { mpesaService } from '../payment/mpesa.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, inBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import dayjs from 'dayjs';
-import { PAYMENT_ATTEMPTS_EXHAUSTED, PAYMENT_PROMPT_UNRECORDED } from './constants';
+import { PAYMENT_ATTEMPTS_EXHAUSTED, PAYMENT_PROMPT_UNRECORDED, RESCHEDULE_COLLECTING_STEP } from './constants';
 import { sanitizeSlotValue } from './slot-memory';
 import { draftVersion, MAX_PAYMENT_ATTEMPTS } from './payment-recovery';
 
@@ -199,8 +200,13 @@ export function getDepositForPackage(pkg: { name: string; deposit: number | null
     throw new Error('No package deposit is configured. Ask the studio team to confirm the amount.');
   }
 
-  const depositAmount: unknown = pkg.deposit;
   const isProductionMpesa = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase() === 'production';
+  // Local-only testing override; ignored in production and under the node test runner.
+  const localOverride = Number(process.env.LOCAL_DEPOSIT_OVERRIDE);
+  const depositAmount: unknown = !isProductionMpesa && process.env.NODE_ENV !== 'production' && !process.env.NODE_TEST_CONTEXT
+    && Number.isInteger(localOverride) && localOverride > 0
+    ? localOverride
+    : pkg.deposit;
   if (typeof depositAmount !== 'number' || !Number.isInteger(depositAmount) || depositAmount < 1) {
     throw new Error(`The configured deposit for ${pkg.name} is missing or invalid. Do not quote or initiate payment; ask the studio team to correct package pricing.`);
   }
@@ -212,7 +218,7 @@ export function getDepositForPackage(pkg: { name: string; deposit: number | null
 
 export async function executeProposeRescheduleTool(this: any, customerId: string, newDate: string, newTime: string) {
   const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-  if (existingDraft && existingDraft.step !== 'reschedule_confirm') {
+  if (existingDraft && existingDraft.step !== 'reschedule_confirm' && existingDraft.step !== RESCHEDULE_COLLECTING_STEP) {
     throw new Error('I have not changed your current request or started a reschedule. Please finish that step or ask the studio team to help.');
   }
   const upcomingBooking = await prisma.booking.findFirst({
@@ -325,6 +331,10 @@ export async function executeConfirmRescheduleTool(this: any, customerId: string
   await prisma.bookingDraft.deleteMany({
     where: { id: draft.id, customerId, step: 'reschedule_confirm', bookingId: upcomingBooking.id },
   }).catch((err: unknown) => console.error('Failed to clear reschedule draft:', err));
+
+  // Same invoice number; only the PDF session date and totals are regenerated.
+  void invoiceService.createOrRefreshForBooking(upcomingBooking.id)
+    .catch((err: unknown) => console.error('Failed to refresh invoice after reschedule:', err));
 
   return {
     newDateTime,
