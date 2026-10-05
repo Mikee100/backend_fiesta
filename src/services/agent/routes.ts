@@ -15,6 +15,7 @@ import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from '
 import { needsUnchangedReassurance } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
 import { familyStylingReply } from './replies';
+import { classifyPaymentMessage } from './payment-recovery';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -84,6 +85,26 @@ export function createMessageRoutes(
       replyMode: 'deterministic',
       when: () => this.shouldClarifyAmbiguousDeposit(userMessage),
       handle: () => this.getAmbiguousDepositReply(),
+    },
+    {
+      name: 'paymentRecovery',
+      replyMode: 'deterministic',
+      // Explicit yes/confirm replies go through immediateConfirmation, which delegates payment_pending drafts here.
+      when: () => (platform === 'whatsapp' || platform === 'web')
+        && classifyPaymentMessage(userMessage) !== null
+        && !(classifyPaymentMessage(userMessage) === 'consent' && this.isExplicitConfirmation(userMessage)),
+      handle: async () => {
+        try {
+          return await this.getPaymentRecoveryReply(customerId, userMessage);
+        } catch (error: any) {
+          if (isMissingColumnError(error)) throw error;
+          console.error('[AGENT_FLOW] Payment recovery failed:', error);
+          return {
+            reply: 'I could not check your payment just now, so I have not sent another prompt. The studio team can help on 0720 111928.',
+            outcome: { success: false, isFallback: true, failureReason: String(error?.message || error).slice(0, 200) },
+          };
+        }
+      },
     },
     {
       name: 'rescheduleWithdrawalConfirmation',
@@ -185,11 +206,6 @@ export function createMessageRoutes(
       replyMode: 'deterministic',
       when: () => this.shouldUsePackageBudgetReply(userMessage),
       handle: () => this.getPackageBudgetReply(),
-    },
-    {
-      name: 'paymentResend',
-      when: () => this.shouldHandleResendRequest(userMessage),
-      handle: async () => this.tryHandlePaymentResend(customerId),
     },
     {
       name: 'suspendingConceptGallery',
@@ -338,9 +354,10 @@ export function createMessageRoutes(
       handle: async () => this.getBookingProcessReply(),
     },
     {
-      name: 'timeOnlyRescheduleSelection',
-      when: () => this.conversationFlows.isTimeOnlyRescheduleSelection(userMessage, history),
-      handle: async () => this.getRescheduleTimeProposalReply(customerId, userMessage),
+      name: 'rescheduleSelection',
+      replyMode: 'deterministic',
+      when: () => this.conversationFlows.hasRescheduleSlotSignal(userMessage),
+      handle: async () => this.getRescheduleSelectionReply(customerId, userMessage, history),
     },
     {
       name: 'rescheduleWithdrawal',

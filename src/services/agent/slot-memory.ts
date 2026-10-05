@@ -14,6 +14,13 @@ export function sanitizeSlotValue(value: string, maxLength = 80): string {
   return value.replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLength);
 }
 
+/** Rejects placeholders and conversational fragments such as "No its Joan" stored as a name. */
+export function isUsableName(name: string | null | undefined): boolean {
+  const value = (name || '').trim();
+  return Boolean(value) && !/^(?:WhatsApp User|Unknown)$/i.test(value)
+    && !/^(?:no|nope|yes+|yeah|yep|ok(?:ay)?)\b|\b(?:it['’]?s|it is|my name is)\b/i.test(value);
+}
+
 export function earlySlotsExpired(draft: Draft, now = Date.now()): boolean {
   return draft.step === EARLY_SLOT_STEP
     && (!draft.createdAt || now - draft.createdAt.getTime() >= SLOT_MEMORY_WINDOW_MS);
@@ -32,7 +39,9 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
     || /^(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+package)?[.! ]*$/i.test(message);
   const nameAnswer = !question && !choice && /\b(?:your name|full name|what name)\b/i.test(lastAssistant)
     && /^[a-z][a-z' -]{1,79}$/i.test(message.trim());
-  if (named || nameCorrection || nameAnswer) slots.name = sanitizeSlotValue(named?.[1] || nameCorrection?.[1] || message);
+  const answeredName = message.trim().replace(/^(?:no|nope|yes|yeah)?[, ]*(?:it['’]?s|it is|my name is|i am|i['’]?m|this is)\s+/i, '');
+  if (named || nameCorrection || nameAnswer) slots.name = sanitizeSlotValue(named?.[1] || nameCorrection?.[1] || answeredName);
+  if (slots.name && !isUsableName(slots.name)) delete slots.name;
   if (!question && choice) {
     const selected = PACKAGE_NAMES_FOR_EXTRACTION.find((name) => {
       const word = name.replace(/^THE /, '');
@@ -79,8 +88,7 @@ export async function rememberBookingSlots(customerId: string, message: string, 
   }
   const customer = await prisma.customer.findUnique({ where: { id: customerId } });
   if (!customer) return null;
-  const profileName = customer.name && !/^(?:WhatsApp User|Unknown)$/i.test(customer.name)
-    ? sanitizeSlotValue(customer.name) : null;
+  const profileName = isUsableName(customer.name) ? sanitizeSlotValue(customer.name) : null;
   const profileDefault = !draft?.name && !stated.name && profileName;
   const data = {
     ...stated,

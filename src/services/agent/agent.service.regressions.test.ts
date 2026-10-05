@@ -16,6 +16,7 @@ import { resolveCalendarDate } from './extraction';
 import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
+import { invoiceService } from '../invoice/invoice.service';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
 import { buildAdditionsReply, isAddonListFollowUp, formatCustomerTime } from './replies';
@@ -39,6 +40,13 @@ test('family styling questions are deterministic team-confirm topics, not invent
     assert.equal(await instance.handleMessage('synthetic-family', question, [], 'whatsapp'), FAMILY_STYLING_TEAM_REPLY);
   }
   assert.equal(familyStylingReply('Can you style them?', [{ role: 'user', content: 'My partner and children are joining.' }]), FAMILY_STYLING_TEAM_REPLY);
+  const familySession = [
+    { role: 'user' as const, content: 'i would like a family session' },
+    { role: 'assistant' as const, content: "Your partner and children are very welcome to join your maternity session. We'll guide poses that include everyone." },
+  ];
+  assert.equal(familyStylingReply('tell me about styling...are they styled too?', familySession), FAMILY_STYLING_TEAM_REPLY);
+  assert.equal(await instance.handleMessage('synthetic-family', 'tell me about styling...are they styled too?', familySession, 'whatsapp'), FAMILY_STYLING_TEAM_REPLY);
+  assert.equal(familyStylingReply('are they welcome on Saturday?', familySession), null);
   assert.equal(familyStylingReply('What makeup is included in Icon?'), null);
   const facts = { amounts: [], deposits: [], editions: [] };
   for (const text of ['Family members can bring their own outfits.', 'We can arrange partner styling as an optional add-on.', 'Outfits and accessories for partners are included.']) {
@@ -718,7 +726,7 @@ test('canned replies and exact tool proposals bypass verification and cannot be 
     return { provider: 'groq', completionCalls: 1, response: { choices: [{ message }], usage: { total_tokens: 3 } } };
   };
   const receipt = await instance.runAgent('exact-proposal', 'confirm', [{ role: 'assistant', content: 'The deposit is KSH 2000. Reply yes to confirm.' }], 'whatsapp');
-  assert.match(receipt.content, /initiated a deposit payment request of KSH 2000/);
+  assert.match(receipt.content, /initiated a deposit payment request of Ksh 2,000/);
   assert.doesNotMatch(receipt.content, /No payment|30%/);
   assert.equal(confirmations, 1);
   assert.equal(completions, 2);
@@ -2080,8 +2088,9 @@ test('cancellation notification flags a successful deposit for manual refund rev
 });
 
 test('reschedule completion only cleans up its own proposal, preserving a replacement draft', async (context) => {
-  const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findUnique, update: prisma.booking.update, remove: prisma.bookingDraft.delete, removeMany: prisma.bookingDraft.deleteMany };
+  const originals = { draft: prisma.bookingDraft.findUnique, booking: prisma.booking.findUnique, update: prisma.booking.update, remove: prisma.bookingDraft.delete, removeMany: prisma.bookingDraft.deleteMany, invoice: invoiceService.createOrRefreshForBooking };
   context.after(() => {
+    invoiceService.createOrRefreshForBooking = originals.invoice;
     prisma.bookingDraft.findUnique = originals.draft;
     prisma.booking.findUnique = originals.booking;
     prisma.booking.update = originals.update;
@@ -2091,6 +2100,7 @@ test('reschedule completion only cleans up its own proposal, preserving a replac
   const collecting = { id: 'new-request', step: 'collecting_slots', name: 'Joan Mwangi', service: 'THE ICON', date: '2026-11-12', time: '10:00' };
   let draft: any = { id: 'reschedule-request', step: 'reschedule_confirm', bookingId: 'older-booking', date: '2026-11-14', time: '15:00', dateTimeIso: '2026-11-14T12:00:00Z' };
   (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (invoiceService.createOrRefreshForBooking as any) = async () => null;
   (prisma.booking.findUnique as any) = async () => ({ id: 'older-booking', service: 'THE BLOOM', dateTime: new Date('2026-11-10T12:00:00Z'), googleEventId: null });
   (prisma.booking.update as any) = async () => { draft = { ...collecting }; return {}; };
   (prisma.bookingDraft.delete as any) = async () => { draft = null; return {}; };
@@ -2104,13 +2114,15 @@ test('reschedule completion only cleans up its own proposal, preserving a replac
 });
 
 test('payment-pending reply uses a real apostrophe', async () => {
-  const original = prisma.bookingDraft.findUnique;
-  (prisma.bookingDraft.findUnique as any) = async () => ({ step: 'payment_pending', service: 'THE ICON' });
+  const originals = { draft: prisma.bookingDraft.findUnique, payment: prisma.payment.findFirst };
+  (prisma.bookingDraft.findUnique as any) = async () => ({ id: 'draft-1', step: 'payment_pending', service: 'THE ICON', version: 2, updatedAt: new Date() });
+  (prisma.payment.findFirst as any) = async () => ({ id: 'payment-1', amount: 2000, phone: '254700000123', status: 'pending', updatedAt: new Date() });
   try {
     const reply = await agent.tryImmediateConfirmation('customer-1', 'yes');
     assert.match(reply, /^I’ve already sent the M-Pesa deposit prompt/);
   } finally {
-    prisma.bookingDraft.findUnique = original;
+    prisma.bookingDraft.findUnique = originals.draft;
+    prisma.payment.findFirst = originals.payment;
   }
 });
 
@@ -2230,7 +2242,7 @@ test('"yes" after a booking proposal still sends the M-Pesa prompt', async () =>
   try {
     const reply = await instance.handleMessage('customer-1', 'yes', [PAYMENT_PROPOSAL], 'whatsapp');
     assert.equal(paymentStarted, true);
-    assert.match(reply, /sent the M-Pesa deposit prompt of KSH 2000/);
+    assert.match(reply, /sent the M-Pesa deposit prompt of Ksh 2,000/);
   } finally {
     prisma.bookingDraft.findUnique = original;
   }

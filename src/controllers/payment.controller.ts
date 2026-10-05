@@ -5,7 +5,7 @@ import { whatsappService } from '../services/messaging/whatsapp.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT } from '../config/constants';
 import { notifyAdmin } from '../services/notifications/notification.service';
 import { invoiceService } from '../services/invoice/invoice.service';
-import { customerReplyTemplates } from '../services/messaging/customer-reply.templates';
+import { describeDarajaResult, paymentFailureMessage } from '../services/agent/payment-recovery';
 import { bookingAddonService } from '../services/booking/booking-addon.service';
 import { bookingService } from '../services/booking/booking.service';
 
@@ -21,7 +21,7 @@ export class PaymentController {
       return res.status(400).json({ status: 'error', message: 'Invalid payload' });
     }
 
-    const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
+    const { CheckoutRequestID, ResultCode } = Body.stkCallback;
 
     console.log(`M-Pesa Callback received for CheckoutRequestID: ${CheckoutRequestID}, ResultCode: ${ResultCode}`);
     console.log('Full Callback Body:', JSON.stringify(req.body, null, 2));
@@ -30,8 +30,15 @@ export class PaymentController {
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
     // Process payment verification, booking creation, calendar sync, and WhatsApp dispatch asynchronously
-    setImmediate(async () => {
-      try {
+    setImmediate(() => {
+      void this.processMpesaCallback(Body.stkCallback);
+    });
+  }
+
+  async processMpesaCallback(stkCallback: any): Promise<void> {
+    const { CheckoutRequestID, ResultDesc, CallbackMetadata } = stkCallback;
+    const ResultCode = Number(stkCallback.ResultCode);
+    try {
         // Find the payment record with potential booking or draft
         const payment = await prisma.payment.findFirst({
           where: { checkoutRequestId: CheckoutRequestID },
@@ -45,12 +52,24 @@ export class PaymentController {
           console.error(`❌ Payment record not found for CheckoutRequestID: ${CheckoutRequestID}`);
           return;
         }
+        if (payment.status === 'success') {
+          console.log(`Duplicate M-Pesa callback ignored for CheckoutRequestID: ${CheckoutRequestID}; payment already succeeded.`);
+          return;
+        }
 
         console.log(`✅ Found payment record for ${payment.phone}. Linked to draft: ${!!payment.bookingDraft}, booking: ${!!payment.booking}`);
 
         if (ResultCode === 0) {
           // Success
           const mpesaReceipt = CallbackMetadata?.Item?.find((item: any) => item.Name === 'MpesaReceiptNumber')?.Value;
+          const claimed = await prisma.payment.updateMany({
+            where: { id: payment.id, status: { not: 'success' } },
+            data: { status: 'success', mpesaReceipt: mpesaReceipt || null },
+          });
+          if (claimed.count === 0) {
+            console.log(`Duplicate M-Pesa success callback ignored for CheckoutRequestID: ${CheckoutRequestID}.`);
+            return;
+          }
 
           const isProductionMpesa = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase() === 'production';
           if (isProductionMpesa && payment.amount < MINIMUM_BOOKING_DEPOSIT) {
@@ -260,7 +279,7 @@ export class PaymentController {
               await notifyAdmin(
                 'booking',
                 `New booking confirmed: ${targetBooking.customer.name || targetBooking.customer.id}`,
-                `${targetBooking.service} on ${targetBooking.dateTime.toLocaleDateString()} at ${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Deposit KSH ${payment.amount}${mpesaReceipt ? `, M-Pesa code ${mpesaReceipt}` : ''}.`,
+                `${targetBooking.service} on ${targetBooking.dateTime.toLocaleDateString()} at ${targetBooking.dateTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}. Deposit KSh ${payment.amount.toLocaleString()}${mpesaReceipt ? `, M-Pesa code ${mpesaReceipt}` : ''}.`,
                 {
                   event: 'new_booking_confirmed',
                   customerId: targetBooking.customerId,
@@ -308,28 +327,32 @@ export class PaymentController {
             }
           }
         } else {
-          // Failed
-          await prisma.payment.update({
-            where: { id: payment.id },
-            data: { status: 'failed' }
+          // Failed: only a still-pending row for this exact prompt may transition, so duplicate or superseded callbacks are ignored.
+          const outcome = describeDarajaResult(ResultCode);
+          const transitioned = await prisma.payment.updateMany({
+            where: { id: payment.id, status: 'pending', checkoutRequestId: CheckoutRequestID },
+            data: { status: outcome.status },
           });
+          if (transitioned.count === 0) {
+            console.log(`Duplicate or superseded M-Pesa failure callback ignored for CheckoutRequestID: ${CheckoutRequestID}.`);
+            return;
+          }
 
           const customerId = payment.bookingDraft?.customerId || payment.booking?.customerId;
           if (customerId) {
             try {
-              const message = customerReplyTemplates.paymentFailed(ResultDesc);
+              const message = paymentFailureMessage(ResultCode, payment.bookingDraft?.step === 'payment_pending' ? payment.bookingDraft : null);
               await whatsappService.sendMessage(customerId, message);
             } catch (waErr: any) {
               console.error('Failed to send payment failure WhatsApp message:', waErr?.message || waErr);
             }
           }
           
-          console.log(`Payment failed for CheckoutRequestID: ${CheckoutRequestID}. Reason: ${ResultDesc}`);
+          console.log(`Payment ${outcome.status} for CheckoutRequestID: ${CheckoutRequestID}. ResultCode: ${ResultCode}. Reason: ${ResultDesc}`);
         }
-      } catch (asyncErr: any) {
-        console.error('Error in asynchronous M-Pesa callback handling:', asyncErr);
-      }
-    });
+    } catch (asyncErr: any) {
+      console.error('Error in asynchronous M-Pesa callback handling:', asyncErr);
+    }
   }
 }
 

@@ -28,7 +28,7 @@ export const customerReplyTemplates = {
     'The M-Pesa prompt is still waiting for payment. Once it goes through, I will confirm your session.',
 
   paymentFailed: (reason: string) =>
-    formatCustomerReply(`Your deposit payment did not go through: ${reason}. Your booking request is still held for 15 minutes. You can try again, or message us if you need help.`),
+    formatCustomerReply(`Your deposit payment did not go through: ${reason.trim().replace(/[.\s]+$/, '')}. Your booking request is still held for 15 minutes. You can try again, or message us if you need help.`),
 
   appointmentReminder: (name: string, service: string, time: string) =>
     `Hi ${name}, your ${service} session is tomorrow at ${time}. Please arrive about 30 minutes early so there is time to get settled and ready. We look forward to seeing you.`,

@@ -18,11 +18,15 @@ import {
   OFFICIAL_WEBSITE_URLS,
   PACKAGE_PRICING_FALLBACK,
   PAYMENT_CONFIRMATION_REQUIRED_REPLY,
+  PAYMENT_ALREADY_PENDING,
+  PAYMENT_ATTEMPTS_EXHAUSTED,
+  RESCHEDULE_COLLECTING_STEP,
+  RESCHEDULE_CONTEXT_TTL_MS,
   PAYMENT_PROMPT_UNRECORDED,
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
-import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
+import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
@@ -54,7 +58,6 @@ import {
   buildCancellationProposal,
   buildPackageDepositProposal,
   buildRescheduleProposalConfirmation,
-  buildTimeOnlyRescheduleProposal,
   isAddonListFollowUp as matchesAddonListFollowUp,
   isAdditionsRequest,
   isBespokeRequest,
@@ -113,6 +116,7 @@ import {
   touchCustomerMemory as updateCustomerMemory,
 } from './usage-and-memory';
 import { buildBookingProcessReply } from './booking-process-reply';
+import { handlePaymentRecovery, paymentAttemptsExhaustedReply, type PaymentMessageKind } from './payment-recovery';
 import {
   extractInvoiceNumber as parseInvoiceNumber,
   extractInvoiceSessionDateRange as parseInvoiceSessionDateRange,
@@ -412,7 +416,7 @@ export class AgentService {
 
   private async withdrawPendingReschedule(customerId: string): Promise<void> {
     await prisma.bookingDraft.deleteMany({
-      where: { customerId, step: 'reschedule_confirm' },
+      where: { customerId, step: { in: ['reschedule_confirm', RESCHEDULE_COLLECTING_STEP] } },
     });
   }
 
@@ -846,11 +850,6 @@ export class AgentService {
     return isSocialMediaRequest(userMessage);
   }
 
-  private shouldHandleResendRequest(userMessage: string): boolean {
-    const text = userMessage.toLowerCase();
-    return /(resend|send\s+again|retry|repeat|send\s+it\s+again)/.test(text);
-  }
-
   private shouldUseMultiPersonBookingReply(userMessage: string): boolean {
     return isMultiPersonBookingRequest(userMessage);
   }
@@ -1051,9 +1050,10 @@ export class AgentService {
     const booking = await prisma.booking.findFirst({
       where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
       orderBy: { dateTime: 'asc' },
-      select: { service: true, dateTime: true },
+      select: { id: true, service: true, dateTime: true },
     });
     if (!booking) return null;
+    await this.rememberRescheduleContext(customerId, booking);
 
     if (this.isRescheduleWithin72Hours(booking.dateTime)) {
       return this.getReschedulePolicyMessage();
@@ -1062,49 +1062,113 @@ export class AgentService {
     return `Of course. Your ${booking.service} session is currently on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${inBusinessTimezone(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
   }
 
-  private async getRescheduleTimeProposalReply(customerId: string, userMessage: string): Promise<string | null> {
-    const newTime = this.conversationFlows.parseTimeOnly(userMessage);
-    if (!newTime) return null;
+  /** Stores which booking is being moved, so later turns (or a reminder in between) cannot lose it. */
+  private async rememberRescheduleContext(customerId: string, booking: { id: string; service: string }): Promise<void> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    const replaceable = !draft || draft.step === RESCHEDULE_COLLECTING_STEP || draft.step === 'reschedule_confirm'
+      || (draft.step === EARLY_SLOT_STEP && !draft.service && !draft.date);
+    if (!replaceable) return;
+    const data = { step: RESCHEDULE_COLLECTING_STEP, bookingId: booking.id, service: booking.service, date: null, time: null, dateTimeIso: null };
+    if (draft) await prisma.bookingDraft.updateMany({ where: { id: draft.id, step: draft.step }, data });
+    else await prisma.bookingDraft.create({ data: { customerId, ...data } }).catch((error: any) => { if (error?.code !== 'P2002') throw error; });
+  }
+
+  private isActiveRescheduleDraft(draft: { step: string; updatedAt?: Date | null } | null): boolean {
+    if (!draft || (draft.step !== RESCHEDULE_COLLECTING_STEP && draft.step !== 'reschedule_confirm')) return false;
+    return !draft.updatedAt || Date.now() - new Date(draft.updatedAt).getTime() < RESCHEDULE_CONTEXT_TTL_MS;
+  }
+
+  /**
+   * Reschedule of an existing confirmed booking: the booking is the source of truth, so only the
+   * changed fields come from the message ("same day" or no date keeps the booking's date).
+   */
+  private async getRescheduleSelectionReply(customerId: string, userMessage: string, history: { role: 'user' | 'assistant'; content: string }[] = []): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!this.isActiveRescheduleDraft(draft) && !this.conversationFlows.isRescheduleQuestion(history)) return null;
+    if (draft?.step === RESCHEDULE_COLLECTING_STEP && /\b(?:new|another|second|separate) (?:booking|session|shoot)\b|\bbook (?:a|another|the)\b/i.test(userMessage)) {
+      await prisma.bookingDraft.deleteMany({ where: { id: draft.id, step: RESCHEDULE_COLLECTING_STEP } });
+      return null;
+    }
+    const namedEdition = userMessage.match(new RegExp(`\\b(?:${PACKAGE_NAME_PATTERN})\\b`, 'i'))?.[0]?.toLowerCase();
+    // Naming a different edition is a package change, not a pure date/time move; leave it to the general flow.
+    const isOtherEdition = (service: string | null | undefined) => Boolean(namedEdition && service && !service.toLowerCase().includes(namedEdition));
+    if (isOtherEdition(draft?.service)) return null;
 
     const booking = await prisma.booking.findFirst({
-      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() }, ...(draft?.bookingId && this.isActiveRescheduleDraft(draft) ? { id: draft.bookingId } : {}) },
       orderBy: { dateTime: 'asc' },
       select: { id: true, service: true, dateTime: true },
     });
-    if (!booking) return null;
+    if (!booking || isOtherEdition(booking.service)) return null;
 
-    if (this.isRescheduleWithin72Hours(booking.dateTime)) {
-      return this.getReschedulePolicyMessage();
+    const current = inBusinessTimezone(booking.dateTime);
+    const existingDate = current.format('YYYY-MM-DD');
+    const edition = editionInText(booking.service);
+    let statedDate: string | null;
+    try {
+      statedDate = resolveCalendarDate(userMessage);
+    } catch {
+      return `That calendar date is not valid. Which date and time would you like for your session for ${edition}?`;
+    }
+    const newDate = statedDate || existingDate;
+    const newDateLabel = businessDay(newDate).format('dddd, D MMMM');
+    const newTime = this.conversationFlows.parseCustomerTime(userMessage);
+    if (!newTime) return `What time on ${newDateLabel} would you like for your session for ${edition}?`;
+    if (newDate === existingDate && newTime === current.format('HH:mm')) {
+      return `Your session for ${edition} is already on ${newDateLabel} at ${formatCustomerTime(newTime)}. Which other time would you like?`;
+    }
+
+    if (draft?.step === EARLY_SLOT_STEP && !draft.service && !draft.date) {
+      // Slot memory can mistake a reschedule time for a new booking; that empty draft must not block the change.
+      await prisma.bookingDraft.deleteMany({ where: { id: draft.id, step: EARLY_SLOT_STEP, service: null, date: null } });
     }
 
     const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => booking.service.toLowerCase().includes(key));
-    const bookingDay = inBusinessTimezone(booking.dateTime).format('YYYY-MM-DD');
-    const slotsResult = await bookingService.getAvailableSlots(
-      bookingDay,
-      serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION,
-      booking.id
-    );
-    const availableSlots = Array.isArray(slotsResult) ? slotsResult : [];
+    const duration = serviceKey ? SERVICE_DURATIONS[serviceKey] : DEFAULT_DURATION;
+    const slotsResult: any = await bookingService.getAvailableSlots(newDate, duration, booking.id);
+    if (slotsResult?.status === 'closed') {
+      return `${newDateLabel} is not available (${slotsResult.reason}). Which other date and time would you like?`;
+    }
+    const availableSlots: string[] = Array.isArray(slotsResult) ? slotsResult : [];
     if (!availableSlots.includes(newTime)) {
-      const alternatives = availableSlots.slice(0, 3).map((time) => dayjs(`2000-01-01T${time}`).format('h:mm A')).join(', ');
-      return `${dayjs(`2000-01-01T${newTime}`).format('h:mm A')} is not free on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')}. The available times are ${alternatives || 'fully booked that day'}. Which would work for you?`;
+      if (!availableSlots.length) return `${newDateLabel} is fully booked. Which other date would work for you?`;
+      const minutes = (time: string) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3, 5));
+      const nearest = [...availableSlots]
+        .sort((a, b) => Math.abs(minutes(a) - minutes(newTime)) - Math.abs(minutes(b) - minutes(newTime)))
+        .slice(0, 3)
+        .sort((a, b) => minutes(a) - minutes(b));
+      const latest = availableSlots[availableSlots.length - 1];
+      const reason = minutes(newTime) > minutes(latest)
+        ? ` Your session runs ${formatAppointmentDuration(duration)}, so the latest start that day is ${formatCustomerTime(latest)}.`
+        : '';
+      return `${formatCustomerTime(newTime)} is not available on ${newDateLabel}.${reason} The closest available times are ${nearest.map(formatCustomerTime).join(', ')}. Which would work for you?`;
     }
 
-    const result = await this.executeProposeRescheduleTool(customerId, bookingDay, newTime);
+    let result: { service: string; oldDateTime: Date };
+    try {
+      result = await this.executeProposeRescheduleTool(customerId, newDate, newTime);
+    } catch (error: any) {
+      console.error('[AGENT_FLOW] Reschedule proposal failed:', error?.message || error);
+      return /^I have not changed your current request/.test(error?.message || '')
+        ? error.message
+        : 'I could not prepare that change, so your session is unchanged. The studio team can help on 0720 111928.';
+    }
     await this.notifyRescheduleAdmin({
       customerId,
       event: 'proposed',
       service: result.service,
       oldDateTime: result.oldDateTime,
-      newDate: bookingDay,
+      newDate,
       newTime,
     });
 
-    return buildTimeOnlyRescheduleProposal(
-      result.service,
-      inBusinessTimezone(booking.dateTime).format('dddd, MMMM D'),
-      dayjs(`2000-01-01T${newTime}`).format('h:mm A')
-    );
+    const sameDay = newDate === existingDate;
+    const from = sameDay ? formatCustomerTime(current.format('HH:mm')) : `${current.format('dddd, D MMMM')} at ${formatCustomerTime(current.format('HH:mm'))}`;
+    const to = sameDay ? formatCustomerTime(newTime) : `${newDateLabel} at ${formatCustomerTime(newTime)}`;
+    const policy = this.isRescheduleWithin72Hours(booking.dateTime)
+      ? ' Because your session is within 72 hours, moving it will forfeit your deposit under our policy.'
+      : ' Your edition and extras stay the same.';
+    return `${newDateLabel} at ${formatCustomerTime(newTime)} is available. I can move your session for ${edition} from ${from} to ${to}.${policy} Would you like me to confirm the change?`;
   }
 
   private isRescheduleWithin72Hours(bookingDateTime: Date, now = new Date()): boolean {
@@ -1482,7 +1546,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
         ? `PAYMENT SUCCEEDED via M-Pesa${paidPayment.mpesaReceipt ? ` (Receipt: ${paidPayment.mpesaReceipt})` : ''}. The booking is confirmed. Do NOT claim the payment is pending.`
         : 'The booking is confirmed, but no successful payment is recorded. Do not say the deposit was paid or received; tell the customer the studio team can verify payment status.';
     } else if (draftBeforeThisTurn?.step === 'payment_pending') {
-      paymentSummary = 'Payment pending user M-Pesa PIN entry for booking draft.';
+      paymentSummary = 'A deposit payment step is open for the booking draft. Do not say whether a prompt is pending, failed, cancelled or paid, and do not offer to resend it; payment questions are answered from payment records.';
     }
 
     // 1b. Long-term memory beyond the last 10 messages of raw history
@@ -1749,7 +1813,7 @@ ${contextString}`;
                 const result = await this.executeConfirmBookingTool(customerId, initialDraftStep, expectedDeposit);
                 if (Number.isInteger(result.depositAmount) && result.depositAmount > 0) verifiedToolDeposits.add(result.depositAmount);
                 confirmedActionThisTurn = true;
-                exactProposalReply = `I've initiated a deposit payment request of KSH ${result.depositAmount} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed.`;
+                exactProposalReply = `I've initiated a deposit payment request of Ksh ${result.depositAmount.toLocaleString()} to your phone. Once you enter your M-Pesa PIN and the payment is successful, your booking for ${result.service} on ${result.date} at ${result.time} will be officially confirmed.`;
                 toolResponse = `${exactProposalReply} This is DONE - do not call any more booking tools this turn.`;
               }
             }
@@ -2093,7 +2157,8 @@ ${contextString}`;
       return this.respond(ctx, BUDGET_HANDOFF_REPLY, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
     }
 
-    if (platform === 'whatsapp' || platform === 'web') {
+    // A reply to a reschedule question changes an existing booking, so it must not seed a new-booking draft.
+    if ((platform === 'whatsapp' || platform === 'web') && !this.conversationFlows.isRescheduleQuestion(history)) {
       try {
         const slotReply = await this.rememberBookingSlots(customerId, userMessage, history);
         if (slotReply) return this.respond(ctx, slotReply);
@@ -2306,7 +2371,9 @@ ${contextString}`;
     history: { role: 'user' | 'assistant'; content: string }[]
   ): Promise<{ reply: string; proposed: boolean }> {
     const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-    if (existingDraft?.step && existingDraft.step !== 'cancel_confirm') {
+    if (existingDraft?.step === RESCHEDULE_COLLECTING_STEP) {
+      await prisma.bookingDraft.deleteMany({ where: { id: existingDraft.id, step: RESCHEDULE_COLLECTING_STEP } });
+    } else if (existingDraft?.step && existingDraft.step !== 'cancel_confirm') {
       const draftDescription = existingDraft.step === 'payment_pending'
         ? 'An M-Pesa payment prompt is already pending'
         : existingDraft.step === 'awaiting_confirmation'
@@ -2443,7 +2510,8 @@ ${contextString}`;
     if (['reschedule_confirm', 'cancel_confirm'].includes(draft.step) && !this.previousMessageRequestsConfirmation(history)) return null;
 
     if (draft.step === 'payment_pending') {
-      return `I’ve already sent the M-Pesa deposit prompt to your phone for ${draft.service || 'your booking'}. Please complete the payment there and I’ll confirm the booking as soon as it succeeds.`;
+      const consent = !userMessage || this.isPaymentConfirmation(userMessage);
+      return this.getPaymentRecoveryReply(customerId, userMessage, consent ? 'consent' : 'status_check');
     }
 
     if (draft.step === 'awaiting_confirmation') {
@@ -2454,8 +2522,20 @@ ${contextString}`;
       if (expectedDeposit === null || !this.previousMessageRequestsConfirmation(history)) {
         return this.getBookingStatusReply(customerId);
       }
-      const result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
-      return `I've sent the M-Pesa deposit prompt of KSH ${result.depositAmount} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
+      let result;
+      try {
+        result = await this.executeConfirmBookingTool(customerId, 'awaiting_confirmation', expectedDeposit);
+      } catch (error: any) {
+        if (error?.code === PAYMENT_ATTEMPTS_EXHAUSTED) {
+          await this.escalate(customerId, 'booking', `Payment prompt limit reached for ${draft.service || 'the booking'} on ${draft.date || 'unknown date'} ${draft.time || ''}. No further prompts will be sent automatically. Contact the customer to finish the booking.`);
+          return paymentAttemptsExhaustedReply();
+        }
+        if (error?.code === PAYMENT_ALREADY_PENDING) {
+          return this.getPaymentRecoveryReply(customerId, userMessage, 'consent');
+        }
+        throw error;
+      }
+      return `I've sent the M-Pesa deposit prompt of Ksh ${result.depositAmount.toLocaleString()} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
     }
 
     if (draft.step === 'reschedule_confirm' && this.previousMessageRequestsConfirmation(history)) {
@@ -2493,58 +2573,9 @@ ${contextString}`;
     return null;
   }
 
-  private async tryHandlePaymentResend(customerId: string): Promise<string | null> {
-    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-
-    // Valid resend path: customer has a pending payment draft.
-    if (draft?.step === 'payment_pending') {
-      const payment = await prisma.payment.findFirst({
-        where: { bookingDraftId: draft.id, status: { in: ['pending', 'failed'] } },
-        orderBy: { updatedAt: 'desc' },
-      });
-
-      if (!payment) {
-        return 'I cannot find an active payment request to resend right now. Please say "book" and I will re-open the booking payment step for you.';
-      }
-
-      try {
-        const mpesaResponse = await mpesaService.initiateStkPush(customerId, payment.amount, draft.id);
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            status: 'pending',
-            checkoutRequestId: mpesaResponse.CheckoutRequestID,
-            updatedAt: new Date(),
-          }
-        });
-
-        return `Done - I've resent the M-Pesa deposit prompt of KSH ${payment.amount} to your phone. Please enter your PIN to complete payment.`;
-      } catch (error: any) {
-        console.error('Failed to resend M-Pesa STK push:', error);
-        return `I couldn't resend the payment prompt right now. Please try again in a minute, or I can have the team assist immediately.`;
-      }
-    }
-
-    // If a successful payment already exists for an upcoming confirmed booking,
-    // never offer to resend payment.
-    const confirmedPaidBooking = await prisma.payment.findFirst({
-      where: {
-        status: 'success',
-        booking: {
-          customerId,
-          status: 'confirmed',
-          dateTime: { gte: new Date() },
-        }
-      },
-      include: { booking: true },
-      orderBy: { updatedAt: 'desc' },
-    });
-
-    if (confirmedPaidBooking?.booking) {
-      return `Your payment is already successful and your booking is confirmed for ${confirmedPaidBooking.booking.service} on ${dayjs(confirmedPaidBooking.booking.dateTime).format('dddd, MMMM D, YYYY [at] h:mm A')}. No resend is needed.`;
-    }
-
-    return null;
+  /** Payment questions are answered from the draft step and payment row only; they never reach the model. */
+  private async getPaymentRecoveryReply(customerId: string, userMessage: string, forcedKind?: PaymentMessageKind): Promise<string | null> {
+    return handlePaymentRecovery.call(this, customerId, userMessage, forcedKind);
   }
 
   /**

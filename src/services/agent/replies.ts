@@ -11,7 +11,7 @@ export function familyStylingReply(message: string, history: { role: 'user' | 'a
   const styling = /\b(?:dress(?:ing|ed|es)?|groom(?:ing|ed)?|styl(?:ing|e|ed)|outfits?|clothes|clothing|attire|accessories|hair|make[ -]?up)\b/i;
   const extraMakeup = ADDON_CATALOG.find(item => item.sku === 'extra_makeup');
   const needsConfirmation = message.split(/[.!?;]|\band\b/i).some(clause => {
-    const recipient = family.test(clause) || /\b(?:them|him|her|their|his)\b/i.test(clause)
+    const recipient = family.test(clause) || /\b(?:they|them|him|her|their|his|everyone|everybody)\b/i.test(clause)
       && history.slice(-4).some(entry => family.test(entry.content));
     const catalogSelection = extraMakeup && clause.match(extraMakeup.match)
       && !/\?/.test(message) && /\b(?:want|add|include|noted)\b/i.test(clause);

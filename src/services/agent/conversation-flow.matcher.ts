@@ -86,6 +86,30 @@ export class ConversationFlowMatcher {
     return /what time.*work better|what new time|time would you like/.test(previousAssistantMessage);
   }
 
+  /** The last assistant turn asked for a new date/time for an existing booking. */
+  isRescheduleQuestion(history: ConversationMessage[]): boolean {
+    const previousAssistantMessage = [...history].reverse().find((entry) => entry.role === 'assistant')?.content.toLowerCase() || '';
+    return /what time.*work better|what new time|share your preferred date and time|what (?:new )?(?:date and time|date or time|day and time) would you like|(?:move|reschedule|push) your (?:session|booking|appointment|shoot) to|when would you like to (?:move|reschedule)/.test(previousAssistantMessage);
+  }
+
+  /** Accepts "5pm", "from 5:30 pm", "17:00" anywhere in the message. */
+  parseCustomerTime(message: string): string | null {
+    const text = message.toLowerCase();
+    const meridiem = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+    if (meridiem) return this.parseTimeOnly(`${meridiem[1]}${meridiem[2] ? `:${meridiem[2]}` : ''}${meridiem[3]}`);
+    const clock = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    return clock ? `${clock[1].padStart(2, '0')}:${clock[2]}` : null;
+  }
+
+  isRescheduleSelection(message: string, history: ConversationMessage[]): boolean {
+    return this.isRescheduleQuestion(history) && this.hasRescheduleSlotSignal(message);
+  }
+
+  hasRescheduleSlotSignal(message: string): boolean {
+    if (this.parseCustomerTime(message)) return true;
+    return /\b(?:same|that)\s+(?:day|date)\b|\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b\d{1,2}(?:st|nd|rd|th)\b|\b\d{4}-\d{2}-\d{2}\b/i.test(message);
+  }
+
   isWeekdayRequest(message: string): boolean {
     return /(what|which)\s+day\s+of\s+(the\s+)?week.*\b\d{1,2}(st|nd|rd|th)?\b|what\s+day.*\b\d{1,2}(st|nd|rd|th)?\b/.test(message.toLowerCase());
   }

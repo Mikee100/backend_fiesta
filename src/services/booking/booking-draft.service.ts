@@ -35,11 +35,18 @@ export class BookingDraftService {
     return prisma.bookingDraft.findUnique({ where: { customerId } });
   }
 
-  async markPaymentPending(customerId: string) {
-    return prisma.bookingDraft.update({
-      where: { customerId },
-      data: { step: 'payment_pending' },
-    });
+  /** Claims the draft for one STK push; a concurrent duplicate confirmation fails the version check. */
+  async markPaymentPending(customerId: string, version?: number) {
+    const versioned = Number.isInteger(version);
+    try {
+      return await prisma.bookingDraft.update({
+        where: { customerId, step: 'awaiting_confirmation', ...(versioned ? { version } : {}) },
+        data: { step: 'payment_pending', ...(versioned ? { version: Number(version) + 1 } : {}) },
+      });
+    } catch (error: any) {
+      if (error?.code === 'P2025') throw Object.assign(new Error('A payment prompt is already being sent for this booking.'), { code: 'PAYMENT_ALREADY_PENDING' });
+      throw error;
+    }
   }
 }
 

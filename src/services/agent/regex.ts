@@ -1,2 +1,2 @@
 // Word-anchored so "exchange" or "remove" no longer read as a reschedule.
-export const RESCHEDULE_KEYWORD_PATTERN = /\b(?:reschedul(?:e|ed|es|ing)|chang(?:e|ed|es|ing)|mov(?:e|ed|es|ing)|postpon(?:e|ed|es|ing))\b/;
+export const RESCHEDULE_KEYWORD_PATTERN = /\b(?:reschedul(?:e|ed|es|ing)|chang(?:e|ed|es|ing)|mov(?:e|ed|es|ing)|postpon(?:e|ed|es|ing))\b|\bpush(?:ed|es|ing)?\s+(?:it|this|that|(?:my|the)\s+(?:session|booking|appointment|shoot))\s+(?:back|forward|to|till|until|for)\b/;
