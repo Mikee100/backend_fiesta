@@ -41,7 +41,7 @@ test('missing-column failures alert schema mismatch instead of suggesting a retr
     runAgent: async () => { throw error; },
     escalate: async (_customer: string, _type: string, description: string) => { alerts.push(JSON.parse(description)); },
   });
-  const first = await agent.handleMessage('schema-customer', 'Hello', [], 'whatsapp');
+  const first = await agent.handleMessage('schema-customer', 'can I exchange my outfit', [], 'whatsapp');
   const second = await agent.handleMessage('schema-customer', 'Hello again', [], 'whatsapp');
   await settle();
   assert.equal(first, SCHEMA_MAINTENANCE_REPLY);
@@ -50,7 +50,7 @@ test('missing-column failures alert schema mismatch instead of suggesting a retr
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].event, 'database_schema_out_of_date');
   assert.equal(alerts[0].column, 'booking_drafts.cancelProposedAt');
-  assert.equal(alerts[0].customerMessage, 'Hello');
+  assert.equal(alerts[0].customerMessage, 'can I exchange my outfit');
   assert.ok(metrics.every((metric) => metric.failureReason === 'database_schema_out_of_date'));
   assert.match(logged.join('\n'), /SCHEMA_OUT_OF_DATE/);
   assert.doesNotMatch(logged.join('\n'), /connection details must never be logged/);
@@ -143,7 +143,7 @@ test('an LLM reply with a failure type is logged as a fallback', async () => {
   const { agent, metrics, learnings } = createAgent({
     runAgent: async () => ({ content: 'Sorry, I lost the thread there.', tokensUsed: 0, failureType: 'empty_model_response' }),
   });
-  const reply = await agent.handleMessage('customer-1', 'Hi', [], 'whatsapp');
+  const reply = await agent.handleMessage('customer-1', 'can I exchange my outfit', [], 'whatsapp');
   await settle();
 
   assert.equal(reply, 'Sorry, I lost the thread there.');
@@ -156,7 +156,7 @@ test('a provider failure is logged as a fallback with the failure reason', async
   const { agent, metrics } = createAgent({
     runAgent: async () => { throw Object.assign(new Error('tokens per day (TPD) limit reached'), { status: 429, code: 'rate_limit_exceeded' }); },
   });
-  await agent.handleMessage('customer-1', 'Hi', [], 'whatsapp');
+  await agent.handleMessage('customer-1', 'can I exchange my outfit', [], 'whatsapp');
   await settle();
 
   assert.equal(metrics[0].success, false);

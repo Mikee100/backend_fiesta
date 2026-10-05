@@ -1,5 +1,7 @@
 import { ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
+import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { ADDON_MAKEUP_CLARIFICATION, ADDON_MULTI_CLARIFICATION, ADDON_QUOTED_PRICE_LABEL } from './constants';
+import { normalizeQuotes } from './regex';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 
@@ -54,6 +56,26 @@ export function addonRecipient(message: string, sku: string): string | null {
   const addon = ADDON_CATALOG.find((item) => item.sku === sku);
   const clause = choiceClauses(message).find((text) => addon?.match.test(text)) || message;
   return clause.match(/\bfor\s+(?:my\s+)?(?:another person|sister|brother|mother|father|partner|husband|wife|friend)\b/i)?.[0] || null;
+}
+
+/** "No, it's for me" after the extra-makeup question: makeup is already part of the customer's own session. */
+export function isMakeupForSelf(message: string, history: Message[] = []): boolean {
+  const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
+  if (!lastAssistant.includes(ADDON_MAKEUP_CLARIFICATION) || addonRecipient(message, 'extra_makeup')) return false;
+  return /^\s*(?:no+|nope|nah)\b|\bfor me\b|\bmyself\b|\bjust me\b|\bit'?s mine\b/i.test(normalizeQuotes(message));
+}
+
+export function makeupIncludedReply(service: string | null | undefined, editionName: string | null): string {
+  const extra = 'Extra makeup is for another person, such as your sister.';
+  if (service && !SEED_EDITION_INCLUSIONS[service]?.makeup) return `The team will confirm the makeup included in your ${editionName} session. ${extra}`;
+  return `Professional makeup is already included in your ${editionName ? `${editionName} ` : ''}session, so there's nothing to add for you. ${extra}`;
+}
+
+/** "Show me the add ons": a request to see the extras, not a choice of one. */
+export function isAddonListRequest(message: string): boolean {
+  const text = normalizeQuotes(message).toLowerCase().replace(/\badd\s+ons?\b/g, 'add-ons');
+  return /\b(?:show|see|send|share|list|view|what are|which are|what)\b[^.?!]{0,30}\b(?:add-?ons?|extras|optional extras)\b/.test(text)
+    && !ADDON_CATALOG.some((item) => item.match.test(text));
 }
 
 export function addonSelectionClarification(message: string, history: Message[] = []): string | null {

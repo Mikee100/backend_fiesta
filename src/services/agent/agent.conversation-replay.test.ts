@@ -138,6 +138,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
   stub(prisma.customer, 'upsert', async ({ update }: any) => (customer = { ...customer, ...update }));
   stub(prisma.customer, 'create', async ({ data }: any) => (customer = { bookings: [], ...data }));
   stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(require('./catalog-policy'), 'claimCatalogLink', async () => true);
   stub(prisma.bookingDraft, 'findUnique', async () => draft);
   stub(prisma.bookingDraft, 'findMany', async () => draft ? [draft] : []);
   stub(prisma.bookingDraft, 'create', async ({ data }: any) => {
@@ -162,6 +163,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
   stub(googleCalendarService, 'getEvents', async () => []);
   stub(prisma.payment, 'findFirst', async () => null);
   stub(prisma.bookingAddon, 'findMany', async () => []);
+  stub(prisma.customerSessionNote, 'findFirst', async () => null);
   stub(prisma.package, 'findMany', async () => packages);
   stub(prisma.package, 'findFirst', async () => packages[0]);
   stub(prisma.package, 'findUnique', async ({ where }: any) => packages.find((pkg) => pkg.name === where.name) || null);
@@ -231,22 +233,16 @@ test('Wairimu conversation replay with six-message history and a next-day return
   await context.test('[FIXED IN 8.1a] [STATE] first name is persisted as soon as stated', () => {
     assert.equal(frames[0].draft?.name || frames[0].customer.name, 'Wairimu');
   });
-  await context.test('[FIXED IN 8.6] [COST + MOCKED CALL] verifier retries once in the twelve-turn replay', () => {
-    assert.equal(correctionLengths.length, 1);
-    assert.ok(correctionLengths[0] < 1600, 'corrective instruction should be compact');
-    console.info('[REPLAY_VERIFIER_COST]', JSON.stringify({ turns: turns.length, correctiveCalls: correctionLengths.length, correctionCharacters: correctionLengths[0], totalMockCompletions: totalCompletions }));
+  await context.test('[FIXED IN 8.6] [COST + MOCKED CALL] lashes turn is deterministic, so the replay needs no verifier retry', () => {
+    // The lashes question used to reach the model and be corrected; it now returns the team-confirm reply directly.
+    assert.equal(correctionLengths.length, 0);
+    assert.equal(frames[10].prompts.length, 0, 'lashes must not reach the model');
+    console.info('[REPLAY_VERIFIER_COST]', JSON.stringify({ turns: turns.length, correctiveCalls: correctionLengths.length, totalMockCompletions: totalCompletions }));
   });
-  await context.test('[FIXED IN 8.3] [ROUTING + FAULT INJECTION] catalog request uses DB durations in Rate Card 2026', () => {
-    assert.match(frames[1].reply, /Rate Card 2026/);
-    for (const [name, duration] of [
-      ['THE BLOOM', '1.5 hours'], ['THE ICON', '2.5 hours'],
-      ['THE LEGEND', '2.5 hours'],
-    ]) {
-      assert.ok(frames[1].reply.includes(name) && frames[1].reply.includes(duration), `${name}: ${duration}`);
-    }
+  await context.test('[LINK-FIRST] [ROUTING] first catalog request shares the pricing page without listing editions', () => {
+    assert.match(frames[1].reply, /https:\/\/www\.fiestahousematernity\.com\/session-packages/);
+    assert.doesNotMatch(frames[1].reply, /Rate Card 2026|Ksh|THE BLOOM|THE EMPRESS/);
     assert.equal(frames[1].prompts.length, 0, 'catalog must bypass model generation');
-    assert.match(frames[1].reply, /THE EMPRESS[^\n]*Ask me for details/);
-    assert.doesNotMatch(frames[1].reply, /THE EMPRESS[^\n]*3\.5 hours/);
   });
   await context.test('[FIXED IN 8.1a] [STATE] package selection is persisted immediately', () => {
     assert.equal(frames[2].draft?.service, 'THE BLOOM');
@@ -278,8 +274,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
   await context.test('[FIXED IN 8.2] [STATE + FAULT INJECTION] October 5 is refused as a Monday', async () => {
     activeTurn = { message: '5th October', modelReply: 'October 5 is Tuesday and the studio is open.' };
     const reply = await instance.handleMessage(customerId, activeTurn.message, history.slice(-6), 'whatsapp');
-    assert.match(reply, /2026-10-05 is Monday/);
-    assert.match(reply, /Closed on Mondays/);
+    assert.match(reply, /closed on Mondays, so Monday, 5 October is not available/);
     assert.doesNotMatch(reply, /Tuesday|studio is open/);
   });
   await context.test('[FIXED IN 8.8] [STATE/PROMPT + FAULT INJECTION] known slots survive trimmed history and next day', () => {

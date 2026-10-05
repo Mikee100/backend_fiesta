@@ -24,6 +24,8 @@ const ASYNC_HANDLERS: Record<string, string> = {
   getPackageSelectionReply: 'packageSelection',
   getPackageAdviceReply: 'packageAdvice',
   getPackageCatalogReply: 'packageCatalog',
+  getLashesReply: 'lashes',
+  getGreetingReply: 'greeting',
   tryImmediateConfirmation: 'immediateConfirmation',
 };
 
@@ -33,6 +35,7 @@ const SYNC_HANDLERS: Record<string, string> = {
   getBookingForSomeoneElseReply: 'bookingForSomeoneElse',
   getMultiPersonBookingReply: 'multiPersonBooking',
   getPackageBudgetReply: 'packageBudget',
+  getLegacyPackageReply: 'legacyPackageName',
   getBusinessIntroductionReply: 'businessIntroduction',
   getWebsiteReply: 'website',
   getContactDetailsReply: 'contactDetails',
@@ -94,6 +97,7 @@ function createHarness(options: HarnessOptions = {}) {
   const originalAddonList = agent.isAddonListFollowUp.bind(agent);
   agent.isAddonListFollowUp = (...args: any[]) => (addonListHit = originalAddonList(...args));
   agent.getAdditionsReply = () => (addonListHit ? 'ROUTE:addonListFollowUp' : 'ROUTE:additions');
+  agent.getCatalogDisplayReply = (_customer: string, _platform: string, kind: string) => kind === 'addons' ? agent.getAdditionsReply() : reply('packageCatalog');
 
   let timeOnlyHit = false;
   const flows = agent.conversationFlows;
@@ -106,7 +110,10 @@ function createHarness(options: HarnessOptions = {}) {
 
 function routeOf(reply: string): string {
   if (reply === ADDON_MAKEUP_CLARIFICATION) return 'selectedAddon';
-  if (reply.startsWith('ROUTE:')) return reply.slice('ROUTE:'.length);
+  if (/^You may bring one outfit/.test(reply)) return 'personalOutfit';
+  if (/^Basic hair styling is included/.test(reply)) return 'hairWigClarification';
+  if (/^The express delivery fee is not listed/.test(reply)) return 'expressDeliveryFee';
+  if (reply.startsWith('ROUTE:')) return reply.split('\n')[0].slice('ROUTE:'.length);
   if (/^Yes\. Your original session date and time are still booked/.test(reply)) return 'rescheduleWithdrawalConfirmation';
   if (/^(No rush\.|You are welcome\.)/.test(reply)) return 'postActionAcknowledgement';
   if (/^Which add-on would you like to add/.test(reply)) return 'clarifyNewAddon';
@@ -177,6 +184,9 @@ const CASES: Case[] = [
 
   // Packages / budget / payment resend
   { message: "What's your cheapest package?", expected: 'packageBudget' },
+  { message: 'Do you have a standard package?', expected: 'legacyPackageName' },
+  { message: 'Do you offer eye lashes services in the makeup?', expected: 'lashes' },
+  { message: 'Is the makeup inclusive of lashes?', expected: 'lashes' },
   { message: 'Can you resend the payment prompt?', paymentPending: true, expected: 'paymentRecovery' },
   { message: 'Can you resend the payment prompt?', expected: 'runAgent', note: 'no open payment step falls through' },
   { message: 'yes', paymentPending: true, expected: 'immediateConfirmation', note: 'explicit yes reaches immediateConfirmation, which delegates payment_pending drafts to payment recovery' },
@@ -194,6 +204,9 @@ const CASES: Case[] = [
   { message: 'Can I see your portfolio?', expected: 'portfolio' },
   { message: "What's your instagram?", expected: 'socialMedia' },
   { message: 'Can I get raw files?', expected: 'rawFiles' },
+  { message: 'How much do I have to pay for photos within 3 working days?', expected: 'expressDeliveryFee' },
+  { message: 'Can I bring one extra outfit of my own?', expected: 'personalOutfit' },
+  { message: 'What does professional hair mean, is it wig styling?', expected: 'hairWigClarification' },
 
   // Add-ons
   { message: 'Which add-ons did I choose before?', history: [assistant('Noted: Extra outfit beyond package (Ksh 4,000 each).')], expected: 'previousAddon' },
@@ -222,6 +235,9 @@ const CASES: Case[] = [
 
   // Packages
   { message: "I'll take the icon", expected: 'packageSelection' },
+  { message: 'give me the Muse package', expected: 'packageSelection' },
+  { message: 'I want the Icon', expected: 'packageSelection' },
+  { message: 'the Bloom please', expected: 'packageSelection' },
   { message: 'Which package do you recommend?', expected: 'packageAdvice' },
   { message: 'What packages do you offer?', expected: 'packageCatalog', note: 'catalog is not gated by natural mode' },
   { message: 'share the packages that you offer', expected: 'packageCatalog' },
@@ -237,9 +253,10 @@ const CASES: Case[] = [
 
   // LLM fallthrough
   { message: "I'm 7 months pregnant, can we do Saturday at 3pm?", expected: 'runAgent' },
-  { message: 'how much is the empress', expected: 'runAgent' },
+  { message: 'how much is the empress', expected: 'packageCatalog' },
   { message: 'cancel my booking', expected: 'cancellationProposal' },
-  { message: 'Hi', expected: 'runAgent' },
+  { message: 'Hi', expected: 'greeting' },
+  { message: 'Hello', nullRoutes: ['greeting'], expected: 'runAgent', note: 'an active draft yields to booking progress' },
 ];
 
 function expectedRoute(testCase: Case, natural: boolean): string {
@@ -306,9 +323,12 @@ test('message route order remains unchanged', () => {
     'pastAppointment',
     'bookingForSomeoneElse',
     'multiPersonBooking',
+    'lashes',
+    'legacyPackageName',
     'packageBudget',
     'suspendingConceptGallery',
     'reviewPage',
+    'greeting',
     'businessIntroduction',
     'weekday',
     'website',
@@ -316,9 +336,14 @@ test('message route order remains unchanged', () => {
     'portfolio',
     'socialMedia',
     'rawFiles',
+    'expressDeliveryFee',
     'previousAddon',
     'clarifyNewAddon',
+    'makeupForSelf',
+    'addonRequest',
     'addonListFollowUp',
+    'personalOutfit',
+    'hairWigClarification',
     'selectedAddon',
     'additions',
     'bespoke',

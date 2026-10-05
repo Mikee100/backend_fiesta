@@ -1,7 +1,15 @@
 import prisma from '../../config/prisma';
 import { BOOKING_SLOT_RETENTION_MS, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { resolveCalendarDate } from './extraction';
-import { bookingDateFacts } from '../../utils/time';
+import { bookingDateFacts, formatCustomerDate } from '../../utils/time';
+import { selectedEdition } from './conversation-flow.matcher';
+
+export function closedDateReply(facts: { date: string; isMonday: boolean; isPast: boolean }): string {
+  const day = formatCustomerDate(facts.date);
+  return facts.isPast
+    ? `${day} has already passed. Which other date would work for you?`
+    : `We are closed on Mondays, so ${day} is not available. Which other date would work for you?`;
+}
 
 export const SLOT_MEMORY_WINDOW_MS = BOOKING_SLOT_RETENTION_MS;
 export const EARLY_SLOT_STEP = 'collecting_slots';
@@ -36,7 +44,8 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
     ? message.match(/^\s*no[, ]+\s*(?:it['’]?s|it is|my name is)\s+([a-z][a-z' -]{1,79})[.! ]*$/i) : null;
   const question = /\?|^\s*(?:what|which|how|can|could|do|does|is|are)\b/i.test(message);
   const choice = /\b(?:interested in|i want|i would want|i choose|i would like|i'll take|please book|actually|let'?s (?:do|go with))\b/i.test(message)
-    || /^(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+package)?[.! ]*$/i.test(message);
+    || /^(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+package)?[.! ]*$/i.test(message)
+    || Boolean(selectedEdition(message));
   const nameAnswer = !question && !choice && /\b(?:your name|full name|what name)\b/i.test(lastAssistant)
     && /^[a-z][a-z' -]{1,79}$/i.test(message.trim());
   const answeredName = message.trim().replace(/^(?:no|nope|yes|yeah)?[, ]*(?:it['’]?s|it is|my name is|i am|i['’]?m|this is)\s+/i, '');
@@ -115,9 +124,7 @@ export async function rememberBookingSlots(customerId: string, message: string, 
   const service = stated.service || draft?.service;
   if (stated.date) {
     const facts = bookingDateFacts(stated.date);
-    if (facts.isMonday || facts.isPast) {
-      return `${facts.date} is ${facts.weekday}. ${facts.isPast ? 'That date is in the past' : 'Closed on Mondays'}. Which other date would work for you?`;
-    }
+    if (facts.isMonday || facts.isPast) return closedDateReply(facts);
   }
   if (profileDefault) {
     return `I have your name as ${profileName}. Is that correct?`;

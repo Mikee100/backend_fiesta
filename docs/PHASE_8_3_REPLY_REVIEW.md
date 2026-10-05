@@ -10,11 +10,61 @@ the DB. No inclusion is inferred from an edition name. No source rows were edite
 
 ## Booking process
 
+Link-first update (2026-10-05): the wording below is pending approval, not a
+renewal of the earlier approval. The catalog below is retained as a last resort.
+
+## Link-first replies (pending approval)
+
+First edition request:
+
+```text
+You can see all our editions, inclusions and prices here: https://www.fiestahousematernity.com/session-packages
+Tell me which edition catches your eye.
+```
+
+First add-on request:
+
+```text
+All the optional extras and their prices are here: https://www.fiestahousematernity.com/session-packages
+Tell me which you would like for your session.
+```
+
+Specific items keep their existing verified answer and append the same link.
+Comparisons remain limited to two editions. A repeated catalog request, explicit
+request to list it in chat, or broken-link follow-up uses the existing full-list
+builder. Bare "yes" or "show me" after a generic link is not full-list consent.
+During slot collection the second sentence is replaced by the next missing
+edition/date/time/name question, without saving or proposing anything.
+
+State uses namespaced CustomerMemory.keyInsights entries scoped to the active
+UnifiedConversation session, or customer/platform thread fallback. Separate
+edition/add-on markers expire after 24 hours. Atomic compare-and-set preserves
+other insights and prunes expired catalog markers. If storage fails, visible
+history is the fallback; trimmed history can then cause another link rather than
+an unsolicited list. Claiming before delivery can consume a marker on failed
+delivery. Mocked state tests are not live PostgreSQL/concurrency certification.
+No schema migration, price/deposit edit, booking mutation or ingestion was run.
+
+Offline validation, 2026-10-05: full backend suite 421/421 passed (exit 0),
+TypeScript no-emit check passed (exit 0), and diff whitespace check passed.
+Focused verifier/policy run: 19/19 passed. Additional real persistence regression
+confirms wig hire after the link still saves unit/total Ksh 4,000 with the draft
+unchanged. Tests were written red first for URL preservation, state, follow-ups,
+specific-item links, collecting-booking continuation and verifier false positives.
+Replay: 13/15 passed (exit 1); the date/time child and parent fail because the
+existing bookingProgressReply fixture does not mock customerSessionNote.findFirst.
+The new link-first replay assertion passes. All checks redirected DATABASE_URL
+to an unreachable local endpoint; no live booking/payment/Calendar run was done.
+Overall live validation remains unverified and replay remains failing. Changes
+are uncommitted pending wording approval; unrelated concurrent edits are retained.
+
+## Booking process (pending link-first approval)
+
 ```text
 Here is how booking works:
-1. Choose from our 7 editions.
+1. Choose from our 7 editions. See them here: https://www.fiestahousematernity.com/session-packages
 2. Share your preferred date and time. We are closed on Mondays.
-3. Add any optional extras you would like, such as an extra outfit, wig hire or extra photos.
+3. Choose any optional extras from the same page: https://www.fiestahousematernity.com/session-packages
 4. We check availability; a Ksh 2,000 deposit secures your slot.
 5. Once you confirm the proposal, we send the M-Pesa prompt. Your booking is confirmed after the deposit is received.
 6. Come for your session at 4th Avenue Parklands, Diamond Plaza Annex, 2nd Floor, Nairobi.
@@ -53,6 +103,7 @@ THE ICON - Ksh 35,000
 - Professional makeup
 - 4 studio outfits with styling
 - 1 A3 fine art mount
+https://www.fiestahousematernity.com/session-packages
 ```
 
 An Empress detail request receives:
@@ -91,6 +142,52 @@ schema edit or dashboard inclusion editor is implemented. Those await the same
 approved migration as cancelProposedAt and the 8.1b columns.
 
 ## Source discrepancy report
+
+### Public pricing-page audit, 2026-10-05
+
+Public source: https://www.fiestahousematernity.com/session-packages was fetched
+and includes all seven editions and the add-ons below. Compared read-only with
+scripts/seed-packages.ts, src/config/edition-inclusions.ts and ADDON_CATALOG in
+src/config/constants.ts. No live DB connection/inspection or seed execution
+was performed. Matching seed values do NOT certify current database rows or
+constitute studio-owner confirmation. Recheck this audit when the page changes.
+
+| Edition | Website price (Ksh) | Hours / photos / outfits | Comparison with local seed/reference |
+| --- | --- | --- | --- |
+| Bloom | 15,000 | 1.5 / 6 / 2 | Price, duration, photos, outfits, makeup and styling match. |
+| Muse | 25,000 | 2 / 12 / 3 | All listed core inclusions match. |
+| Icon | 35,000 | 2.5 / 15 / 4 | Matches, including one A3 mount. |
+| Legend | 45,000 | 2.5 / 15 / 4 | Price/core fields and 8x8 hardcover photobook match. Seed notes/reference also include one styled wig; website does not list a wig. Resolve before certifying inclusions. |
+| Queen | 55,000 | 3 / 20 / 4 | Matches, including balloon backdrop with flowers, one styled wig and one A3 mount. |
+| Empress | 70,000 | 3.5 / 25 / 4 | Website matches seed notes: Power Suit, two wigs, backdrop with flowers, 8x8 hardcover photobook and A3 mount. Runtime detail withholding remains pending owner/source resolution; there is no Empress inclusion reference. |
+| Goddess | 120,000 | 5 / 30 / 5 | Seed notes match Power Suit, two wigs, Reel, 8x8 hardcover photobook and A2 mount. Website backdrop option includes flowers; the short inclusion reference omits the word flowers. |
+
+All seven website editions list professional makeup and studio outfits with
+styling. Their seed booleans match. The website lists no numeric deposit here;
+it says a non-refundable deposit is required. Seed deposits remain Ksh 2,000,
+and runtime deposit validation/charging is unchanged.
+
+| Add-on | Website price (Ksh) | Local comparison / qualification gaps |
+| --- | --- | --- |
+| Extra edited photo | 1,000 per photo | Unit price and quantity pricing match. |
+| Extra digital art edit | 3,000 per photo | Unit price and quantity pricing match. |
+| Raw files | Quoted by package tier | Local zero is a quote-required sentinel, not free; matches. |
+| Extra outfit beyond package | 4,000 per outfit | Unit price and quantity pricing match. |
+| Extra professional makeup | 3,500 per session | Price matches; local catalog has no explicit per-session label. |
+| Fiesta House Power Suit | 10,000 where not included | Price matches; local add-on entry does not encode the inclusion qualifier. |
+| Styled wig hire | 4,000 per wig, book in advance | Price/quantity match; local catalog has no book-in-advance field. |
+| Wig styling only | 3,000 per wig, book in advance | Price/quantity match; local catalog has no book-in-advance field. |
+| Suspending Concept | 7,000 | Price matches. |
+| Goddess Sculpture Set | 15,000 where not included | Price matches; local add-on entry does not encode the inclusion qualifier. |
+| Professional Reel | Quoted by package tier, book in advance | Quote-required sentinel matches; local catalog has no book-in-advance field. |
+
+Bespoke experiences and travelling-mother concierge arrangements are also
+listed by consultation, without fixed prices; their existing reply paths remain.
+This audit does not import website marketing copy or add unconfirmed facts to
+RAG. Studio approval and an authorised refresh remain necessary to resolve
+Legend/Empress and represent missing structured qualifications in AI data.
+
+### Earlier source conflicts (unchanged)
 
 | Fact | Seed and current local FAQ | User-reported transcript/retrieval | Previous card | Current treatment |
 | --- | --- | --- | --- | --- |

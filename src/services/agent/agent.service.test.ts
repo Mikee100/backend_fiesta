@@ -279,6 +279,7 @@ test('hands off a declined-extras booking when the provider daily limit is exhau
   const originals = {
     checkTokenBudget: agent.checkTokenBudget,
     trackSentiment: agent.trackSentiment,
+    getBookingProgressReply: agent.getBookingProgressReply,
     runAgent: agent.runAgent,
     logAiJobMetric: agent.logAiJobMetric,
     logConversationLearning: agent.logConversationLearning,
@@ -287,6 +288,7 @@ test('hands off a declined-extras booking when the provider daily limit is exhau
   const escalations: string[] = [];
   agent.checkTokenBudget = async () => true;
   agent.trackSentiment = async () => {};
+  agent.getBookingProgressReply = async () => null;
   agent.runAgent = async () => {
     throw Object.assign(new Error('tokens per day (TPD) limit reached'), { status: 429, code: 'rate_limit_exceeded' });
   };

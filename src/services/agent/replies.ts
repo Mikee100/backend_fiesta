@@ -53,11 +53,15 @@ export function isAddonListFollowUp(
   history: { role: 'user' | 'assistant'; content: string }[]
 ): boolean {
   const text = normalizeHyphens(userMessage).trim().toLowerCase().replace(/[.!?]+$/, '');
-  const affirmative = /^(show(\s+me)?(\s+the)?(\s+(full\s+)?(list|options|extras|add-?ons))?|see\s+them|list\s+them|list\s+the\s+(extras|add-?ons)|what\s+(are\s+they|else)|yes(\s+please)?|yeah|yep|sure|ok(ay)?|please)$/.test(text);
-  if (!affirmative) return false;
+  const affirmative = /^(show(\s+me)?(\s+the)?(\s+(full\s+)?(list|options|extras|add[\s-]?ons?))?|see\s+them|list\s+them|list\s+the\s+(extras|add[\s-]?ons?)|what\s+(are\s+they|else)|yes(\s+please)?|yeah|yep|sure|ok(ay)?|please)$/.test(text);
+  if (!affirmative && !/^list\s+them\s+here$/.test(text)) return false;
 
   const lastAssistant = [...history].reverse().find((message) => message.role === 'assistant');
   if (!lastAssistant) return false;
+  if (lastAssistant.content.includes(OFFICIAL_WEBSITE_URLS.packages)) {
+    return /extras|add-ons/i.test(lastAssistant.content)
+      && /^(?:list\s+(?:them|the\s+(?:extras|add-?ons))(?:\s+here)?|show\s+(?:me\s+)?(?:the\s+)?(?:full\s+)?(?:list|extras|add-?ons)(?:\s+here)?)$/.test(text);
+  }
   if ([ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER]
     .some((phrase) => normalizeHyphens(lastAssistant.content).toLowerCase().includes(phrase.toLowerCase()))) return true;
   return /(available extras|add-?ons?\b|optional additions|extra services|extra outfit|styled wig)/i.test(
@@ -110,12 +114,45 @@ export function isPackageBudgetRequest(userMessage: string): boolean {
 }
 
 export function buildPackageBudgetReply(): string {
-  return 'I can help with that. The most affordable option is usually THE BLOOM, while THE ICON is the most popular mid-range package. If you want to keep it simple, tell me which package you prefer: THE BLOOM, THE ICON, or a premium option like THE EMPRESS or THE ROYAL.';
+  return 'I can help with that. The most affordable option is usually THE BLOOM, while THE ICON is the most popular mid-range package. If you want to keep it simple, tell me which package you prefer: THE BLOOM, THE ICON, or a premium option like THE EMPRESS or THE GODDESS.';
+}
+
+const LEGACY_PACKAGE_PATTERN = /\b(standard|economy|executive|gold|platinum|vvip|vip)\s+(?:package|edition|session|plan|option|tier)s?\b/i;
+
+/** Retired package names get a direct answer instead of a model call; "my standard session" refers to an old booking and is skipped. */
+export function legacyPackageReply(message: string): string | null {
+  const match = message.match(LEGACY_PACKAGE_PATTERN);
+  if (!match || /\bmy\b/i.test(message)) return null;
+  const word = match[1].toLowerCase();
+  const name = word.length <= 4 ? word.toUpperCase() : `${word[0].toUpperCase()}${word.slice(1)}`;
+  return `We don't have a ${name} package. Our editions run from THE BLOOM to THE GODDESS, and THE BLOOM is the entry option. Would you like its details, or the full rate card?`;
+}
+
+export const LASHES_TEAM_REPLY = "Our edition details don't list lashes, so I've passed your question to the studio team to confirm. You can also reach them on 0720 111928.";
+
+export function isLashesQuestion(message: string): boolean {
+  return /\b(?:eye)?lash(?:es)?\b/i.test(message);
 }
 
 export function isAdditionsRequest(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
-  return /(additions|add-ons|add-on|extras|extra\s+services|extra\s+photo|extra\s+outfit|extra\s+makeup|digital\s+art|power\s+suit|wig\s+hire|suspending\s+concept|sculpture\s+set|reel\s+pricing|what\s+extras)/.test(text);
+  return /(additions|add[\s-]?ons?\b|extras|extra\s+services|extra\s+photo|extra\s+outfit|extra\s+makeup|digital\s+art|power\s+suit|wig\s+hire|suspending\s+concept|sculpture\s+set|reel\s+pricing|what\s+extras)/.test(text);
+}
+
+export function isPersonalOutfitQuestion(userMessage: string): boolean {
+  return /\b(?:bring|wear)\b.{0,60}\boutfit\b.{0,30}\b(?:of my own|that is mine|that's mine)\b|\b(?:bring|wear)\s+my\s+own\s+outfit\b/i.test(userMessage);
+}
+
+export function buildPersonalOutfitReply(): string {
+  return 'You may bring one outfit of your own or substitute it for one from our studio wardrobe. Additional outfits beyond that are Ksh 4,000 each.';
+}
+
+export function isHairWigClarificationRequest(userMessage: string): boolean {
+  return /\b(?:what does|what is|does)\b.{0,60}\b(?:professional hair|hair styling|wig styling|wig installation|styled wig)\b|\b(?:professional hair|hair styling)\b.{0,50}\b(?:wig|mean|included)\b/i.test(userMessage);
+}
+
+export function buildHairWigClarificationReply(): string {
+  return 'Basic hair styling is included with sessions. Wig styling and installation is Ksh 3,000; styled wig hire is Ksh 4,000. Which one did you mean?';
 }
 
 export function buildMixedIntentClarificationReply(): string {

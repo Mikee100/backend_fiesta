@@ -1,5 +1,6 @@
 import prisma from '../../config/prisma';
 import { BRAND_SLOGAN } from './constants';
+import { normalizeQuotes } from './regex';
 
 const sloganStem = BRAND_SLOGAN.replace(/\.$/, '');
 const sloganWords = sloganStem.split(/\s+/).join('\\s+');
@@ -13,7 +14,8 @@ export function containsSlogan(reply: string): boolean {
   return new RegExp(sloganWords, 'i').test(reply);
 }
 
-export function sloganForbidden(reply: string): boolean {
+export function sloganForbidden(modelReply: string): boolean {
+  const reply = normalizeQuotes(modelReply);
   return /\d|\b(?:kshs?|kes|shs|price|cost|fee|deposit|payment|paid|date|booking|policy|policies|hours|working days|refund|cancel|reschedule|available|availability|edition|package|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|partner|husband|children|poses|privacy|delivery|download|files|makeup|closed)\b/i.test(reply)
     || !/\b(?:welcome|hello|hi|goodbye|thank you|thanks|looking forward|you're welcome)\b/i.test(reply);
 }

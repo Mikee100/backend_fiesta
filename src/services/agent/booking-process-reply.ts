@@ -1,4 +1,5 @@
 import prisma from '../../config/prisma';
+import { OFFICIAL_WEBSITE_URLS } from './constants';
 
 export function isBookingProcessRequest(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
@@ -35,9 +36,9 @@ export async function buildBookingProcessReply(this: any): Promise<string> {
 
   return [
     'Here is how booking works:',
-    editionCount === null ? '1. Choose your edition.' : `1. Choose from our ${editionCount} edition${editionCount === 1 ? '' : 's'}.`,
+    `${editionCount === null ? '1. Choose your edition.' : `1. Choose from our ${editionCount} edition${editionCount === 1 ? '' : 's'}.`} See them here: ${OFFICIAL_WEBSITE_URLS.packages}`,
     '2. Share your preferred date and time. We are closed on Mondays.',
-    '3. Add any optional extras you would like, such as an extra outfit, wig hire or extra photos.',
+    `3. Choose any optional extras from the same page: ${OFFICIAL_WEBSITE_URLS.packages}`,
     `4. ${depositText}`,
     '5. Once you confirm the proposal, we send the M-Pesa prompt. Your booking is confirmed after the deposit is received.',
     `6. Come for your session at ${location}.`,

@@ -1,3 +1,5 @@
+import { BUDGET_HANDOFF_REPLY } from './constants';
+
 // Zero-cost guardrails around the AI agent: a circuit breaker so a struggling
 // provider doesn't get hammered request after request, and a keyword-based
 // frustration heuristic so upset customers get flagged without paying for an
@@ -129,8 +131,6 @@ export function isProviderRateLimitError(error: any): boolean {
   return classifyProviderRateLimit(error) !== null;
 }
 
-export const FALLBACK_MESSAGE =
-  "We’ve reached today’s AI conversation limit for this chat. A team member will follow up with you shortly, and we’ll continue as soon as the daily limit resets.";
+export const FALLBACK_MESSAGE = BUDGET_HANDOFF_REPLY;
 
-export const PROVIDER_OUTAGE_MESSAGE =
-  "Our AI service is temporarily unavailable. A team member will follow up with you shortly, and we’ll continue when service is restored.";
+export const PROVIDER_OUTAGE_MESSAGE = BUDGET_HANDOFF_REPLY;

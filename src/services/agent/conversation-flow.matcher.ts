@@ -6,12 +6,30 @@ export type ConversationMessage = {
   content: string;
 };
 
+const EDITION_WORDS = 'bloom|muse|icon|legend|queen|empress|goddess';
+const SELECTION_VERB = /\b(?:give\s+me|i\s+want|i\s+would\s+(?:like|want)|i['’]?d\s+like|i\s+(?:choose|pick|select)|i(?:['’]ll|\s+will)\s+(?:take|have|go\s+with|choose|pick)|let['’]?s\s+(?:go\s+with|do|book)|go\s+with|take|choose|pick|select|book|interested\s+in)\b/i;
+const BARE_EDITION = new RegExp(`^(?:(?:ok(?:ay)?|so|then|yes|please)[, ]+)?(?:the\\s+)?(?:${EDITION_WORDS})(?:\\s+(?:package|edition))?(?:[, ]+(?:please|pls|then))?[.! ]*$`, 'i');
+
+/** Returns the edition when the message chooses exactly one edition; questions, detail requests and negations return null. */
+export function selectedEdition(message: string): string | null {
+  const text = message.trim();
+  const named = PACKAGE_NAMES_FOR_EXTRACTION.filter((name) => new RegExp(`\\b${name.replace(/^THE /, '')}\\b`, 'i').test(text));
+  if (named.length !== 1) return null;
+  if (/\?|^\s*(?:what|which|how|why|can|could|do|does|is|are)\b/i.test(text)) return null;
+  if (/\b(?:include[sd]?|inclusions?|details?|tell\s+me\s+about|compare|difference|vs|versus|recommend|price|cost|how\s+much|not|don['’]?t|dont|never|instead)\b/i.test(text)) return null;
+  return SELECTION_VERB.test(text) || BARE_EDITION.test(text) ? named[0] : null;
+}
+
+export function isPlainGreeting(message: string): boolean {
+  return /^\s*(?:hi+|hello+|hey+|hiya|helo|good\s+(?:morning|afternoon|evening|day)|habari(?:\s+yako)?|niaje|mambo|greetings)(?:\s+(?:there|team|fiesta(?:\s+house)?))?[\s!.,]*$/i.test(message);
+}
+
 export class ConversationFlowMatcher {
   isPackageCatalogRequest(message: string, history: ConversationMessage[] = []): boolean {
     const text = message.toLowerCase().trim();
     const namesEdition = PACKAGE_NAMES_FOR_EXTRACTION.some((name) => new RegExp(`\\b${name.replace(/^THE /, '')}\\b`, 'i').test(text));
     const editionQuestion = new RegExp(`\\b(?:what|which|share|show|list|tell)\\b.*\\b${EDITION_TERM_PATTERN}\\b|\\byour\\s+${EDITION_TERM_PATTERN}\\b`, 'i');
-    const requestedDetail = namesEdition && /\b(?:include|includes|inclusions|come with|tell me about|details)\b/i.test(text);
+    const requestedDetail = namesEdition && /\b(?:include|includes|inclusions|come with|tell me about|details|how much|price|cost)\b/i.test(text);
     const editionNameOnly = PACKAGE_NAMES_FOR_EXTRACTION.some((name) => [name.toLowerCase(), name.replace(/^THE /, '').toLowerCase()].includes(text.replace(/[.!?]+$/, '')));
     const choosesFromOverview = editionNameOnly
       && history.some((entry) => entry.role === 'assistant' && entry.content.includes(EDITION_CATALOG_HEADER));
@@ -54,7 +72,7 @@ export class ConversationFlowMatcher {
   }
 
   isPackageSelection(message: string): boolean {
-    if (/^\s*(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)(?:\s+(?:package|edition))?[.! ]*$/i.test(message)) return true;
+    if (selectedEdition(message)) return true;
     return /(i\s+(like|want|choose|will take|would like|would want)|i(?:'ll|\s+will)\s+(go with|take)|let'?s\s+(go with|do))\s+(the\s+)?(bloom|muse|icon|legend|queen|empress|goddess|standard|economy|executive|gold|platinum|vip|vvip)(\s+(package|edition))?\b/.test(message.toLowerCase());
   }
 

@@ -2,11 +2,17 @@ import dayjs from 'dayjs';
 import prisma from '../../config/prisma';
 import { bookingService } from '../booking/booking.service';
 import { DEFAULT_DURATION, EDITIONS_PENDING_OWNER_CONFIRMATION, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
-import { EDITION_CATALOG_HEADER, EDITION_CATALOG_INTRO, EDITION_CATALOG_FOLLOW_UP } from './constants';
+import { EDITION_CATALOG_HEADER, EDITION_CATALOG_INTRO, EDITION_CATALOG_FOLLOW_UP, OFFICIAL_WEBSITE_URLS } from './constants';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { inBusinessTimezone } from '../../utils/time';
 import { getDepositForPackage, getPackageForDeposit } from './booking-tools';
 import { editionInText } from './reply-voice';
+import { selectedEdition } from './conversation-flow.matcher';
+
+export function editionSelectedDateQuestion(name: string): string {
+  const title = name.toLowerCase().replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+  return `${title} it is. What date would suit you? You can see everything included here: ${OFFICIAL_WEBSITE_URLS.packages}`;
+}
 
 export function buildPackageCard(pkg: {
   name: string;
@@ -27,7 +33,8 @@ export function buildPackageCard(pkg: {
   const inclusions = pkg.inclusions?.length ? pkg.inclusions
     : differingInclusionFields(pkg.name, pkg).length === 0 ? SEED_EDITION_INCLUSIONS[pkg.name]?.inclusions : undefined;
   if (inclusions) {
-    return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}\n${inclusions.map((item) => `- ${item}`).join('\n')}`;
+    const visible = pkg.name === 'THE LEGEND' ? inclusions.filter(item => !/\bwig/i.test(item)) : inclusions;
+    return `${pkg.name} - Ksh ${pkg.price.toLocaleString()}\n${visible.map((item) => `- ${item}`).join('\n')}${pkg.name === 'THE LEGEND' ? '\nThe team will confirm the remaining inclusions for you.' : ''}`;
   }
   const items: string[] = [];
   if (pkg.duration) items.push(`Session length: ${pkg.duration}`);
@@ -39,7 +46,7 @@ export function buildPackageCard(pkg: {
   }
   if (pkg.styling) items.push('Styling');
 
-  if (pkg.wig) {
+  if (pkg.wig && pkg.name !== 'THE LEGEND') {
     items.push('Styled wig included (quantity to be confirmed)');
   }
 
@@ -127,7 +134,7 @@ export async function getPackageAdviceReply(userMessage: string): Promise<string
   });
 
   const text = userMessage.toLowerCase();
-  const mentionedPackages = packages.filter((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
+  const mentionedPackages = packages.filter((pkg) => new RegExp(`\\b${pkg.name.replace(/^THE /, '').replace(/ package$/i, '')}\\b`, 'i').test(text));
   if (mentionedPackages.length >= 2) {
     const [first, second] = mentionedPackages;
     const differences: string[] = [];
@@ -153,7 +160,9 @@ export async function getPackageAdviceReply(userMessage: string): Promise<string
 export async function getPackageSelectionReply(customerId: string, userMessage: string): Promise<string | null> {
   const text = userMessage.toLowerCase();
   const packages = await prisma.package.findMany({ select: { name: true, deposit: true } });
-  const selectedPackage = packages.find((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
+  const chosen = selectedEdition(userMessage);
+  const selectedPackage = (chosen && packages.find((pkg) => pkg.name.toUpperCase() === chosen))
+    || packages.find((pkg) => text.includes(pkg.name.replace(/ package$/i, '').toLowerCase()));
   if (!selectedPackage) return null;
 
   const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
@@ -187,7 +196,7 @@ export async function getPackageSelectionReply(customerId: string, userMessage: 
   }
 
   if (draft?.step && !['collecting_slots', 'service'].includes(draft.step)) return null;
-  if (!draft?.date) return `You've chosen ${editionInText(selectedPackage.name)}. What date would suit you?`;
+  if (!draft?.date) return editionSelectedDateQuestion(selectedPackage.name);
   if (!draft.time) return `You've chosen ${editionInText(selectedPackage.name)}. What time would suit you?`;
   return `Your details for ${editionInText(selectedPackage.name)} are noted. Would you like to go ahead?`;
 }
