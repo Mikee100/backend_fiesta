@@ -4,8 +4,15 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import ts from 'typescript';
-import { scoreSentiment, circuitBreaker, classifyProviderRateLimit } from './resilience.service';
+import { scoreSentiment, circuitBreaker, classifyProviderRateLimit, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE } from './resilience.service';
+import { BUDGET_HANDOFF_REPLY } from './constants';
 import { createSchemaAlertLimiter, DatabaseSchemaOutOfDateError, safeSchemaDetails, verifyBookingDraftSchema } from '../../config/schema-readiness';
+
+test('service and circuit fallbacks use the approved neutral handoff', () => {
+  assert.equal(FALLBACK_MESSAGE, BUDGET_HANDOFF_REPLY);
+  assert.equal(PROVIDER_OUTAGE_MESSAGE, BUDGET_HANDOFF_REPLY);
+  assert.doesNotMatch(FALLBACK_MESSAGE, /daily|limit|quota|reset|AI service/i);
+});
 
 function isolatedMpesa(environment = 'sandbox', key = 'fake-key', secret = 'fake-secret') {
   const file = path.join(__dirname, '../payment/mpesa.service.ts');

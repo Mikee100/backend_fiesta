@@ -1,5 +1,6 @@
 import { PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { EARLY_SLOT_STEP } from './slot-memory';
+import { normalizeQuotes } from './regex';
 
 export function editionInText(name: string): string {
   const canonical = PACKAGE_NAMES_FOR_EXTRACTION.find((edition) => edition.toLowerCase() === name.trim().toLowerCase());
@@ -9,11 +10,12 @@ export function editionInText(name: string): string {
 }
 
 export function repeatedCollectionQuestion(
-  reply: string,
+  modelReply: string,
   draft: { step: string; name?: string | null; service?: string | null; date?: string | null; time?: string | null } | null,
   customerName?: string | null,
   userMessage = '',
 ): string | null {
+  const reply = normalizeQuotes(modelReply);
   if (draft?.step !== EARLY_SLOT_STEP || !reply.includes('?') || /\b(?:change|different|recommend|compare|instead|correct)\b/i.test(userMessage)) return null;
   const name = draft.name || (customerName && !/^(?:Unknown|WhatsApp User)$/i.test(customerName) ? customerName : null);
   const repeatsName = name && /\b(?:what(?:'s| is)|give me|tell me|may i have)\b[^?]{0,40}\b(?:your|the)\s+name\b/i.test(reply);

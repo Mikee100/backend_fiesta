@@ -15,7 +15,14 @@ Use the detailed STAGING_AI_TEST_PLAN.md for the exact forty questions and evide
   and children, any clothing/accessories, and any verified optional services/prices.
   The owner has not answered. Keep the deterministic team-confirm reply until the
   answer is signed off; only then add the verified FAQ row and refresh retrieval.
+  Add "Are lashes included in professional makeup, or an add-on (price)?" and
+  "Is info@fiestahouseattire.com (and the fiestahouseattire Facebook page) still
+  current?" Lashes questions use a deterministic team-confirm reply until answered.
   No package data has been owner-confirmed in this thread.
+  Add "Does THE LEGEND include one styled wig? The public pricing page omits it,
+  but local seed/FAQ/reference data includes it. Which source should be corrected?"
+  Customer answers withhold the Legend wig inclusion until owner confirmation;
+  this does not change its stored data or the Ksh 4,000 optional wig-hire price.
 - Create the non-production PostgreSQL DB, back up/baseline migrations, approve/apply
   cancelProposedAt, 8.1b fields and packages.inclusions together; verify client parity
   and compare runtime rows to approved data read-only.

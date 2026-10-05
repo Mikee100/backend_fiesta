@@ -25,15 +25,17 @@ import {
   PAYMENT_PROMPT_UNRECORDED,
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
-import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
-import { rememberBookingSlots as storeEarlySlots, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
+import { RESCHEDULE_KEYWORD_PATTERN, normalizeQuotes } from './regex';
+import { rememberBookingSlots as storeEarlySlots, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
 import { editionInText, repeatedCollectionQuestion } from './reply-voice';
 import { enforceSlogan } from './slogan-guard';
-import { bookingProgressReply } from './booking-progress';
+import { claimCatalogLink, explicitCatalogListRequest, type CatalogKind } from './catalog-policy';
+import { ADDON_LINK_REPLY, EDITION_LINK_REPLY } from './constants';
+import { bookingProgressReply, addonPickQuestion, nextStep, openTimesReply, sampleSlots, STEP_QUESTIONS } from './booking-progress';
 import { createSchemaAlertLimiter, isMissingColumnError, safeSchemaDetails, SCHEMA_MAINTENANCE_REPLY } from '../../config/schema-readiness';
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
@@ -46,6 +48,9 @@ import {
   buildMultiPersonBookingReply,
   buildMixedIntentClarificationReply,
   buildPackageBudgetReply,
+  legacyPackageReply,
+  isLashesQuestion,
+  LASHES_TEAM_REPLY,
   buildPortfolioReply,
   buildPostShootProcessReply,
   buildRawFilesReply,
@@ -83,15 +88,16 @@ import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT, PACKAGE_N
 import { mpesaService } from '../payment/mpesa.service';
 import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROVIDER_OUTAGE_MESSAGE, shouldNotifyOutage, classifyProviderRateLimit, isProviderRateLimitError } from './resilience.service';
 import { notifyAdmin } from '../notifications/notification.service';
-import { businessDay, bookingDateFacts, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
+import { businessDay, bookingDateFacts, formatCustomerDate, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
-import { ConversationFlowMatcher } from './conversation-flow.matcher';
+import { ConversationFlowMatcher, isPlainGreeting } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 import { createMessageRoutes as buildMessageRoutes, type MessageRoute } from './routes';
+import { explicitlySelectedDeliveryMethod } from './photo-delivery-replies';
 import {
   executeConfirmBookingTool as confirmBookingTool,
   executeConfirmCancellationTool as confirmCancellationTool,
@@ -235,6 +241,7 @@ export class AgentService {
           : matchedUrl;
         const path = new URL(urlWithoutPunctuation).pathname.replace(/\/+$/, '') || '/';
 
+        if (path === '/session-packages') return OFFICIAL_WEBSITE_URLS.packages + trailingPunctuation;
         if (path === '/reviews' || path === '/gallery/suspending-concept' || path === '/') {
           return path === '/reviews'
             ? OFFICIAL_WEBSITE_URLS.reviews + trailingPunctuation
@@ -299,9 +306,10 @@ export class AgentService {
   }
 
   private getUnverifiedActionReply(
-    reply: string,
+    modelReply: string,
     done: { rescheduled: boolean; cancelled: boolean; noteSaved: boolean }
   ): string | null {
+    const reply = normalizeQuotes(modelReply);
     const claimsRescheduled = /\b(?:has been|have been|is now|i've|i have|successfully)\s+(?:rescheduled|moved)\b/i.test(reply);
     if (claimsRescheduled && !done.rescheduled) {
       return "Sorry, I haven't been able to apply that reschedule yet, so your booking is still on its original date and time. Please send the new date and time together (e.g. \"8th October at 3pm\") and I'll confirm it.";
@@ -450,8 +458,8 @@ export class AgentService {
   ): string | null {
     const statedDate = resolveCalendarDate(userMessage);
     if (statedDate) {
-      const facts = bookingDateFacts(statedDate);
-      return `${facts.date} is ${facts.weekday}.`;
+      const date = businessDay(statedDate);
+      return `${date.format('D MMMM YYYY')} is a ${date.format('dddd')}.`;
     }
     const match = userMessage.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
     if (!match) return null;
@@ -480,6 +488,22 @@ export class AgentService {
 
   private getBusinessIntroductionReply(): string {
     return buildBusinessIntroductionReply();
+  }
+
+  private async getGreetingReply(customerId: string): Promise<string | null> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    // A profile name alone is not booking progress.
+    if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) return null;
+    return buildBusinessIntroductionReply();
+  }
+
+  /** Deterministic reply for the detected intent when the verifier cannot use the model's reply. */
+  private async getVerifierTemplateReply(customerId: string, userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]): Promise<string | null> {
+    if (this.shouldResolvePackageSelectionImmediately(userMessage)) return this.getPackageSelectionReply(customerId, userMessage);
+    if (this.conversationFlows.isPackageCatalogRequest(userMessage, history)) return EDITION_LINK_REPLY;
+    if (isPlainGreeting(userMessage)) return buildBusinessIntroductionReply();
+    return null;
   }
 
   private shouldUseBookingProcessReply(userMessage: string): boolean {
@@ -528,11 +552,12 @@ export class AgentService {
   }
 
   private isUnverifiedBookingConfirmation(
-    reply: string,
+    modelReply: string,
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[],
     existingBooking?: { dateTime: Date; status: string }
   ): boolean {
+    const reply = normalizeQuotes(modelReply);
     const claimsConfirmed = /\b(?:confirmed\s+(?:session|appointment|booking)|(?:booking|session|appointment)\s+(?:is|has been)\s+confirmed|session is all set|successfully booked|payment has gone through|payment is received and confirmed)\b/i.test(reply);
     if (!claimsConfirmed) return false;
     const asksExisting = /\b(?:existing|upcoming|already booked|confirmed)\b.*\b(?:session|appointment|booking)\b|\b(?:session|appointment|booking)\b.*\b(?:existing|upcoming|already booked)\b/i.test(userMessage);
@@ -652,6 +677,21 @@ export class AgentService {
 
   private getPackageBudgetReply(): string {
     return buildPackageBudgetReply();
+  }
+
+  private getLegacyPackageReply(userMessage: string): string | null {
+    return legacyPackageReply(userMessage);
+  }
+
+  /** Lashes are not in any confirmed edition data, so the question goes to the team rather than the model. */
+  private async getLashesReply(customerId: string, userMessage: string): Promise<string> {
+    if (this.shouldEscalateVerifier(customerId, userMessage)) {
+      await this.escalate(customerId, 'booking', JSON.stringify({
+        event: 'owner_fact_question', topic: 'lashes', customerMessage: userMessage.slice(0, 2000),
+        note: 'Lashes are not in confirmed edition data. Reply to the customer once the owner confirms.',
+      }));
+    }
+    return LASHES_TEAM_REPLY;
   }
 
   private shouldClarifyMixedIntent(userMessage: string): boolean {
@@ -1031,8 +1071,41 @@ export class AgentService {
     return buildPackageCatalogReply(showInclusions, userMessage);
   }
 
+  private async getCatalogDisplayReply(customerId: string, platform: string, kind: CatalogKind, userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
+    const linkReply = kind === 'addons' ? ADDON_LINK_REPLY : EDITION_LINK_REPLY;
+    const mentionedEditions = PACKAGE_NAMES_FOR_EXTRACTION.filter(name => new RegExp(`\\b${name.replace(/^THE /, '')}\\b`, 'i').test(userMessage));
+    const specificEdition = kind === 'editions' && mentionedEditions.length === 1;
+    if (specificEdition) {
+      const detail = await this.getPackageCatalogReply(true, userMessage);
+      return detail ? `${detail}\n${OFFICIAL_WEBSITE_URLS.packages}` : linkReply;
+    }
+    if (!explicitCatalogListRequest(userMessage) && await claimCatalogLink(customerId, platform, kind, history)) {
+      const question = await this.getCatalogBookingQuestion(customerId, kind);
+      return question ? `${linkReply.split('\n')[0]}\n${question}` : linkReply;
+    }
+    return kind === 'addons' ? this.getAdditionsReply(customerId)
+      : await this.getPackageCatalogReply(this.conversationFlows.isPackageInclusionFollowUp(userMessage, history), userMessage) || linkReply;
+  }
+
+  /** The pending booking question after a catalog link; for add-ons it names the chosen edition. */
+  private async getCatalogBookingQuestion(customerId: string, kind: CatalogKind = 'editions'): Promise<string | null> {
+    try {
+      const draft = await prisma.bookingDraft.findUnique({ where: { customerId },
+        select: { step: true, service: true, date: true, time: true, name: true, createdAt: true, isForSomeoneElse: true } });
+      if (!draft || draft.step !== EARLY_SLOT_STEP || earlySlotsExpired(draft) || draft.isForSomeoneElse) return null;
+      const step = nextStep({ ...draft, addonsDecided: kind === 'editions' });
+      if (kind === 'addons' && draft.service && (step === 'need_addon_decision' || step === 'ready_to_propose')) return addonPickQuestion(draft.service);
+      if (step !== 'ready_to_propose' && step !== 'need_addon_decision') return STEP_QUESTIONS[step];
+    } catch {
+      console.warn('[AGENT_FLOW] catalog_booking_context=unavailable');
+    }
+    return null;
+  }
+
   private async getPackageAdviceReply(userMessage: string): Promise<string | null> {
-    return buildPackageAdviceReply(userMessage);
+    const reply = await buildPackageAdviceReply(userMessage);
+    return reply ? `${reply}\n${OFFICIAL_WEBSITE_URLS.packages}` : null;
   }
 
   private async getPackageSelectionReply(customerId: string, userMessage: string): Promise<string | null> {
@@ -1179,7 +1252,8 @@ export class AgentService {
     return 'Your session is within 72 hours. According to our policy, rescheduling now will forfeit your deposit. Would you still like to proceed? If yes, please share your preferred date and time.';
   }
 
-  private async getBookingProcessReply(): Promise<string> {
+  private async getBookingProcessReply(customerId?: string, platform = 'whatsapp', history: { role: 'user' | 'assistant'; content: string }[] = []): Promise<string> {
+    if (customerId) await Promise.all(['editions', 'addons'].map(kind => claimCatalogLink(customerId, platform, kind as CatalogKind, history)));
     return buildBookingProcessReply.call(this);
   }
 
@@ -1390,6 +1464,8 @@ A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancel
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
 A9. VERIFIED WEBSITE LINKS: Use only these exact Fiesta House website URLs: ${Object.values(OFFICIAL_WEBSITE_URLS).join(', ')}. Never guess or construct a page path. The reviews page is /reviews; the Suspending Concept gallery is /gallery/suspending-concept. If no verified link fits, share the homepage or offer to check with the team.
+LINK-FIRST CATALOG: For editions, packages and optional add-ons share ${OFFICIAL_WEBSITE_URLS.packages}, not the whole catalog. Keep all catalog knowledge for specific-item answers, comparisons and booking calculations. Answer one item or compare two briefly, then append the link. Only list the catalog when the customer explicitly asks for it here, cannot open the link, or repeats a catalog request after the link; code handles repeat state. A bare yes or show me after the link is not a request for a full list. Do not change prices, deposits or selected add-ons.
+LEGEND INCLUSION HOLD: The public page does not list a Legend wig, while local data does. Do not assert that a wig is included or excluded with Legend, even if retrieval says otherwise. Withhold that inclusion until the owner confirms; say the team will confirm the remaining inclusions. Other verified Legend details may still be answered.
 
 [B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
 B1. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
@@ -1510,7 +1586,7 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
         dateRangeResults.set(key, result);
       }
       calendarReply = result.dates.length
-        ? `Available dates for ${service}:\n${result.dates.map((entry) => `${entry.weekday}, ${entry.date}: ${entry.slots.map(formatCustomerTime).join(', ')}`).join('\n')}\nWhich date and time would work for you?`
+        ? `Available dates for ${editionInText(service)}:\n${result.dates.map((entry) => `${formatCustomerDate(entry.date)}: ${sampleSlots(entry.slots).map(formatCustomerTime).join(', ')}`).join('\n')}\nWhich date and time would work for you?`
         : `${result.message} Which other date range would work for you?`;
       return result;
     };
@@ -1519,19 +1595,19 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
       const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => service.toLowerCase().includes(key));
       if (!serviceKey) throw new Error('Choose a recognised package before checking availability.');
       const result = await bookingService.getAvailableSlots(date, SERVICE_DURATIONS[serviceKey]);
-      const label = `${facts.date} is ${facts.weekday}`;
+      const day = formatCustomerDate(date);
       if (facts.isPast || facts.isMonday || !Array.isArray(result)) {
         const reason = facts.isPast ? 'That date is in the past' : facts.isMonday ? 'Closed on Mondays'
           : Array.isArray(result) ? 'No slots are available' : result.reason;
-        calendarReply = `${label}. ${reason}. Which other date would work for you?`;
+        calendarReply = facts.isPast || facts.isMonday ? closedDateReply(facts) : `${day}: ${reason}. Which other date would work for you?`;
         return { ...facts, status: 'closed', reason };
       }
       const requestedTime = statedSlots.time || currentSlots?.time;
       calendarReply = requestedTime && result.includes(requestedTime)
-        ? `${label}. ${formatCustomerTime(requestedTime)} is available for ${editionInText(service)}. Would you like to go ahead with that time?`
+        ? `${formatCustomerTime(requestedTime)} on ${day} is available for ${editionInText(service)}. Would you like to go ahead with that time?`
         : result.length
-          ? `${label}. Available slots for ${service}: ${result.map(formatCustomerTime).join(', ')}. Which time would work for you?`
-          : `${label}. No slots are available for ${service}. Which other date would work for you?`;
+          ? openTimesReply(date, service, result)
+          : `${day} is fully booked for ${editionInText(service)}. Which other date would work for you?`;
       return { ...facts, slots: result };
     };
 
@@ -1880,13 +1956,18 @@ ${contextString}`;
               }
             }
             else if (functionName === 'save_delivery_preference') {
-              const result = await this.executeSaveDeliveryPreferenceTool(customerId, args.method, args.email, args.whatsappNumber, args.note, platform);
-              if (result.method === 'email' && result.email) {
-                toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved ${result.email} as your delivery email. We'll share your secure download link within 10 working days after the shoot."`;
-              } else if (result.method === 'whatsapp' && result.whatsappNumber) {
-                toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved WhatsApp delivery to ${result.whatsappNumber}. We'll share your secure download link within 10 working days after the shoot."`;
+              const deliveryContext = [...history.filter((message) => message.role === 'user').map((message) => message.content), userMessage].join('\n');
+              if (!explicitlySelectedDeliveryMethod(deliveryContext, args.method)) {
+                toolResponse = 'No delivery preference was saved. The customer has not explicitly chosen this channel. Ask whether they prefer WhatsApp, email, or the secure download link.';
               } else {
-                toolResponse = `SUCCESS: Delivery preference saved as ${result.method}. Use this exact customer-facing confirmation: "Perfect, I've saved your delivery preference. We'll share your secure download link within 10 working days after the shoot."`;
+                const result = await this.executeSaveDeliveryPreferenceTool(customerId, args.method, args.email, args.whatsappNumber, args.note, platform);
+                if (result.method === 'email' && result.email) {
+                  toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved ${result.email} as your delivery email. We'll share your secure download link within 10 working days after the shoot."`;
+                } else if (result.method === 'whatsapp' && result.whatsappNumber) {
+                  toolResponse = `SUCCESS: Delivery preference saved. Use this exact customer-facing confirmation: "Perfect, I've saved WhatsApp delivery to ${result.whatsappNumber}. We'll share your secure download link within 10 working days after the shoot."`;
+                } else {
+                  toolResponse = `SUCCESS: Delivery preference saved as ${result.method}. Use this exact customer-facing confirmation: "Perfect, I've saved your delivery preference. We'll share your secure download link within 10 working days after the shoot."`;
+                }
               }
             }
             else if (functionName === 'add_session_note') {
@@ -1998,6 +2079,8 @@ ${contextString}`;
       const facts: VerifierFacts = {
         amounts: [...new Set([...ADDON_CATALOG.filter((addon) => addon.unitPrice > 0).map((addon) => addon.unitPrice), ...verifiedToolAmounts])],
         deposits: [...verifiedToolDeposits], editions: [], customerMessage: userMessage, packagePrices: [],
+        catalogListAllowed: explicitCatalogListRequest(userMessage)
+          && (/\b(?:packages?|editions?|add-ons?|extras)\b/i.test(userMessage) || history.some(entry => entry.role === 'assistant' && entry.content.includes(OFFICIAL_WEBSITE_URLS.packages))),
       };
       if (currencyAmounts(safeModelContent).length
         || depositAmounts(safeModelContent).length
@@ -2013,6 +2096,8 @@ ${contextString}`;
           const deposits: number[] = [...verifiedToolDeposits];
           for (const row of rows) {
             if (Number.isInteger(row.price) && row.price > 0) amounts.push(row.price);
+            // The stored deposit is the business fact even when a local override changes the charged amount.
+            if (typeof row.deposit === 'number' && Number.isInteger(row.deposit) && row.deposit >= MINIMUM_BOOKING_DEPOSIT) { deposits.push(row.deposit); amounts.push(row.deposit); }
             try { const deposit = this.getDepositForPackage(row); deposits.push(deposit); amounts.push(deposit); } catch {}
           }
           facts.amounts = [...new Set(amounts)];
@@ -2042,15 +2127,22 @@ ${contextString}`;
         }
         return this.formatCustomerReply(reply, userMessage, history);
       }, async (text, reasons) => {
-        if (!this.shouldEscalateVerifier(customerId)) {
+        if (!this.shouldEscalateVerifier(customerId, userMessage)) {
           console.info('[AGENT_FLOW] verifier=escalation_suppressed');
           return;
         }
         await this.escalate(customerId, 'booking', JSON.stringify({
           event: 'output_verifier_blocked', reasons, customerMessage: userMessage.slice(0, 2000), offendingText: JSON.parse(text),
         }));
-      });
+      }, () => this.getVerifierTemplateReply(customerId, userMessage, history));
       safeModelContent = verified.reply;
+      if (safeModelContent === EDITION_LINK_REPLY || safeModelContent === ADDON_LINK_REPLY) {
+        await claimCatalogLink(customerId, platform, safeModelContent === ADDON_LINK_REPLY ? 'addons' : 'editions', history);
+      }
+      if (!verified.blocked && this.conversationFlows.isPackageAdviceRequest(userMessage)
+        && !safeModelContent.includes(OFFICIAL_WEBSITE_URLS.packages)) {
+        safeModelContent = `${safeModelContent}\n${OFFICIAL_WEBSITE_URLS.packages}`;
+      }
       verifierBlocked = verified.blocked;
     }
     safeModelContent = await enforceSlogan(customerId, platform, safeModelContent, history);
@@ -2092,7 +2184,9 @@ ${contextString}`;
    * best-effort frustration detection, and AI job metrics. Never throws -
    * always resolves to a string that's safe to send to the customer.
    */
-  async handleMessage(customerId: string, userMessage: string, history: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
+  async handleMessage(customerId: string, rawMessage: string, rawHistory: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
+    const userMessage = normalizeQuotes(rawMessage);
+    const history = rawHistory.map((entry) => ({ ...entry, content: normalizeQuotes(entry.content) }));
     const startedAt = Date.now();
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
@@ -2209,8 +2303,8 @@ ${contextString}`;
     return { reply: SCHEMA_MAINTENANCE_REPLY, outcome: { success: false, isFallback: true, failureReason: 'database_schema_out_of_date' } };
   }
 
-  private async getBookingProgressReply(customerId: string, message: string, history: { role: 'user' | 'assistant'; content: string }[], decisionJustSaved = false): Promise<string | null> {
-    return bookingProgressReply.call(this, customerId, message, history, decisionJustSaved);
+  private async getBookingProgressReply(customerId: string, message: string, history: { role: 'user' | 'assistant'; content: string }[], decisionJustSaved = false, force = false): Promise<string | null> {
+    return bookingProgressReply.call(this, customerId, message, history, decisionJustSaved, force);
   }
 
   private async rememberBookingSlots(

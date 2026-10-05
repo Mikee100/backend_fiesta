@@ -31,6 +31,11 @@ export function bookingDateFacts(date: string) {
 	};
 }
 
+/** Customer-facing date, e.g. "Friday, 9 October". */
+export function formatCustomerDate(date: string): string {
+	return businessDay(date).format('dddd, D MMMM');
+}
+
 export function nextWeekRange() {
 	const now = nowInBusinessTimezone().startOf('day');
 	const monday = now.subtract((now.day() + 6) % 7, 'day').add(7, 'day');

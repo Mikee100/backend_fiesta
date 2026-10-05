@@ -10,12 +10,17 @@ import {
   shouldNotifyOutage,
 } from './resilience.service';
 import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
-import { addonInquiryReply, addonRecipient, addonSelectionClarification } from './addon-capture';
+import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest, isMakeupForSelf, makeupIncludedReply } from './addon-capture';
+import { editionShortName } from './booking-progress';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { needsUnchangedReassurance } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
-import { familyStylingReply } from './replies';
+import { buildHairWigClarificationReply, buildPersonalOutfitReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
+import { buildExpressDeliveryFeeReply, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
 import { classifyPaymentMessage } from './payment-recovery';
+import { catalogLinkFollowUp } from './catalog-policy';
+import { OFFICIAL_WEBSITE_URLS } from './constants';
+import { isPlainGreeting } from './conversation-flow.matcher';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -202,6 +207,18 @@ export function createMessageRoutes(
       },
     },
     {
+      name: 'lashes',
+      replyMode: 'deterministic',
+      when: () => isLashesQuestion(userMessage),
+      handle: async () => this.getLashesReply(customerId, userMessage),
+    },
+    {
+      name: 'legacyPackageName',
+      replyMode: 'deterministic',
+      when: () => Boolean(legacyPackageReply(userMessage)),
+      handle: () => this.getLegacyPackageReply(userMessage),
+    },
+    {
       name: 'packageBudget',
       replyMode: 'deterministic',
       when: () => this.shouldUsePackageBudgetReply(userMessage),
@@ -219,6 +236,12 @@ export function createMessageRoutes(
       name: 'reviewPage',
       when: () => Boolean(this.getReviewPageReply(userMessage)),
       handle: () => this.getReviewPageReply(userMessage),
+    },
+    {
+      name: 'greeting',
+      replyMode: 'deterministic',
+      when: () => isPlainGreeting(userMessage),
+      handle: async () => this.getGreetingReply(customerId),
     },
     {
       name: 'businessIntroduction',
@@ -259,7 +282,13 @@ export function createMessageRoutes(
       name: 'rawFiles',
       replyMode: 'deterministic',
       when: () => this.shouldUseRawFilesReply(userMessage),
-      handle: () => this.getRawFilesReply(),
+      handle: () => `${this.getRawFilesReply()}\n${OFFICIAL_WEBSITE_URLS.packages}`,
+    },
+    {
+      name: 'expressDeliveryFee',
+      replyMode: 'deterministic',
+      when: () => isExpressDeliveryFeeRequest(userMessage),
+      handle: () => buildExpressDeliveryFeeReply(),
     },
     {
       name: 'previousAddon',
@@ -272,17 +301,46 @@ export function createMessageRoutes(
       handle: () => 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.',
     },
     {
+      name: 'makeupForSelf',
+      replyMode: 'deterministic',
+      when: () => isMakeupForSelf(userMessage, history),
+      handle: async () => {
+        const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+        const reply = makeupIncludedReply(draft?.service, draft?.service ? editionShortName(draft.service) : null);
+        const next = await this.getBookingProgressReply(customerId, userMessage, history, false, true);
+        return next ? `${reply}\n${next}` : reply;
+      },
+    },
+    {
+      name: 'addonRequest',
+      replyMode: 'deterministic',
+      when: () => isAddonListRequest(userMessage),
+      handle: () => this.getCatalogDisplayReply(customerId, platform, 'addons', userMessage, history),
+    },
+    {
       name: 'addonListFollowUp',
       replyMode: 'deterministic',
       when: () => this.isAddonListFollowUp(userMessage, history) && !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history),
-      handle: () => this.getAdditionsReply(customerId),
+      handle: () => this.getCatalogDisplayReply(customerId, platform, 'addons', userMessage, history),
+    },
+    {
+      name: 'personalOutfit',
+      replyMode: 'deterministic',
+      when: () => isPersonalOutfitQuestion(userMessage),
+      handle: () => buildPersonalOutfitReply(),
+    },
+    {
+      name: 'hairWigClarification',
+      replyMode: 'deterministic',
+      when: () => isHairWigClarificationRequest(userMessage),
+      handle: () => buildHairWigClarificationReply(),
     },
     {
       name: 'selectedAddon',
       when: () => Boolean(addonInquiryReply(userMessage) || addonSelectionClarification(userMessage, history) || this.getSelectedAddon(userMessage, history)),
       handle: async () => {
         const inquiry = addonInquiryReply(userMessage);
-        if (inquiry) return inquiry;
+        if (inquiry) return `${inquiry}\n${OFFICIAL_WEBSITE_URLS.packages}`;
         const clarification = addonSelectionClarification(userMessage, history);
         if (clarification) return clarification;
         const choices = this.getSelectedAddons(userMessage, history);
@@ -321,7 +379,7 @@ export function createMessageRoutes(
       name: 'additions',
       replyMode: 'deterministic',
       when: () => this.shouldUseAdditionsReply(userMessage),
-      handle: () => this.getAdditionsReply(customerId),
+      handle: () => this.getCatalogDisplayReply(customerId, platform, 'addons', userMessage, history),
     },
     {
       name: 'bespoke',
@@ -351,7 +409,7 @@ export function createMessageRoutes(
       name: 'bookingProcess',
       replyMode: 'deterministic',
       when: () => this.shouldUseBookingProcessReply(userMessage),
-      handle: async () => this.getBookingProcessReply(),
+      handle: async () => this.getBookingProcessReply(customerId, platform, history),
     },
     {
       name: 'rescheduleSelection',
@@ -397,11 +455,11 @@ export function createMessageRoutes(
     {
       name: 'packageCatalog',
       replyMode: 'deterministic',
-      when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history),
+      when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history) || catalogLinkFollowUp(userMessage, history),
       handle: async () => {
-        const showInclusions = this.conversationFlows.isPackageInclusionFollowUp(userMessage, history);
-        return await this.getPackageCatalogReply(showInclusions, userMessage)
-          || 'The studio team will share our current rate card and edition details. I cannot verify the catalog right now.';
+        const previous = [...history].reverse().find(entry => entry.role === 'assistant')?.content || '';
+        const kind = catalogLinkFollowUp(userMessage, history) && /extras|add-ons/i.test(previous) ? 'addons' : 'editions';
+        return this.getCatalogDisplayReply(customerId, platform, kind, userMessage, history);
       },
     },
     {

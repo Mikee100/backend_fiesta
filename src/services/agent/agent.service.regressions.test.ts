@@ -21,18 +21,125 @@ import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/
 import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
 import { buildAdditionsReply, isAddonListFollowUp, formatCustomerTime } from './replies';
 import { shouldUseBookingStatusReply, getBookingStatusReply } from './appointment-replies';
-import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply } from './replies';
+import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply, buildPackageBudgetReply, legacyPackageReply, LASHES_TEAM_REPLY } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
 import { DAILY_TOKEN_CAP } from './resilience.service';
 import { BUDGET_HANDOFF_REPLY } from './constants';
-import { BRAND_RULES, BRAND_SLOGAN, VOICE_RULES } from './constants';
+import { BRAND_RULES, BRAND_SLOGAN, VOICE_RULES, ADDON_LINK_REPLY, EDITION_LINK_REPLY, OFFICIAL_WEBSITE_URLS } from './constants';
 import { buildBookingProposalConfirmation, previousMessageRequestsConfirmation, buildPostShootProcessReply, isPostShootProcessRequest } from './replies';
 import { editionInText, repeatedCollectionQuestion } from './reply-voice';
 import { containsSlogan, enforceSlogan, normalizeSlogan } from './slogan-guard';
 import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
+import { explicitlySelectedDeliveryMethod, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
+import { isPlainGreeting, selectedEdition } from './conversation-flow.matcher';
 
 const agent = new AgentService() as any;
 const extractor = new BookingExtractor() as any;
+
+test('Legend detail withholds disputed wig inclusions even when runtime and seed both say included', async (context) => {
+  const original = prisma.package.findMany;
+  context.after(() => { prisma.package.findMany = original; });
+  const reference = SEED_EDITION_INCLUSIONS['THE LEGEND'];
+  (prisma.package.findMany as any) = async () => [{ ...reference, name: 'THE LEGEND', price: 45000, notes: '1 styled wig', inclusions: ['1 styled wig', '15 final edited photos'] }];
+  const reply = await agent.getPackageCatalogReply(true, 'Tell me about the Legend');
+  assert.match(reply, /45,000/);
+  assert.match(reply, /15 final edited photos/);
+  assert.doesNotMatch(reply, /styled wig|wig included/i);
+  const direct = agent.buildPackageCard({ ...reference, name: 'THE LEGEND', price: 45000, notes: '1 styled wig' });
+  assert.doesNotMatch(direct, /styled wig|wig included/i);
+  assert.match(reply, /team will confirm/i);
+});
+
+test('link-first catalog preserves the pricing URL and does not treat yes or show me as list consent', () => {
+  const url = 'https://www.fiestahousematernity.com/session-packages';
+  assert.equal(agent.formatCustomerReply(`See our editions: ${url}`), `See our editions: ${url}`);
+  const history = [{ role: 'assistant' as const, content: `All the optional extras and their prices are here: ${url}. Tell me which you would like for your session.` }];
+  assert.equal(isAddonListFollowUp('yes', history), false);
+  assert.equal(isAddonListFollowUp('show me', history), false);
+  assert.equal(isAddonListFollowUp('list them here', history), true);
+});
+
+test('link-first verifier replaces unrequested catalogs but preserves money validation', async () => {
+  const text = 'Bloom - Ksh 15,000\nMuse - Ksh 25,000\nIcon - Ksh 35,000';
+  const facts = { amounts: [15000, 25000, 35000], deposits: [2000], editions: [] };
+  assert.ok(verifyModelReply(text, facts).reasons.includes('catalog_dump'));
+  const result = await verifyWithOneRetry(text, facts, async () => assert.fail('catalog display needs no model retry'), async () => assert.fail('catalog display needs no escalation'));
+  assert.ok(result.reply.includes('https://www.fiestahousematernity.com/session-packages'));
+  assert.ok(!result.reply.includes('15,000'));
+  assert.ok(verifyModelReply(`${text}\nDeposit is Ksh 500.`, facts).reasons.includes('deposit_mismatch'));
+});
+
+test('link-first catalog state survives trimming, separates catalogs and expires without losing other memory', async (context) => {
+  const originals = { session: prisma.unifiedConversation.findFirst, upsert: prisma.customerMemory.upsert, find: prisma.customerMemory.findUnique, update: prisma.customerMemory.updateMany };
+  let sessionId = 'link-session';
+  let insights = ['owner:keep-this'];
+  context.after(() => { prisma.unifiedConversation.findFirst = originals.session; prisma.customerMemory.upsert = originals.upsert; prisma.customerMemory.findUnique = originals.find; prisma.customerMemory.updateMany = originals.update; });
+  (prisma.unifiedConversation.findFirst as any) = async () => ({ sessionId });
+  (prisma.customerMemory.upsert as any) = async () => ({});
+  (prisma.customerMemory.findUnique as any) = async () => ({ keyInsights: [...insights] });
+  (prisma.customerMemory.updateMany as any) = async ({ where, data }: any) => {
+    if (JSON.stringify(where.keyInsights.equals) !== JSON.stringify(insights)) return { count: 0 };
+    insights = data.keyInsights.set;
+    return { count: 1 };
+  };
+  const instance = withQuietAgent({ getPackageCatalogReply: async () => 'FULL EDITIONS', getAdditionsReply: async () => 'FULL ADDONS' });
+  assert.match(await instance.handleMessage('synthetic-link', 'show packages', [], 'whatsapp'), /session-packages/);
+  assert.equal(await instance.handleMessage('synthetic-link', 'show packages', [], 'whatsapp'), 'FULL EDITIONS');
+  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'addons', 'what add-ons do you have', []), /session-packages/);
+  assert.equal(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'addons', 'list them here', []), 'FULL ADDONS');
+  sessionId = 'new-session';
+  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'editions', 'show packages', []), /session-packages/);
+  assert.ok(insights.includes('owner:keep-this'));
+  insights = insights.map(item => item.startsWith('system:catalog-link:v1:') ? item.replace(/\d+$/, '1') : item);
+  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'editions', 'show packages', []), /session-packages/);
+  assert.equal(insights.filter(item => item.startsWith('system:catalog-link:v1:')).length, 1);
+});
+
+test('link-first specific edition and addon inquiry keep their facts and append the pricing link', async () => {
+  const instance = withQuietAgent({ getPackageCatalogReply: async () => 'THE BLOOM - Ksh 15,000\n6 final edited photos' });
+  const reply = await instance.getCatalogDisplayReply('synthetic-detail', 'web', 'editions', 'tell me about the Bloom', []);
+  assert.match(reply, /THE BLOOM - Ksh 15,000/);
+  assert.match(reply, /session-packages/);
+  assert.ok(!reply.includes('THE MUSE'));
+  const inquiry = await instance.handleMessage('synthetic-detail', 'how much is wig hire?', [], 'web');
+  assert.match(inquiry, /4,000/);
+  assert.match(inquiry, /session-packages/);
+});
+
+test('link-first shared copy, broken-link fallback and mid-booking question preserve selection', async (context) => {
+  const policy = require('./catalog-policy');
+  const originalClaim = policy.claimCatalogLink;
+  const originalDraft = prisma.bookingDraft.findUnique;
+  const draft = { step: EARLY_SLOT_STEP, service: 'THE ICON', name: 'Joan', date: null, time: null, createdAt: new Date() };
+  policy.claimCatalogLink = async () => true;
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  context.after(() => { policy.claimCatalogLink = originalClaim; prisma.bookingDraft.findUnique = originalDraft; });
+  const instance = withQuietAgent({ getPackageCatalogReply: async () => 'FULL EDITIONS', getAdditionsReply: async () => 'FULL ADDONS', tryImmediateConfirmation: async () => null,
+    getCatalogBookingQuestion: (AgentService.prototype as any).getCatalogBookingQuestion });
+  const addonHistory = [{ role: 'assistant' as const, content: ADDON_LINK_REPLY }];
+  const editionHistory = [{ role: 'assistant' as const, content: EDITION_LINK_REPLY }];
+  for (const text of ['yes', 'show me']) {
+    assert.equal(isAddonListFollowUp(text, addonHistory), false);
+    assert.equal(isAddonListFollowUp(text, editionHistory), false);
+    const reply = await instance.handleMessage('synthetic-copy', text, addonHistory, 'whatsapp');
+    assert.ok(!reply.includes('FULL ADDONS') && !reply.includes('FULL EDITIONS'));
+  }
+  assert.equal(await instance.handleMessage('synthetic-copy', "the link doesn't open", addonHistory, 'whatsapp'), 'FULL ADDONS');
+  assert.equal(await instance.handleMessage('synthetic-copy', 'list them here', editionHistory, 'whatsapp'), 'FULL EDITIONS');
+  const reply = await instance.handleMessage('synthetic-copy', 'which editions do you have?', [], 'whatsapp');
+  assert.match(reply, /session-packages/);
+  assert.match(reply, /What date would suit you\?/);
+  assert.equal(draft.service, 'THE ICON');
+});
+
+test('link-first verifier permits single-edition inclusions and explicit last-resort catalogs', () => {
+  const goddess = 'The Goddess - Ksh 120,000. 5 hours. Power Suit, 2 styled wigs, Goddess Sculpture Set, Professional Reel.';
+  const facts = { amounts: [120000], deposits: [2000], editions: [{ name: 'THE GODDESS', duration: '5 hours' }], customerMessage: 'tell me about the Goddess' };
+  assert.deepEqual(verifyModelReply(goddess, facts).reasons, []);
+  const catalog = 'Bloom - Ksh 15,000\nMuse - Ksh 25,000\nIcon - Ksh 35,000';
+  assert.deepEqual(verifyModelReply(catalog, { ...facts, amounts: [15000, 25000, 35000], catalogListAllowed: true }).reasons, []);
+  assert.ok(verifyModelReply('Extra outfit - Ksh 4,000\nExtra makeup - Ksh 3,500\nStyled wig hire - Ksh 4,000', { ...facts, amounts: [4000, 3500] }).reasons.includes('catalog_dump'));
+});
 
 test('family styling questions are deterministic team-confirm topics, not invented services', async () => {
   const instance = withQuietAgent({ runAgent: async () => assert.fail('family styling must not reach the model') });
@@ -53,6 +160,40 @@ test('family styling questions are deterministic team-confirm topics, not invent
     assert.ok(verifyModelReply(text, facts).reasons.includes('unverified_family_styling'));
   }
   assert.deepEqual(verifyModelReply(FAMILY_STYLING_TEAM_REPLY, facts).reasons, []);
+});
+
+test('Faith information turns do not save extras or invent express pricing', async () => {
+  const notes: string[] = [];
+  const instance = withQuietAgent({ naturalAssistantMode: true,
+    executeAddNoteTool: async (_customer: string, _date: string, note: string) => { notes.push(note); return { created: true }; },
+    getEarliestImageDeliveryReply: async () => 'Edited photos are ready 10 working days after your session and shared through a secure download link.',
+    runAgent: async () => assert.fail('these information questions must stay on deterministic routes'),
+  });
+
+  const outfit = await instance.handleMessage('faith-regression', 'Can I bring one extra outfit of my own?', [], 'whatsapp');
+  assert.match(outfit, /bring one outfit of your own or substitute/i);
+  assert.equal(notes.length, 0);
+
+  const turnaroundQuestion = 'How long does it usually take for the photos to be edited?';
+  assert.equal(instance.shouldUseEarliestImageDeliveryReply(turnaroundQuestion), true);
+  const turnaround = await instance.handleMessage('faith-regression', turnaroundQuestion, [], 'whatsapp');
+  assert.match(turnaround, /10 working days.*secure download link/i);
+  assert.equal(notes.length, 0);
+
+  const expressQuestion = 'How much do I have to pay for my photos to be delivered within 3 working days?';
+  assert.equal(isExpressDeliveryFeeRequest(expressQuestion), true);
+  const express = await instance.handleMessage('faith-regression', expressQuestion, [], 'whatsapp');
+  assert.match(express, /team will confirm/i);
+  assert.doesNotMatch(express, /Ksh\s*5,?000/i);
+  assert.equal(notes.length, 0);
+});
+
+test('delivery preference requires a channel the customer explicitly chose', () => {
+  assert.equal(explicitlySelectedDeliveryMethod('How much do I have to pay for delivery within 3 working days?', 'whatsapp'), false);
+  assert.equal(explicitlySelectedDeliveryMethod('This is Faith on WhatsApp.', 'whatsapp'), false);
+  assert.equal(explicitlySelectedDeliveryMethod('Please send the link by WhatsApp.', 'whatsapp'), true);
+  assert.equal(explicitlySelectedDeliveryMethod("I'd prefer email for the download link.", 'email'), true);
+  assert.equal(explicitlySelectedDeliveryMethod('Please share the secure download link.', 'download_link'), true);
 });
 
 test('verifier blocks internal-fault explanations to customers', () => {
@@ -365,7 +506,7 @@ test('Joan correction retains Icon and closed Monday is answered without model c
   await instance.rememberBookingSlots('synthetic-joan', 'I would want the Icon', []);
   assert.equal(draft.service, 'THE ICON');
   const reply = await instance.handleMessage('synthetic-joan', '5th at 3pm', [], 'whatsapp');
-  assert.match(reply, /2026-10-05 is Monday.*Closed on Mondays/);
+  assert.match(reply, /closed on Mondays, so Monday, 5 October is not available/);
   await instance.rememberBookingSlots('synthetic-joan', 'No its Joan', [{ role: 'assistant', content: 'I have your name as Miriam. Is that correct?' }]);
   assert.equal(draft.name, 'Joan');
   assert.equal(customer.name, 'Joan');
@@ -374,7 +515,7 @@ test('Joan correction retains Icon and closed Monday is answered without model c
   assert.equal(draft.date, '2026-10-05');
   assert.equal(extractStatedSlots('The icon package').service, 'THE ICON');
   const mixed = await instance.handleMessage('synthetic-joan', 'Your husband / 5th at 3pm', [], 'whatsapp');
-  assert.match(mixed, /2026-10-05 is Monday.*Closed on Mondays/);
+  assert.match(mixed, /closed on Mondays, so Monday, 5 October is not available/);
 });
 
 test('reported Joan turns retain current slots and finish with a proposal, never the older booking', async (context) => {
@@ -399,6 +540,8 @@ test('reported Joan turns retain current slots and finish with a proposal, never
   stub(prisma.booking, 'findFirst', async () => null);
   stub(prisma.payment, 'findFirst', async () => ({ amount: 2000, mpesaReceipt: 'OLD-TEST' }));
   stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(prisma.customerMemory, 'upsert', async () => ({}));
+  stub(prisma.customerMemory, 'updateMany', async () => ({ count: 1 }));
   stub(prisma.customerSessionNote, 'findFirst', async () => notes.at(-1) || null);
   stub(bookingService, 'getAvailableSlots', async () => ['15:00']);
   stub(knowledgeRetrieval, 'search', async () => []);
@@ -411,7 +554,7 @@ test('reported Joan turns retain current slots and finish with a proposal, never
     getPackagePricingLine: async () => 'THE ICON: Ksh 35,000.',
     executeAddNoteTool: async (_customer: string, _date: string, description: string) => { notes.push({ id: 'saved-addon', description }); return { created: true }; },
     executeProposeBookingTool: async (_customer: string, name: string, service: string, date: string) => {
-      proposed++; assert.equal(name, 'Joan Mwangi'); assert.equal(service, 'THE ICON'); assert.equal(date, '2026-10-06T15:00');
+      proposed++; assert.equal(name, proposed === 1 ? 'Joan' : 'Joan Mwangi'); assert.equal(service, 'THE ICON'); assert.equal(date, '2026-10-06T15:00');
       draft = { ...draft, step: 'awaiting_confirmation' }; return { depositAmount: 2000 };
     },
     executeConfirmBookingTool: async () => { assert.fail('this replay must never send a payment prompt'); },
@@ -419,13 +562,14 @@ test('reported Joan turns retain current slots and finish with a proposal, never
   });
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const replies: string[] = [];
-  for (const message of ['I would want the Icon', 'The icon package', '5th at 3pm', 'No its Joan', 'how about 6th at 3pm', 'yess', 'i want the wig styling', 'okay, so is that it?', 'Joan Mwangi']) {
+  for (const message of ['I would want the Icon', 'The icon package', '5th at 3pm', 'No its Joan', 'how about 6th at 3pm', 'yess', 'i want the wig styling']) {
     const reply = await instance.handleMessage('synthetic-run', message, history.slice(-6), 'whatsapp');
     replies.push(reply); history.push({ role: 'user', content: message }, { role: 'assistant', content: reply });
   }
-  assert.equal(draft.service, 'THE ICON'); assert.equal(draft.name, 'Joan Mwangi'); assert.equal(draft.date, '2026-10-06'); assert.equal(draft.time, '15:00');
-  assert.ok(replies.some((reply) => /Monday.*Closed on Mondays/.test(reply)));
-  assert.ok(replies.some((reply) => /full name/.test(reply)));
+  assert.equal(draft.service, 'THE ICON'); assert.equal(draft.name, 'Joan'); assert.equal(draft.date, '2026-10-06'); assert.equal(draft.time, '15:00');
+  assert.ok(replies.some((reply) => /closed on Mondays/.test(reply)));
+  assert.ok(replies.every((reply) => !/full name|\d{4}-\d{2}-\d{2}/.test(reply)), 'a first name is enough and dates are never ISO');
+  assert.match(replies[4], /^3:00 PM on Tuesday, 6 October is available for the Icon edition\. Would you like any optional add-ons/);
   assert.match(replies.at(-1) || '', /the Icon edition.*Tuesday, 6 October 2026.*3:00 PM/);
   assert.match(replies.at(-1) || '', /deposit is Ksh 2,000/);
   assert.equal(proposed, 1);
@@ -446,7 +590,7 @@ test('reported Joan turns retain current slots and finish with a proposal, never
   assert.equal(proposed, 2, 'pending proposals must not be recreated');
 });
 
-test('a repeated usable first name after the proposal name request does not create a name loop', async (context) => {
+test('a first name satisfies the name step, so no full-name question is ever asked', async (context) => {
   context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
   const originals = { draft: prisma.bookingDraft.findUnique, slots: bookingService.getAvailableSlots };
   context.after(() => { prisma.bookingDraft.findUnique = originals.draft; bookingService.getAvailableSlots = originals.slots; });
@@ -456,11 +600,9 @@ test('a repeated usable first name after the proposal name request does not crea
   const instance = withQuietAgent({ getBookingProgressReply: (AgentService.prototype as any).getBookingProgressReply,
     executeProposeBookingTool: async (_customer: string, name: string) => { proposals++; assert.equal(name, 'Joan'); return { depositAmount: 2000 }; },
   });
-  const question = await instance.getBookingProgressReply('first-name-only', 'okay, so is that it?', [], true);
-  assert.match(question, /full name/);
-  const reply = await instance.getBookingProgressReply('first-name-only', 'Joan', [{ role: 'assistant', content: question }], true);
+  const reply = await instance.getBookingProgressReply('first-name-only', 'okay, so is that it?', [], true);
   assert.match(reply, /deposit is Ksh 2,000/);
-  assert.doesNotMatch(reply, /May I have your full name/);
+  assert.doesNotMatch(reply, /name/);
   assert.equal(proposals, 1);
 });
 
@@ -584,8 +726,29 @@ test('verifier escalation cooldown is customer-scoped and expires after ten minu
   assert.equal(notify('customer-a'), true);
   assert.equal(notify('customer-a'), false);
   assert.equal(notify('customer-b'), true);
+  assert.equal(notify('customer-c', 'Are they styled too?'), true);
+  assert.equal(notify('customer-c', 'are they styled too'), false, 'the same question is not escalated twice');
+  assert.equal(notify('customer-c', 'Do you offer lashes?'), true, 'a different question still reaches the team');
   context.mock.timers.tick(VERIFIER_ESCALATION_COOLDOWN_MS);
   assert.equal(notify('customer-a'), true);
+});
+
+test('retired package names, lashes and the budget reply never invent editions or facts', async () => {
+  assert.doesNotMatch(buildPackageBudgetReply(), /ROYAL/);
+  assert.match(legacyPackageReply('Do you have a standard package?') || '', /^We don't have a Standard package\..*THE BLOOM is the entry option/);
+  assert.match(legacyPackageReply('is there a vip session') || '', /VIP package/);
+  assert.equal(legacyPackageReply('when is my standard session?'), null);
+  assert.equal(legacyPackageReply('What packages do you offer?'), null);
+  const escalations: string[] = [];
+  const instance = withQuietAgent({
+    escalate: async (_customer: string, _type: string, description: string) => { escalations.push(description); },
+    runAgent: async () => assert.fail('lashes and retired package names must not reach the model'),
+  });
+  assert.equal(await instance.handleMessage('synthetic-lashes', 'Do you offer eye lashes services in the makeup?', [], 'whatsapp'), LASHES_TEAM_REPLY);
+  assert.equal(escalations.length, 1);
+  assert.match(escalations[0], /owner_fact_question.*lashes/);
+  assert.match(await instance.handleMessage('synthetic-lashes', 'Do you have a standard package?', [], 'whatsapp'), /We don't have a Standard package/);
+  assert.match(VERIFIER_FALLBACK, /passed your question to the studio team.*0720 111928/);
 });
 
 test('output verifier regenerates exactly once and escalates repeated violations', async () => {
@@ -605,6 +768,109 @@ test('output verifier regenerates exactly once and escalates repeated violations
   assert.equal(failed.reply, VERIFIER_FALLBACK);
   const empty = await verifyWithOneRetry('A 30% deposit applies.', facts, async () => '', async (text) => { offending.push(text); });
   assert.equal(empty.reply, VERIFIER_FALLBACK);
+});
+
+test('edition selection matcher accepts one chosen edition and rejects questions, details and negations', () => {
+  for (const [message, edition] of [['give me the Muse package', 'THE MUSE'], ['I want the Icon', 'THE ICON'], ['the Bloom please', 'THE BLOOM'],
+    ["let's go with the Legend edition", 'THE LEGEND'], ['I choose Goddess', 'THE GODDESS'], ['Muse', 'THE MUSE']]) {
+    assert.equal(selectedEdition(message), edition, message);
+  }
+  for (const message of ['tell me about the Muse', 'what does the Muse include?', 'give me the Muse or the Icon', "I don't want the Muse",
+    'Can I have the Muse?', 'give me the packages', 'how much is the Muse']) {
+    assert.equal(selectedEdition(message), null, message);
+  }
+  assert.equal(isPlainGreeting('Hello'), true);
+  assert.equal(isPlainGreeting('Hi there!'), true);
+  assert.equal(isPlainGreeting('Hello, I want the Muse'), false);
+});
+
+test('verifier empty retry uses the intent template without escalation and logs rejected amounts with the allowed set', async (context) => {
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+  context.after(() => { console.warn = originalWarn; });
+  const facts = { amounts: [2000, 25000], deposits: [2000], editions: [] };
+  const escalations: string[] = [];
+  const template = await verifyWithOneRetry('THE MUSE is Ksh 25,000 and the deposit is Ksh 4,500.', facts, async () => '',
+    async (text) => { escalations.push(text); }, async () => 'TEMPLATE');
+  assert.deepEqual(template, { reply: 'TEMPLATE', blocked: false });
+  assert.equal(escalations.length, 0);
+  assert.ok(warnings.some(line => /verifier=blocked reason=unknown_amount,deposit_mismatch rejected_amounts=\[4500\] allowed_amounts=\[2000,25000\] allowed_deposits=\[2000\]/.test(line)), warnings.join('\n'));
+  assert.ok(warnings.some(line => /verifier=template_fallback .*retry=empty.* escalation=none/.test(line)));
+  assert.ok(!warnings.some(line => /empty_regeneration/.test(line)));
+  const reasons: string[][] = [];
+  const untemplated = await verifyWithOneRetry('The deposit is Ksh 4,500.', facts, async () => '',
+    async (text, why) => { escalations.push(text); reasons.push(why); }, async () => null);
+  assert.equal(untemplated.reply, VERIFIER_FALLBACK);
+  assert.equal(escalations.length, 1);
+  assert.match(escalations[0], /"retry":"empty"/);
+  assert.deepEqual(reasons[0], ['unknown_amount', 'deposit_mismatch']);
+});
+
+test('verifier allows stored edition deposits when a local override changes the charged deposit', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Unknown', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(prisma.package, 'findMany', async () => [
+    { name: 'THE BLOOM', price: 15000, deposit: 2000, duration: '1.5 hours' },
+    { name: 'THE MUSE', price: 25000, deposit: 2000, duration: '2 hours' },
+  ]);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  let calls = 0;
+  const instance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent, getPackagePricingLine: async () => '',
+    getDepositForPackage: () => 10,
+    escalate: async () => assert.fail('a correct Muse quote must not escalate'),
+    createCompletionWithToolNameGuard: async () => { calls++; return { provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant', content: 'THE MUSE is Ksh 25,000 and the deposit is Ksh 2,000.' } }], usage: { total_tokens: 3 } } }; },
+  });
+  const result = await instance.runAgent('muse-allowlist', 'Is the Muse good for me', [], 'whatsapp');
+  assert.equal(result.content, 'THE MUSE is Ksh 25,000 and the deposit is Ksh 2,000.');
+  assert.equal(calls, 1);
+});
+
+test('Hello, packages, give me the Muse package: welcome, link, Muse saved with a date question and no escalation', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  const policy = require('./catalog-policy');
+  stub(policy, 'claimCatalogLink', async () => true);
+  // Mirrors the live run: a profile-name draft with no booking slots.
+  const draft: any = { id: 'muse-run', customerId: 'muse-run', step: EARLY_SLOT_STEP, name: 'Miriam', service: null, date: null, time: null, createdAt: new Date(), isForSomeoneElse: false };
+  stub(prisma.bookingDraft, 'findUnique', async () => draft);
+  stub(prisma.bookingDraft, 'create', async () => assert.fail('the existing draft must be updated'));
+  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { Object.assign(draft, data); return { count: 1 }; });
+  stub(prisma.customer, 'findUnique', async () => ({ id: 'muse-run', name: 'WhatsApp User' }));
+  stub(prisma.customer, 'update', async () => assert.fail('no name was stated'));
+  stub(prisma.package, 'findMany', async () => [
+    { name: 'THE BLOOM', price: 15000, deposit: 2000 }, { name: 'THE MUSE', price: 25000, deposit: 2000 }, { name: 'THE ICON', price: 35000, deposit: 2000 },
+  ]);
+  const escalations: string[] = [];
+  const instance = withQuietAgent({
+    rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots,
+    getCatalogBookingQuestion: (AgentService.prototype as any).getCatalogBookingQuestion,
+    runAgent: async () => assert.fail('none of these turns may reach the model'),
+    escalate: async (_customer: string, _type: string, text: string) => { escalations.push(text); },
+  });
+  const history: { role: 'user' | 'assistant'; content: string }[] = [];
+  const turn = async (message: string) => {
+    const reply = await instance.handleMessage('muse-run', message, [...history], 'whatsapp');
+    history.push({ role: 'user', content: message }, { role: 'assistant', content: reply });
+    return reply;
+  };
+  assert.equal(await turn('Hello'), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
+  const catalog = await turn('Could you share the packages i have a look at them?');
+  assert.ok(catalog.includes(OFFICIAL_WEBSITE_URLS.packages));
+  assert.doesNotMatch(catalog, /Ksh/);
+  assert.equal(await turn('give me the Muse package'),
+    `The Muse it is. What date would suit you? You can see everything included here: ${OFFICIAL_WEBSITE_URLS.packages}`);
+  assert.equal(draft.service, 'THE MUSE');
+  assert.equal(escalations.length, 0);
 });
 
 test('real agent output verifier retries once, counts usage and escalates unsafe output', async (context) => {
@@ -880,20 +1146,24 @@ test('quoted extras never render Ksh zero or enter invoice totals', async (conte
   await bookingAddonService.markInvoiced('quoted');
 });
 
-test('generated add-on replies remain recognised by the shared-phrase matcher', async () => {
+test('generated add-on replies remain recognised by the shared-phrase matcher', async (context) => {
   for (const addon of ADDON_CATALOG) {
     const reply = agent.getAddonSelectionReply(addon);
     assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: reply }]), true, addon.sku);
   }
   assert.equal(isAddonListFollowUp('show me', [{ role: 'assistant', content: buildAdditionsReply(2000) }]), true);
   let lists = 0;
+  const policy = require('./catalog-policy');
+  const originalClaim = policy.claimCatalogLink;
+  policy.claimCatalogLink = async () => true;
+  context.after(() => { policy.claimCatalogLink = originalClaim; });
   const instance = withQuietAgent({ naturalAssistantMode: true,
     getAdditionsReply: () => { lists++; return 'ADDON LIST'; },
     executeAddNoteTool: async () => { assert.fail('a list request must not capture'); },
     runAgent: async () => { assert.fail('the extras list must be deterministic'); },
   });
-  assert.equal(await instance.handleMessage('extras-list', 'what extras do you have?', [], 'whatsapp'), 'ADDON LIST');
-  assert.equal(lists, 1);
+  assert.match(await instance.handleMessage('extras-list', 'what extras do you have?', [], 'whatsapp'), /session-packages/);
+  assert.equal(lists, 0);
 });
 
 test('real add-on persistence keeps new-session extras pending without changing the draft or older booking', async (context) => {
@@ -926,10 +1196,19 @@ test('real add-on persistence keeps new-session extras pending without changing 
   assert.ok(rows.every((row) => row.status === 'pending' && row.bookingId === undefined && row.sessionNoteId));
   assert.match(notes.map((note) => note.description).join('\n'), /for my sister/);
   assert.match(reply, /Noted for your session/);
+  const wigReply = await instance.handleMessage('pending-extras', 'I want the wig hire', [{ role: 'assistant', content: ADDON_LINK_REPLY }], 'whatsapp');
+  const wig = rows.find(row => row.sku === 'wig_hire');
+  assert.equal(wig.unitPrice, 4000);
+  assert.equal(wig.totalPrice, 4000);
+  assert.match(wigReply, /Noted for your session/);
   assert.deepEqual(draft, before);
 });
 
 test('money and policy routes are deterministic and rendered copy matches the approval document', async (context) => {
+  const policy = require('./catalog-policy');
+  const originalClaim = policy.claimCatalogLink;
+  policy.claimCatalogLink = async () => false;
+  context.after(() => { policy.claimCatalogLink = originalClaim; });
   const packages = [
     { name: 'THE BLOOM', price: 15000, duration: '1.5 hours', images: 6, outfits: 2, photobook: false, mount: false, balloonBackdrop: false, wig: false },
     { name: 'THE MUSE', price: 25000, duration: '2 hours', images: 12, outfits: 3, photobook: false, mount: false, balloonBackdrop: false, wig: false },
@@ -973,11 +1252,11 @@ test('money and policy routes are deterministic and rendered copy matches the ap
   const icon = await instance.handleMessage('copy-customer', 'What does THE ICON include?', [], 'whatsapp');
   assert.ok(copyReview.includes(icon), 'detail-card approval text must match recorded fields');
   const empress = await instance.handleMessage('copy-customer', 'What does THE EMPRESS include?', [], 'whatsapp');
-  assert.equal(empress, 'The team will confirm the exact inclusions for you.');
+  assert.equal(empress, 'The team will confirm the exact inclusions for you.\nhttps://www.fiestahousematernity.com/session-packages');
   assert.doesNotMatch(empress, /3\.5|25|Power Suit|Reel|photobook|2 styled wigs/i);
   for (const name of Object.keys(SEED_EDITION_INCLUSIONS)) {
     const detail = await instance.getPackageCatalogReply(true, `What does ${name} include?`);
-    for (const item of SEED_EDITION_INCLUSIONS[name].inclusions) assert.ok(detail.includes(item), `${name}: ${item}`);
+    for (const item of SEED_EDITION_INCLUSIONS[name].inclusions.filter(item => name !== 'THE LEGEND' || !/\bwig/i.test(item))) assert.ok(detail.includes(item), `${name}: ${item}`);
     assert.doesNotMatch(detail, /quantity to be confirmed|size to be confirmed|design to be confirmed/);
   }
   assert.deepEqual(differingInclusionFields('THE ICON', { ...packages[2], images: 16 }), ['images']);
@@ -991,7 +1270,7 @@ test('money and policy routes are deterministic and rendered copy matches the ap
   assert.match(await instance.getBookingProcessReply(), /our 3 editions/);
   availablePackages = [];
   const unavailable = await instance.handleMessage('copy-customer', 'what packages do you have', [], 'whatsapp');
-  assert.match(unavailable, /studio team.*current rate card/i);
+  assert.match(unavailable, /session-packages/);
 });
 
 test('edition details fall back to seed inclusions when the column is absent or null', async (context) => {
@@ -1170,6 +1449,8 @@ test('real handleMessage injects persisted slots after six-message trim and a ne
   stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { draft = { ...draft, ...data }; return { count: 1 }; });
   stub(prisma.customerMemory, 'findUnique', async () => null);
   stub(prisma.booking, 'findFirst', async () => null);
+  // "interested in the Bloom package" is now a deterministic edition selection.
+  stub(prisma.package, 'findMany', async () => [{ name: 'THE BLOOM', price: 15000, deposit: 2000, duration: '1.5 hours' }]);
   stub(knowledgeRetrieval, 'search', async () => []);
   const prompts: string[] = [];
   const replies: string[] = [];
@@ -1314,8 +1595,9 @@ test('calendar tools use stored packages and code-owned next-week and weekday re
     },
   });
   const rangeReply = await instance.handleMessage('calendar-customer', 'Which dates are available next week?', [], 'whatsapp');
-  assert.match(rangeReply, /THE BLOOM/);
-  assert.match(rangeReply, /Tuesday, 2026-10-06/);
+  assert.match(rangeReply, /the Bloom edition/);
+  assert.match(rangeReply, /Tuesday, 6 October: /);
+  assert.doesNotMatch(rangeReply, /\d{4}-\d{2}-\d{2}/);
   assert.doesNotMatch(rangeReply, /2025|THE MUSE|your name|package\?/);
   assert.deepEqual(queries, []);
   assert.equal(rangeLookups, 1);
@@ -1325,17 +1607,16 @@ test('calendar tools use stored packages and code-owned next-week and weekday re
   assert.equal(result.toDate, '2026-10-11');
   assert.equal(result.service, 'THE BLOOM');
   assert.equal(result.dates.some((entry: any) => entry.date === '2026-10-07'), false);
-  assert.equal(instance.getWeekdayReply('What day is 6 October 2026?', []), '2026-10-06 is Tuesday.');
+  assert.equal(instance.getWeekdayReply('What day is 6 October 2026?', []), '6 October 2026 is a Tuesday.');
   assert.equal(resolveCalendarDate('6 October 2025'), '2025-10-06');
   assert.equal(instance.getAuthoritativeRequestedDate('2025-10-06', '2026-10-06', '2025-10-06'), '2025-10-06');
   const dateReply = await instance.handleMessage('calendar-customer', '6th October, 10am', [], 'whatsapp');
-  assert.match(dateReply, /2026-10-06 is Tuesday/);
-  assert.match(dateReply, /10:00 AM is available/);
-  assert.doesNotMatch(dateReply, /Monday|closed|your name|package\?/);
+  assert.match(dateReply, /^10:00 AM on Tuesday, 6 October is available/);
+  assert.doesNotMatch(dateReply, /Monday|closed|your name|package\?|2026-/);
   assert.equal(draft.date, '2026-10-06');
   assert.equal(draft.time, '10:00');
   const mondayReply = await instance.handleMessage('calendar-customer', '5th October, 10am', [], 'whatsapp');
-  assert.match(mondayReply, /2026-10-05 is Monday.*Closed on Mondays/);
+  assert.equal(mondayReply, 'We are closed on Mondays, so Monday, 5 October is not available. Which other date would work for you?');
   const before = queries.length;
   const completionsBeforeUnknown = exposed.length;
   draft = { ...draft, service: null };
@@ -1446,6 +1727,7 @@ function withQuietAgent(overrides: Record<string, unknown>) {
   Object.assign(instance, {
     rememberBookingSlots: async () => null,
     getBookingProgressReply: async () => null,
+    getCatalogBookingQuestion: async () => null,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
     logAiJobMetric: async () => {},
@@ -1917,7 +2199,7 @@ test('an unrelated turn clears a pending cancellation before a later yes', async
     assert.match(proposal, /If you want me to cancel this booking, reply yes to confirm/);
     assert.equal(draft.step, 'cancel_confirm');
 
-    const afterUnrelated = await instance.handleMessage('customer-1', 'how much is the empress?', [
+    const afterUnrelated = await instance.handleMessage('customer-1', 'what are the studio hours?', [
       { role: 'user', content: 'cancel' },
       { role: 'assistant', content: proposal },
     ], 'whatsapp');
@@ -1925,7 +2207,7 @@ test('an unrelated turn clears a pending cancellation before a later yes', async
     assert.match(afterUnrelated, /studio hours/);
 
     await instance.handleMessage('customer-1', 'yes', [
-      { role: 'user', content: 'how much is the empress?' },
+      { role: 'user', content: 'what are the studio hours?' },
       { role: 'assistant', content: afterUnrelated },
     ], 'whatsapp');
     assert.equal(cancellations, 0);
