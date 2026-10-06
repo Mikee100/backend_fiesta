@@ -51,7 +51,7 @@ import {
   buildPackageBudgetReply,
   legacyPackageReply,
   isLashesQuestion,
-  LASHES_TEAM_REPLY,
+  LASHES_FAQ_REPLY,
   buildPortfolioReply,
   buildPostShootProcessReply,
   buildRawFilesReply,
@@ -690,15 +690,8 @@ export class AgentService {
     return legacyPackageReply(userMessage);
   }
 
-  /** Lashes are not in any confirmed edition data, so the question goes to the team rather than the model. */
-  private async getLashesReply(customerId: string, userMessage: string): Promise<string> {
-    if (this.shouldEscalateVerifier(customerId, userMessage)) {
-      await this.escalate(customerId, 'booking', JSON.stringify({
-        event: 'owner_fact_question', topic: 'lashes', customerMessage: userMessage.slice(0, 2000),
-        note: 'Lashes are not in confirmed edition data. Reply to the customer once the owner confirms.',
-      }));
-    }
-    return LASHES_TEAM_REPLY;
+  private getLashesReply(): string {
+    return LASHES_FAQ_REPLY;
   }
 
   private shouldClarifyMixedIntent(userMessage: string): boolean {
@@ -2689,11 +2682,8 @@ ${contextString}`;
   ): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
     if (!/^(sure|yes|yeah|yep|okay|ok)$/.test(normalized)) return false;
-
-    return history
-      .filter((message) => message.role === 'assistant')
-      .slice(-3)
-      .some((message) => /original session date and time|booking remains unchanged|deposit is still held/i.test(message.content));
+    const lastAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /^(?:understood[.!]?\s*)?we(?:'ll| will) keep your original session date and time\b|^yes\.\s*your original session date and time are still booked\b/i.test(lastAssistantMessage.trim());
   }
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {

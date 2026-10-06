@@ -114,7 +114,7 @@ const turns: Turn[] = [
   },
   {
     message: 'Is the makeup inclusive of lashes?',
-    modelReply: 'The standard makeup package does not include lashes. Lashes are KSh 500 extra.',
+    modelReply: 'Lashes are included in all our makeup services, including every package. The extra professional makeup add-on also includes lashes.',
   },
   {
     message: 'Please continue.',

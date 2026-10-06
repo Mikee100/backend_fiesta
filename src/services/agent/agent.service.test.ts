@@ -258,6 +258,10 @@ test('only applies confirmation after the assistant presented a proposal', () =>
     role: 'assistant',
     content: 'What time on Sunday, September 11 would you like to schedule the session?'
   }]), false);
+  assert.equal(agent.previousMessageRequestsConfirmation([{
+    role: 'assistant',
+    content: "To make sure I have this exactly right for you, could you please confirm that you'd like to reschedule your Goddess session to Sunday, October 11th at 2:00 PM?"
+  }]), true);
 });
 
 test('ignores duplicate yes replies after a payment prompt has already been sent', async () => {
@@ -832,6 +836,12 @@ test('confirms the original booking after a withdrawal follow-up', () => {
 
   assert.equal(agent.shouldConfirmRescheduleWithdrawal('Sure?', history), true);
   assert.equal(agent.shouldConfirmRescheduleWithdrawal('What time is it?', history), false);
+  const rescheduleConfirmation = [
+    { role: 'assistant' as const, content: 'Your current booking remains unchanged until you confirm a proposed change.' },
+    { role: 'user' as const, content: 'Lets go with 2:00 PM.' },
+    { role: 'assistant' as const, content: "Could you please confirm that you'd like to reschedule your Goddess session to Sunday at 2:00 PM?" },
+  ];
+  assert.equal(agent.shouldConfirmRescheduleWithdrawal('yes', rescheduleConfirmation), false);
 });
 
 test('returns reschedule confirmation without waiting for Google Calendar', { timeout: 1000 }, async () => {
@@ -874,7 +884,7 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
 
   try {
     const reply = await agent.tryImmediateConfirmation('customer-123', 'yes', [{
-      role: 'assistant', content: 'If that works for you, reply yes and I will confirm it.',
+      role: 'assistant', content: "To make sure I have this exactly right for you, could you please confirm that you'd like to move your session to Sunday, October 11th at 2:00 PM?",
     }]);
 
     assert.match(reply, /session has been moved/i);

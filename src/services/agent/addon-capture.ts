@@ -1,5 +1,4 @@
 import { ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
-import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { ADDON_MAKEUP_CLARIFICATION, ADDON_MULTI_CLARIFICATION, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { normalizeQuotes } from './regex';
 import { stripAssistantEmojis } from './emoji-policy';
@@ -36,7 +35,8 @@ export function selectedAddons(message: string, history: Message[] = []): AddonC
   if (isAddonInquiry(message)) return [];
   const text = message.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
-  if (!declined(text) && lastAssistant.includes(ADDON_MAKEUP_CLARIFICATION) && addonRecipient(text, 'extra_makeup')) {
+  if (lastAssistant.includes(ADDON_MAKEUP_CLARIFICATION)
+    && ((!declined(text) && addonRecipient(text, 'extra_makeup')) || isExplicitSelfMakeupAnswer(text))) {
     return ADDON_CATALOG.filter((item) => item.sku === 'extra_makeup');
   }
   const clauses = choiceClauses(text);
@@ -60,18 +60,10 @@ export function addonRecipient(message: string, sku: string): string | null {
   return clause.match(/\bfor\s+(?:my\s+)?(?:another person|sister|brother|mother|father|partner|husband|wife|friend)\b/i)?.[0] || null;
 }
 
-/** "No, it's for me" after the extra-makeup question: makeup is already part of the customer's own session. */
-export function isMakeupForSelf(message: string, history: Message[] = []): boolean {
-  history = stripAssistantEmojis(history);
-  const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
-  if (!lastAssistant.includes(ADDON_MAKEUP_CLARIFICATION) || addonRecipient(message, 'extra_makeup')) return false;
-  return /^\s*(?:no+|nope|nah)\b|\bfor me\b|\bmyself\b|\bjust me\b|\bit'?s mine\b/i.test(normalizeQuotes(message));
-}
-
-export function makeupIncludedReply(service: string | null | undefined, editionName: string | null): string {
-  const extra = 'Extra makeup is for another person, such as your sister.';
-  if (service && !SEED_EDITION_INCLUSIONS[service]?.makeup) return `The team will confirm the makeup included in your ${editionName} session. ${extra}`;
-  return `Professional makeup is already included in your ${editionName ? `${editionName} ` : ''}session, so there's nothing to add for you. ${extra}`;
+export function isExplicitSelfMakeupAnswer(message: string): boolean {
+  const text = normalizeQuotes(message);
+  if (/\b(?:don't|dont|do not|no thanks|skip|cancel|not for me)\b/i.test(text)) return false;
+  return /\bfor\s+(?:me|myself)\b|\b(?:it's|it is)\s+mine\b|\bmy\s+session\b/i.test(text);
 }
 
 /** "Show me the add ons": a request to see the extras, not a choice of one. */
@@ -85,7 +77,8 @@ export function addonSelectionClarification(message: string, history: Message[] 
   history = stripAssistantEmojis(history);
   if (isAddonInquiry(message)) return null;
   const choices = selectedAddons(message, history);
-  if (choices.some((item) => item.sku === 'extra_makeup') && !addonRecipient(message, 'extra_makeup')) return ADDON_MAKEUP_CLARIFICATION;
+  if (choices.some((item) => item.sku === 'extra_makeup')
+    && !addonRecipient(message, 'extra_makeup') && !isExplicitSelfMakeupAnswer(message)) return ADDON_MAKEUP_CLARIFICATION;
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
   if (/^(?:yes+|yeah|yep|sure|ok|okay)[.! ]*$/i.test(message.trim())
     && ADDON_CATALOG.filter((item) => item.match.test(lastAssistant)).length > 1) return ADDON_MULTI_CLARIFICATION;
@@ -111,6 +104,9 @@ export function addonInquiryReply(message: string): string | null {
   if (!isAddonInquiry(message)) return null;
   const addons = ADDON_CATALOG.filter((item) => item.match.test(message));
   if (!addons.length) return null;
+  if (addons.length === 1 && addons[0].sku === 'extra_makeup') {
+    return `Extra professional makeup is Ksh ${addons[0].unitPrice.toLocaleString()} per session and includes lashes. Professional makeup is included in all packages; this add-on can be noted for you or someone joining your session. Would you like to add it for yourself or someone else?`;
+  }
   const details = addons.map((item) => `${item.name}: ${item.unitPrice > 0 ? `Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}` : ADDON_QUOTED_PRICE_LABEL}.`).join('\n');
   return `${details}\n${addons.length === 1 ? 'Would you like to add it to your session?' : 'Which of these would you like to add to your session?'}`;
 }

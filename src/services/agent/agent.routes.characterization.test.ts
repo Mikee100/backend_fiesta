@@ -116,6 +116,7 @@ function routeOf(reply: string): string {
   if (/^You may bring one outfit/.test(reply)) return 'personalOutfit';
   if (/^Basic hair styling is included/.test(reply)) return 'hairWigClarification';
   if (/^The express delivery fee is not listed/.test(reply)) return 'expressDeliveryFee';
+  if (/^Extra professional makeup is Ksh /.test(reply)) return 'addonInquiry';
   if (/^Rescheduling: Changes within 72 hours/.test(reply)) return 'bookingPolicyInformation';
   if (reply.startsWith('ROUTE:')) return reply.split('\n')[0].slice('ROUTE:'.length);
   if (/^Yes\. Your original session date and time are still booked/.test(reply)) return 'rescheduleWithdrawalConfirmation';
@@ -163,6 +164,7 @@ const CASES: Case[] = [
   { message: 'Jane Wanjiku', history: [assistant('Is the session just for your sister, or would you both like to be photographed together?')], expected: 'recipientName' },
   { message: 'Is the 10k deposit refundable?', expected: 'ambiguousDeposit' },
   { message: 'ok', history: [assistant('Understood! We will keep your original session date and time, and your booking remains unchanged.')], expected: 'rescheduleWithdrawalConfirmation', note: 'beats postActionAcknowledgement' },
+  { message: 'yes', history: [assistant('Your current booking remains unchanged until you confirm a proposed change.'), assistant("Could you please confirm that you'd like to reschedule your Goddess session to Sunday at 2:00 PM?")], expected: 'immediateConfirmation', note: 'latest reschedule proposal confirmation wins over stale unchanged-booking wording' },
   { message: 'thanks', expected: 'postActionAcknowledgement' },
   { message: 'What is the rescheduling and cancellation policy?', expected: 'bookingPolicyInformation' },
   { message: 'So whats my name? Do you know it?', expected: 'customerName' },
@@ -223,6 +225,8 @@ const CASES: Case[] = [
   { message: 'I want to add another one', history: [assistant('Noted: Extra outfit beyond package (Ksh 4,000 each). The add-on goes on the balance.')], expected: 'clarifyNewAddon' },
   { message: 'show me', history: [ADDON_OFFER], expected: 'addonListFollowUp' },
   { message: 'i would want 2 of them then', history: [EXTRA_OUTFIT_EXPLAINED], expected: 'selectedAddon' },
+  { message: 'In the add-ons I saw extra professional makeup..tell me about that..what does it entail', expected: 'addonInquiry' },
+  { message: 'How much is extra makeup?', expected: 'addonInquiry' },
   { message: 'add an extra professional make-up for me', expected: 'selectedAddon' },
   { message: 'What add-ons do you have?', expected: 'additions' },
   { message: 'what extras do you have?', expected: 'additions' },
@@ -353,11 +357,11 @@ test('message route order remains unchanged', () => {
     'expressDeliveryFee',
     'previousAddon',
     'clarifyNewAddon',
-    'makeupForSelf',
     'addonRequest',
     'addonListFollowUp',
     'personalOutfit',
     'hairWigClarification',
+    'addonInquiry',
     'selectedAddon',
     'additions',
     'bespoke',

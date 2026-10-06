@@ -115,7 +115,7 @@ export function previousMessageRequestsConfirmation(
 ): boolean {
   history = stripAssistantEmojis(history);
   const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
+  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm|(?:could\s+you\s+please\s+)?confirm\s+(?:that\s+)?you(?:['’]d|\s+would)\s+like\s+to\s+(?:reschedule|move|change)\b[\s\S]{0,160}\bto\b)/.test(previousAssistantMessage);
 }
 
 export function isPackageBudgetRequest(userMessage: string): boolean {
@@ -138,7 +138,7 @@ export function legacyPackageReply(message: string): string | null {
   return `We don't have a ${name} package. Our editions run from THE BLOOM to THE GODDESS, and THE BLOOM is the entry option. Would you like its details, or the full rate card?`;
 }
 
-export const LASHES_TEAM_REPLY = "Our edition details don't list lashes, so I've passed your question to the studio team to confirm. You can also reach them on 0720 111928.";
+export const LASHES_FAQ_REPLY = 'Yes. Lashes are included in all our makeup services, including every package. The extra professional makeup add-on also includes lashes.';
 
 export function isLashesQuestion(message: string): boolean {
   return /\b(?:eye)?lash(?:es)?\b/i.test(message);

@@ -10,8 +10,7 @@ import {
   shouldNotifyOutage,
 } from './resilience.service';
 import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
-import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest, isMakeupForSelf, makeupIncludedReply } from './addon-capture';
-import { editionShortName } from './booking-progress';
+import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { isCustomerNameQuestion, needsUnchangedReassurance } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
@@ -253,7 +252,7 @@ export function createMessageRoutes(
       name: 'lashes',
       replyMode: 'deterministic',
       when: () => isLashesQuestion(userMessage),
-      handle: async () => this.getLashesReply(customerId, userMessage),
+      handle: () => this.getLashesReply(),
     },
     {
       name: 'legacyPackageName',
@@ -353,17 +352,6 @@ export function createMessageRoutes(
       handle: () => 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.',
     },
     {
-      name: 'makeupForSelf',
-      replyMode: 'deterministic',
-      when: () => isMakeupForSelf(userMessage, history),
-      handle: async () => {
-        const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-        const reply = makeupIncludedReply(draft?.service, draft?.service ? editionShortName(draft.service) : null);
-        const next = await this.getBookingProgressReply(customerId, userMessage, history, false, true);
-        return next ? `${reply}\n${next}` : reply;
-      },
-    },
-    {
       name: 'addonRequest',
       replyMode: 'deterministic',
       when: () => isAddonListRequest(userMessage),
@@ -388,11 +376,19 @@ export function createMessageRoutes(
       handle: () => buildHairWigClarificationReply(),
     },
     {
-      name: 'selectedAddon',
-      when: () => Boolean(addonInquiryReply(userMessage) || addonSelectionClarification(userMessage, history) || this.getSelectedAddon(userMessage, history)),
+      name: 'addonInquiry',
+      replyMode: 'deterministic',
+      when: () => Boolean(addonInquiryReply(userMessage)),
       handle: async () => {
         const inquiry = addonInquiryReply(userMessage);
         if (inquiry) return `${inquiry}\n${OFFICIAL_WEBSITE_URLS.packages}`;
+        return null;
+      },
+    },
+    {
+      name: 'selectedAddon',
+      when: () => Boolean(addonSelectionClarification(userMessage, history) || this.getSelectedAddon(userMessage, history)),
+      handle: async () => {
         const clarification = addonSelectionClarification(userMessage, history);
         if (clarification) return clarification;
         const choices = this.getSelectedAddons(userMessage, history);

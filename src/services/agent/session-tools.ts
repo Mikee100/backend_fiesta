@@ -3,7 +3,7 @@ import prisma from '../../config/prisma';
 import { ADDON_CATALOG } from '../../config/constants';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { notifyAdmin } from '../notifications/notification.service';
-import { addonQuantity, addonRecipient, isAdditionalAddonRequest, isAddonInquiry, selectedAddons } from './addon-capture';
+import { addonQuantity, addonRecipient, isAdditionalAddonRequest, isAddonInquiry, isExplicitSelfMakeupAnswer, selectedAddons } from './addon-capture';
 
 export function extractSessionNoteMetadata(note: string, type?: string, category?: string, priority?: string): {
   normalizedType: string;
@@ -144,7 +144,9 @@ export async function executeAddNoteTool(
   const noteAddons = ADDON_CATALOG.filter((item) => item.match.test(rawNote));
   const sourceHasAddons = ADDON_CATALOG.some((item) => item.match.test(sourceMessage || ''));
   const approved = approvedAddonSkus || selectedAddons(sourceMessage || rawNote).map((item) => item.sku);
-  if (noteAddons.some((item) => item.sku === 'extra_makeup') && !addonRecipient(sourceMessage || rawNote, 'extra_makeup')) {
+  const selfMakeupApproved = approvedAddonSkus?.includes('extra_makeup') && isExplicitSelfMakeupAnswer(sourceMessage || '');
+  if (noteAddons.some((item) => item.sku === 'extra_makeup')
+    && !addonRecipient(sourceMessage || rawNote, 'extra_makeup') && !selfMakeupApproved) {
     return { created: false, reason: 'addon_recipient_requires_confirmation' };
   }
   if ((noteAddons.length || metadata.category === 'addon' || sourceHasAddons) && isAddonInquiry(sourceMessage || rawNote)) {

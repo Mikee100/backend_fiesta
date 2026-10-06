@@ -19,12 +19,13 @@ import { googleCalendarService } from '../calendar/calendar.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
-import { addonQuantity, addonSelectionClarification, isMakeupForSelf, selectedAddons } from './addon-capture';
+import { addonInquiryReply, addonQuantity, addonSelectionClarification, isExplicitSelfMakeupAnswer, selectedAddons } from './addon-capture';
+import { ADDON_MAKEUP_CLARIFICATION } from './constants';
 import { catalogLinkFollowUp } from './catalog-policy';
 import { wasUpcomingAppointmentDetailsJustProvided, isPastAppointmentFollowUp } from './appointment-replies';
 import { buildAdditionsReply, isAddonListFollowUp, formatCustomerTime } from './replies';
 import { shouldUseBookingStatusReply, getBookingStatusReply, isConfirmedSessionFollowUp } from './appointment-replies';
-import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply, buildPackageBudgetReply, legacyPackageReply, LASHES_TEAM_REPLY } from './replies';
+import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply, buildPackageBudgetReply, legacyPackageReply, LASHES_FAQ_REPLY } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
 import { DAILY_TOKEN_CAP } from './resilience.service';
 import { BUDGET_HANDOFF_REPLY } from './constants';
@@ -160,7 +161,8 @@ test('emoji-bearing templates preserve confirmation, addon, reschedule and catal
   assert.equal(catalogLinkFollowUp('list them here', withEmoji(ADDON_LINK_REPLY)), true);
   assert.deepEqual(selectedAddons('yes', withEmoji('Would you like to add styled wig hire?')).map(value => value.sku), ['wig_hire']);
   assert.ok(addonSelectionClarification('yes', withEmoji('Would you like extra makeup or styled wig hire?')));
-  assert.equal(isMakeupForSelf('for me', withEmoji('Is the extra makeup for another person?')), true);
+  assert.equal(isExplicitSelfMakeupAnswer('for me'), true);
+  assert.equal(isExplicitSelfMakeupAnswer("No, I don't want it for me"), false);
   const past = withEmoji('The most recent past booking I have on record is THE MUSE.');
   assert.equal(isPastAppointmentFollowUp('yes', past), isPastAppointmentFollowUp('yes', stripAssistantEmojis(past)));
   const appointment = [{ role: 'user' as const, content: 'Tell me about my upcoming session' }, ...withEmoji('Your Muse session is confirmed.')];
@@ -1170,7 +1172,7 @@ test('verifier escalation cooldown is customer-scoped and expires after ten minu
   assert.equal(notify('customer-a'), true);
 });
 
-test('retired package names, lashes and the budget reply never invent editions or facts', async () => {
+test('retired package names, the lashes FAQ and the budget reply use approved facts', async () => {
   assert.doesNotMatch(buildPackageBudgetReply(), /ROYAL/);
   assert.match(legacyPackageReply('Do you have a standard package?') || '', /^We don't have a Standard package\..*THE BLOOM is the entry option/);
   assert.match(legacyPackageReply('is there a vip session') || '', /VIP package/);
@@ -1181,9 +1183,10 @@ test('retired package names, lashes and the budget reply never invent editions o
     escalate: async (_customer: string, _type: string, description: string) => { escalations.push(description); },
     runAgent: async () => assert.fail('lashes and retired package names must not reach the model'),
   });
-  assert.equal(await instance.handleMessage('synthetic-lashes', 'Do you offer eye lashes services in the makeup?', [], 'whatsapp'), LASHES_TEAM_REPLY);
-  assert.equal(escalations.length, 1);
-  assert.match(escalations[0], /owner_fact_question.*lashes/);
+  assert.equal(await instance.handleMessage('synthetic-lashes', 'Do you offer eye lashes services in the makeup?', [], 'whatsapp'), LASHES_FAQ_REPLY);
+  assert.equal(escalations.length, 0);
+  assert.match(LASHES_FAQ_REPLY, /included in all our makeup services/);
+  assert.match(LASHES_FAQ_REPLY, /extra professional makeup add-on also includes lashes/);
   assert.match(await instance.handleMessage('synthetic-lashes', 'Do you have a standard package?', [], 'whatsapp'), /We don't have a Standard package/);
   assert.match(VERIFIER_FALLBACK, /passed your question to the studio team.*0720 111928/);
 });
@@ -1459,8 +1462,19 @@ test('add-on consent rejects questions and scopes quantities to each explicit ch
   });
 });
 
+test('extra-makeup inquiries explain the add-on without implying it was selected', () => {
+  const reply = addonInquiryReply('In the add-ons I saw extra professional makeup..tell me about that..what does it entail');
+  assert.ok(reply);
+  assert.match(reply, /Ksh 3,500 per session/);
+  assert.match(reply, /included in all packages/);
+  assert.match(reply, /for you or someone joining your session/);
+  assert.match(reply, /includes lashes/);
+  assert.match(reply, /add it for yourself or someone else/);
+  assert.equal(selectedAddons('In the add-ons I saw extra professional makeup..tell me about that..what does it entail').length, 0);
+});
+
 test('negated extras never save and mixed negation selects only the wanted outfit', async (context) => {
-  assert.equal(addonSelectionClarification('I want extra makeup'), 'Is the extra makeup for another person?');
+  assert.equal(addonSelectionClarification('I want extra makeup'), ADDON_MAKEUP_CLARIFICATION);
   assert.match(addonSelectionClarification('yes', [{ role: 'assistant', content: 'Would you like extra makeup or styled wig hire?' }]) || '', /Which add-on/);
   const original = prisma.customerSessionNote.findFirst;
   (prisma.customerSessionNote.findFirst as any) = async () => { assert.fail('negation must stop before storage'); };
@@ -1522,7 +1536,7 @@ test('single versus multi offers and makeup recipients require unambiguous conse
   assert.match(multi, /Which add-on/);
   assert.equal(notes.length, 0);
   const question = await instance.handleMessage('offer', 'I want extra makeup', [], 'whatsapp');
-  assert.equal(question, 'Is the extra makeup for another person?');
+  assert.equal(question, ADDON_MAKEUP_CLARIFICATION);
   assert.equal(notes.length, 0);
   await instance.handleMessage('offer', 'For my sister', [{ role: 'assistant', content: question }], 'whatsapp');
   assert.equal(notes.length, 1);
