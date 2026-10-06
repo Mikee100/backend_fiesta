@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "source": "User-reported WhatsApp incidents on 2026-10-06; no live database inspection",
+  "clock": "2026-10-06T06:00:00.000Z",
+  "historyLimit": 6,
+  "customerId": "synthetic-workflow-baseline",
+  "storedName": "Synthetic Customer",
+  "storedNameEvidence": "Synthetic test seed, not a verified live profile value",
+  "confirmedBooking": {
+    "id": "synthetic-confirmed-muse",
+    "service": "THE MUSE",
+    "dateTime": "2026-10-09T11:00:00.000Z",
+    "status": "confirmed",
+    "depositPaid": 2000
+  },
+  "incidents": [
+    {
+      "id": "paid-session-addon-invoice",
+      "initialContext": "Confirmed Muse booking with a successful deposit; no active new-booking request",
+      "turns": [
+        { "message": "Can we add something to the session?", "observedReply": "Sure! What would you like to add to your session?", "requiredOutcome": "Discuss extras for the confirmed booking without starting another booking" },
+        { "message": "What are these add-ons?", "observedReply": "All the optional extras and their prices are here: https://www.fiestahousematernity.com/session-packages\nTell me which you would like for your session.", "requiredOutcome": "Show the approved catalog link without changing booking state" },
+        { "message": "I want we include the fiesta house power suit", "observedReply": "Noted for your session: Fiesta House Power Suit (Ksh 10,000). It will be added to the session balance, not the deposit.", "requiredOutcome": "Save one Power Suit against the existing booking without changing the deposit" },
+        { "message": "Okay...is that it?", "observedReply": "Great! The Power Suit will be added to your session balance.\nCould you share your name, the package you'd like, and a preferred date and time for the shoot?", "requiredOutcome": "Summarize the confirmed session and saved extra without collecting known details" },
+        { "message": "Send me the invoice", "observedReply": "Which package would you like for your session?", "requiredOutcome": "Refresh the existing invoice: total 35000, paid 2000, balance 33000; do not capture a name or create a draft" }
+      ]
+    },
+    {
+      "id": "identity-and-addon-recall",
+      "initialContext": "Synthetic durable customer name and a Power Suit linked to the confirmed Muse booking",
+      "turns": [
+        { "message": "have you added the add-on", "observedReply": "Yes, these optional additions are available: ... Nothing has been added yet.", "observedReplyIsExcerpt": true, "requiredOutcome": "Read saved extras, not the catalog; do not claim absence without checking" },
+        { "message": "So whats my name? Do you know it?", "observedReply": "I'm happy to help. Could you please share your full name so we can address you correctly?", "requiredOutcome": "Return the synthetic durable customer name, not a recipient name or another collection question" }
+      ]
+    },
+    {
+      "id": "initial-reschedule-rejected-date",
+      "initialContext": "Confirmed Muse booking; no active new-booking request",
+      "turns": [
+        { "message": "thats nice can we kindly reschedule it to some other date...i will be busy that Friday", "observedReply": "Which package would you like for your session?", "requiredOutcome": "Bind a reschedule operation to the confirmed booking and ask for a replacement date/time; Friday is rejected, not selected" }
+      ]
+    },
+    {
+      "id": "blocked-reschedule-typo-recovery",
+      "initialContext": "Confirmed Muse booking with Power Suit; conflicting draft exists but its live contents are unverified",
+      "syntheticConflict": { "step": "collecting_slots", "service": null, "date": "2026-10-09", "time": null },
+      "syntheticConflictEvidence": "Hypothesis fixture for reproducing a stale collection conflict, not a live row readback",
+      "turns": [
+        { "message": "can we reschedule my upcoming session", "observedReply": "I have not changed your current request or your session. The studio team can help resolve the existing step before rescheduling.", "requiredOutcome": "Explain the conflict with an actionable recovery path; do not overwrite the draft" },
+        { "message": "i dont understand", "observedReply": "Sure! What new date and time would you like to move your session to?", "requiredOutcome": "Remain blocked until the conflict is resolved; the model must not falsely resume rescheduling" },
+        { "message": "is there any free slots on the 10th?", "observedReply": "What time on Saturday, 10 October would you like for your session for the Muse edition?", "requiredOutcome": "If the operation is valid, query and show availability for the stored Muse booking; otherwise explain the unresolved conflict consistently" },
+        { "message": "1oam", "observedReply": "I'm sorry, I wasn't able to check the availability for you right now. Could you please tell me again what date and time you're looking for?", "requiredOutcome": "Clarify whether 10am was intended without losing the operation or selected date; do not rely on a provider to recover state" },
+        { "message": "on 10th at 10am", "observedReply": "Which package would you like for your session?", "requiredOutcome": "Continue the valid booking-bound operation or explain its block; never restart package collection" }
+      ]
+    }
+  ]
+}

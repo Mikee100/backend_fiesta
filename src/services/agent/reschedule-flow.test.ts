@@ -8,6 +8,7 @@ import { invoiceService } from '../invoice/invoice.service';
 import { inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { AgentService } from './agent.service';
 import { extractStatedSlots, isUsableName } from './slot-memory';
+import { ConversationFlowMatcher, isBookingPolicyQuestion, rescheduleTargetText } from './conversation-flow.matcher';
 
 const CUSTOMER = 'synthetic-joan';
 type Msg = { role: 'user' | 'assistant'; content: string };
@@ -31,10 +32,13 @@ function harness(context: any, daysAhead: number) {
     slots: ['10:00', '15:00', '17:00'] as string[] | { status: string; reason: string },
     slotQueries: [] as { date: string; excludeBookingId?: string }[],
     deleted: [] as any[],
+    availableBookings: null as any[] | null,
+    bookingQueries: [] as any[],
   };
   const bookingDay = start.format('YYYY-MM-DD');
 
-  stub(prisma.booking, 'findFirst', async () => ({ ...state.booking }));
+  stub(prisma.booking, 'findFirst', async ({ where }: any) => { state.bookingQueries.push(where); return { ...state.booking }; });
+  stub(prisma.booking, 'findMany', async () => state.availableBookings ?? [{ ...state.booking }]);
   stub(prisma.booking, 'findUnique', async () => ({ ...state.booking }));
   stub(prisma.booking, 'update', async ({ data }: any) => { state.bookingUpdates.push(data); Object.assign(state.booking, data); return { ...state.booking }; });
   stub(prisma.booking, 'create', async () => { state.bookingsCreated++; return {}; });
@@ -85,6 +89,153 @@ function harness(context: any, daysAhead: number) {
   return { state, say, bookingDay };
 }
 
+test('policy enquiries remain informational even when a draft blocks rescheduling', async (context) => {
+  const { state, say } = harness(context, 10);
+  for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending', 'reschedule_collecting']) {
+    state.draft = { id: 'policy-conflict', step, service: 'THE MUSE', date: '2026-10-10', time: '10:00', name: 'Maryanne' };
+    const before = { ...state.draft };
+    for (const message of ['What is the rescheduling and cancellation policy?', 'What is your rescheduling policy?',
+      'Please explain the cancellation rules', 'What is the rescheduling policy for 10th October?']) {
+      const reply = await say(message);
+      assert.match(reply, /Rescheduling:.*72 hours[\s\S]*Cancellation:/);
+      assert.match(reply, /No booking change or cancellation has been made/);
+      assert.doesNotMatch(reply, /resolve the existing step|which package|which new date/i);
+      assert.deepEqual(state.draft, before);
+    }
+  }
+  assert.equal(state.createdSteps.length, 0);
+  assert.equal(state.deleted.length, 0);
+  assert.equal(state.slotQueries.length, 0);
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.equal(state.calendarUpdates, 0);
+});
+
+test('policy matching distinguishes information from actual reschedule intent', () => {
+  const flows = new ConversationFlowMatcher();
+  for (const text of ['What is the rescheduling and cancellation policy?', 'Tell me the refund terms', 'How much notice is needed for rescheduling?']) {
+    assert.equal(isBookingPolicyQuestion(text), true);
+    assert.equal(flows.isInitialRescheduleRequest(text), false);
+  }
+  for (const text of ['i want we reschedule it', 'can we reschedule the session to another time', 'Please move my appointment to Saturday']) {
+    assert.equal(isBookingPolicyQuestion(text), false);
+    assert.equal(flows.isInitialRescheduleRequest(text), true);
+  }
+});
+
+test('blocked rescheduling explains the saved draft without assuming it is a genuine separate booking', async (context) => {
+  const { state, say } = harness(context, 10);
+  for (const [step, phrase] of [['collecting_slots', /Unfinished booking details/], ['awaiting_confirmation', /saved booking proposal/],
+    ['payment_pending', /payment status must be checked/]] as const) {
+    state.draft = { id: 'existing-draft', step, service: 'THE MUSE', date: '2026-10-10', time: '10:00' };
+    const before = { ...state.draft };
+    const reply = await say('i want we reschedule it');
+    assert.match(reply, phrase);
+    assert.match(reply, /0720 111928/);
+    assert.match(reply, /No session has been moved or cancelled by this request/);
+    assert.doesNotMatch(reply, /separate booking|prompt was sent|payment failed/);
+    assert.deepEqual(state.draft, before);
+  }
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.equal(state.createdSteps.length, 0);
+  assert.equal(state.deleted.length, 0);
+});
+
+test('initial Muse reschedule request treats busy Friday as the rejected date, not a new booking', async (context) => {
+  const { state, say } = harness(context, 10);
+  state.booking.service = 'THE MUSE';
+  state.booking.customer.name = 'Maryanne';
+  const before = { ...state.booking };
+  const reply = await say.withHistory([{ role: 'assistant', content:
+    'Your THE MUSE session is on Friday, 9 October 2026 at 2:00 PM. Your saved extras are Fiesta House Power Suit. It is confirmed, and your deposit has been paid.' }],
+    'thats nice can we kindly reschedule it to some other date...i will be busy that Friday');
+  assert.match(reply, /Which new date and time would suit you.*Muse/i);
+  assert.doesNotMatch(reply, /which package|your name|what time.*Friday|that day/i);
+  assert.deepEqual(state.createdSteps, ['reschedule_collecting']);
+  assert.equal(state.draft.bookingId, state.booking.id);
+  assert.equal(state.draft.service, 'THE MUSE');
+  assert.equal(state.draft.date, null);
+  assert.equal(state.draft.time, null);
+  assert.deepEqual(state.booking, before);
+  assert.equal(state.slotQueries.length, 0);
+  assert.equal(state.bookingsCreated, 0);
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.equal(state.calendarUpdates, 0);
+  assert.equal(state.invoiceRefreshes.length, 0);
+});
+
+test('initial explicit replacement date proposes the same booking and waits for confirmation', async (context) => {
+  const { state, say } = harness(context, 10);
+  const target = nowInBusinessTimezone().add(11, 'day');
+  const originalDate = state.booking.dateTime.getTime();
+  const extras = [{ name: 'Fiesta House Power Suit', totalPrice: 10000 }];
+  Object.assign(state.booking, { bookingAddons: extras, depositPaid: 2000 });
+  const proposal = await say(`Please reschedule my session to ${target.format('YYYY-MM-DD')} at 10am because I will be busy Friday`);
+  assert.match(proposal, /10:00 AM is available.*confirm the change\?$/s);
+  assert.equal(state.draft.bookingId, 'booking-icon');
+  assert.equal(state.draft.date, target.format('YYYY-MM-DD'));
+  assert.equal(state.draft.time, '10:00');
+  assert.equal(state.booking.dateTime.getTime(), originalDate);
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.equal(state.calendarUpdates, 0);
+  assert.equal(state.invoiceRefreshes.length, 0);
+  assert.ok(!state.createdSteps.includes('collecting_slots'));
+  assert.ok(state.bookingQueries.length >= 2);
+  assert.ok(state.bookingQueries.every(where => where.id === 'booking-icon'), 'selection and proposal both query the bound booking');
+  await say('yes');
+  assert.equal(state.bookingUpdates.length, 1);
+  assert.equal(inBusinessTimezone(state.booking.dateTime).format('YYYY-MM-DD HH:mm'), `${target.format('YYYY-MM-DD')} 10:00`);
+  assert.equal((state.booking as any).depositPaid, 2000);
+  assert.deepEqual((state.booking as any).bookingAddons, extras);
+  assert.equal(state.bookingsCreated, 0);
+});
+
+test('replacement date survives date-only selection, trimmed history and an intervening reminder', async (context) => {
+  const { state, say } = harness(context, 10);
+  const target = nowInBusinessTimezone().add(11, 'day').format('YYYY-MM-DD');
+  await say('Can we reschedule to some other date?');
+  assert.match(await say(target), /What time on/);
+  assert.equal(state.draft.date, target);
+  const reminders: Msg[] = Array.from({ length: 8 }, () => ({ role: 'assistant', content: 'Your original session remains booked. We look forward to welcoming you.' }));
+  const proposal = await say.withHistory(reminders, '10am please');
+  assert.match(proposal, /10:00 AM is available.*confirm the change\?$/s);
+  assert.equal(state.draft.date, target);
+  assert.equal(state.draft.time, '10:00');
+  assert.equal(state.draft.bookingId, 'booking-icon');
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.ok(!state.createdSteps.includes('collecting_slots'));
+});
+
+test('initial reschedule is fail-closed for ambiguous bookings and unrelated active drafts', async (context) => {
+  const { state, say } = harness(context, 10);
+  state.availableBookings = [state.booking, { ...state.booking, id: 'second-booking', service: 'THE MUSE' }];
+  assert.match(await say('Can we reschedule my session?'), /more than one upcoming session.*Which session/);
+  assert.equal(state.draft, null);
+  assert.equal(state.createdSteps.length, 0);
+  state.availableBookings = [];
+  assert.match(await say('Can we reschedule my session?'), /could not find an upcoming confirmed session/);
+  assert.equal(state.draft, null);
+  state.availableBookings = null;
+  for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending', 'cancel_confirm']) {
+    state.draft = { id: 'other-request', step, service: 'THE MUSE', date: '2026-11-12', time: '14:00', name: 'Maryanne' };
+    const before = { ...state.draft };
+    assert.match(await say('Can we reschedule my session?'), /not changed your current request or your session/);
+    assert.deepEqual(state.draft, before);
+  }
+  assert.equal(state.bookingUpdates.length, 0);
+  assert.equal(state.slotQueries.length, 0);
+  assert.equal(state.deleted.length, 0);
+});
+
+test('reschedule intent distinguishes unavailable clauses, targets and withdrawal', () => {
+  const flows = new ConversationFlowMatcher();
+  assert.equal(rescheduleTargetText('move my session from Friday to Saturday at 10am because I am busy Friday').trim(), 'Saturday at 10am');
+  assert.equal(rescheduleTargetText("I can't do Friday, reschedule to Saturday at 10am").trim(), 'reschedule to Saturday at 10am');
+  assert.equal(flows.isInitialRescheduleRequest("Let's not reschedule"), false);
+  assert.equal(flows.isInitialRescheduleRequest('Can I change my name?'), false);
+  assert.equal(flows.isInitialRescheduleRequest('remove the extra outfit'), false);
+  assert.equal(flows.isInitialRescheduleRequest('Can we reschedule the session?'), true);
+});
+
 test('Joan run: same day but from 5pm moves the existing Icon booking without asking name or package', async (context) => {
   const { state, say, bookingDay } = harness(context, 1);
 
@@ -117,7 +268,7 @@ test('Joan run: same day but from 5pm moves the existing Icon booking without as
 
 test('a booking outside 72 hours proposes the move without a forfeiture warning', async (context) => {
   const { say } = harness(context, 10);
-  assert.match(await say('Can I reschedule?'), /What time would work better for you that day\?/);
+  assert.match(await say('Can I reschedule?'), /Which new date and time would suit you/);
   const proposal = await say('same day but from 5pm');
   assert.match(proposal, /from 3:00 PM to 5:00 PM/);
   assert.doesNotMatch(proposal, /forfeit/);

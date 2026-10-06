@@ -13,14 +13,16 @@ import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './co
 import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest, isMakeupForSelf, makeupIncludedReply } from './addon-capture';
 import { editionShortName } from './booking-progress';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
-import { needsUnchangedReassurance } from './reply-voice';
+import { isCustomerNameQuestion, needsUnchangedReassurance } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
-import { buildHairWigClarificationReply, buildPersonalOutfitReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
+import { buildBookingPolicyReply, buildHairWigClarificationReply, buildPersonalOutfitReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
 import { buildExpressDeliveryFeeReply, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
 import { classifyPaymentMessage } from './payment-recovery';
 import { catalogLinkFollowUp } from './catalog-policy';
 import { OFFICIAL_WEBSITE_URLS } from './constants';
-import { isPlainGreeting } from './conversation-flow.matcher';
+import { isBookingPolicyQuestion, isPlainGreeting } from './conversation-flow.matcher';
+import { isConfirmedSessionFollowUp } from './appointment-replies';
+import { emojiReplyType, stripAssistantEmojis } from './emoji-policy';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -37,6 +39,7 @@ export type MessageRoute = {
   when: () => boolean;
   handle: () => MessageRouteResult | Promise<MessageRouteResult>;
   replyMode?: 'deterministic' | 'natural';
+  beforeSlotCapture?: boolean;
 };
 
 export function createMessageRoutes(
@@ -47,6 +50,7 @@ export function createMessageRoutes(
   platform: string,
   startedAt: number
 ): MessageRoute[] {
+  history = stripAssistantEmojis(history);
   let scopeBoundaryReply: string | null = null;
   let informationalFlowResolved = false;
   let informationalFlow: any;
@@ -69,6 +73,39 @@ export function createMessageRoutes(
       name: 'scopeBoundary',
       when: () => Boolean(scopeBoundaryReply = this.getScopeBoundaryReply(userMessage, history)),
       handle: () => scopeBoundaryReply,
+    },
+    {
+      name: 'customerName',
+      replyMode: 'deterministic',
+      when: () => isCustomerNameQuestion(userMessage),
+      handle: async () => {
+        try {
+          return await this.getCustomerNameReply(customerId);
+        } catch (error) {
+          if (isMissingColumnError(error)) throw error;
+          return { reply: 'I could not check your saved name just now. The studio team can help.',
+            outcome: { success: false, isFallback: true, failureReason: 'customer_name_lookup_failed' } };
+        }
+      },
+    },
+    {
+      name: 'bookingPolicyInformation',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => isBookingPolicyQuestion(userMessage),
+      handle: () => buildBookingPolicyReply(),
+    },
+    {
+      name: 'rescheduleEntry',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => (platform === 'whatsapp' || platform === 'web') && this.conversationFlows.isInitialRescheduleRequest(userMessage),
+      handle: async () => {
+        const reply = await this.getInitialRescheduleReply(customerId, userMessage, history);
+        return /^I have not changed your current request or your session\./.test(reply)
+          ? { reply, outcome: { success: false, isFallback: false, failureReason: 'reschedule_conflicting_draft' } }
+          : reply;
+      },
     },
     {
       name: 'identityCorrection',
@@ -187,6 +224,12 @@ export function createMessageRoutes(
       },
     },
     {
+      name: 'confirmedSessionFollowUp',
+      replyMode: 'deterministic',
+      when: () => (platform === 'whatsapp' || platform === 'web') && isConfirmedSessionFollowUp(userMessage),
+      handle: () => this.getConfirmedSessionFollowUpReply(customerId),
+    },
+    {
       name: 'pastAppointment',
       when: () => this.shouldUsePastAppointmentReply(userMessage) || this.isPastAppointmentFollowUp(userMessage, history),
       handle: async () => this.getPastAppointmentReply(customerId),
@@ -292,8 +335,17 @@ export function createMessageRoutes(
     },
     {
       name: 'previousAddon',
+      replyMode: 'deterministic',
       when: () => this.shouldUsePreviousAddonReply(userMessage, history),
-      handle: async () => this.getPreviousAddonReply(customerId),
+      handle: async () => {
+        try {
+          return await this.getPreviousAddonReply(customerId);
+        } catch (error) {
+          if (isMissingColumnError(error)) throw error;
+          return { reply: 'I could not check your saved add-ons just now. The studio team can help verify them.',
+            outcome: { success: false, isFallback: true, failureReason: 'addon_status_lookup_failed' } };
+        }
+      },
     },
     {
       name: 'clarifyNewAddon',
@@ -495,7 +547,8 @@ export function createMessageRoutes(
       handle: async () => {
         try {
           const progress = platform === 'whatsapp' || platform === 'web' ? await this.getBookingProgressReply(customerId, userMessage, history) : null;
-          if (progress) return progress;
+          if (progress) return emojiReplyType(progress) === 'slotAvailable'
+            ? this.decorateTemplateEmoji(customerId, platform, progress, 'slotAvailable', userMessage, history) : progress;
           console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
           const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
           console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({

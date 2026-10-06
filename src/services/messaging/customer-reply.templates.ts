@@ -1,8 +1,11 @@
+import { applyEmojiPolicy, type EmojiContext } from '../agent/emoji-policy';
+
 const LEGACY_WEBSITE = /https?:\/\/(?:www\.)?fiestahouseattire\.com(?:\/[^\s)\]}>,]*)?/gi;
 const CANNED_OPENERS = /^(?:sure thing|absolutely|no worries|great question|perfect)[!,.:\s-]*/i;
 
-export function formatCustomerReply(reply: string): string {
-  return reply
+export function formatCustomerReply(reply: string, emojiContext?: EmojiContext): string {
+  const source = emojiContext ? reply : reply.replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '');
+  const formatted = source
     .replace(LEGACY_WEBSITE, 'https://www.fiestahousematernity.com/')
     .replace(/\bFiesta AI\b/gi, 'Fiesta House')
     .replace(/\*\*(.*?)\*\*/g, '$1')
@@ -10,11 +13,11 @@ export function formatCustomerReply(reply: string): string {
     .replace(/`([^`]+)`/g, '$1')
     .replace(/^\s*[-*]\s+/gm, '')
     .replace(/^\s*\d+[.)]\s+/gm, '')
-    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '')
     .replace(CANNED_OPENERS, '')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]+\n/g, '\n')
     .trim();
+  return emojiContext ? applyEmojiPolicy(formatted, emojiContext) : formatted;
 }
 
 export const customerReplyTemplates = {

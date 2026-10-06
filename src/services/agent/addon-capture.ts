@@ -2,6 +2,7 @@ import { ADDON_CATALOG, type AddonCatalogItem } from '../../config/constants';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { ADDON_MAKEUP_CLARIFICATION, ADDON_MULTI_CLARIFICATION, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { normalizeQuotes } from './regex';
+import { stripAssistantEmojis } from './emoji-policy';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 
@@ -31,6 +32,7 @@ export function isAddonInquiry(message: string): boolean {
 }
 
 export function selectedAddons(message: string, history: Message[] = []): AddonCatalogItem[] {
+  history = stripAssistantEmojis(history);
   if (isAddonInquiry(message)) return [];
   const text = message.toLowerCase().replace(/styles?\s+wig/g, 'styled wig');
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
@@ -60,6 +62,7 @@ export function addonRecipient(message: string, sku: string): string | null {
 
 /** "No, it's for me" after the extra-makeup question: makeup is already part of the customer's own session. */
 export function isMakeupForSelf(message: string, history: Message[] = []): boolean {
+  history = stripAssistantEmojis(history);
   const lastAssistant = [...history].reverse().find((entry) => entry.role === 'assistant')?.content || '';
   if (!lastAssistant.includes(ADDON_MAKEUP_CLARIFICATION) || addonRecipient(message, 'extra_makeup')) return false;
   return /^\s*(?:no+|nope|nah)\b|\bfor me\b|\bmyself\b|\bjust me\b|\bit'?s mine\b/i.test(normalizeQuotes(message));
@@ -79,6 +82,7 @@ export function isAddonListRequest(message: string): boolean {
 }
 
 export function addonSelectionClarification(message: string, history: Message[] = []): string | null {
+  history = stripAssistantEmojis(history);
   if (isAddonInquiry(message)) return null;
   const choices = selectedAddons(message, history);
   if (choices.some((item) => item.sku === 'extra_makeup') && !addonRecipient(message, 'extra_makeup')) return ADDON_MAKEUP_CLARIFICATION;

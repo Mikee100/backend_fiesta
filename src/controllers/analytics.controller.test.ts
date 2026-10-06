@@ -12,6 +12,8 @@ test('model usage separates providers and records failed requests without tokens
     { createdAt: now, provider: 'gemini', model: 'gemini-2.5-flash', inputTokens: 30, outputTokens: 12, totalTokens: 42, status: 'success', failover: true, errorCode: null },
     { createdAt: now, provider: 'groq', model: 'openai/gpt-oss-20b', inputTokens: 0, outputTokens: 0, totalTokens: 0, status: 'failed', failover: false, errorCode: '429' },
     { createdAt: now, provider: 'groq', model: 'openai/gpt-oss-20b', inputTokens: 20, outputTokens: 8, totalTokens: 28, status: 'success', failover: false, errorCode: null },
+    { createdAt: now, provider: 'groq2', model: 'openai/gpt-oss-20b', inputTokens: 9, outputTokens: 3, totalTokens: 12, status: 'success', failover: true, errorCode: null },
+    { createdAt: now, provider: 'gemini2', model: 'gemini-2.5-flash', inputTokens: 5, outputTokens: 2, totalTokens: 7, status: 'success', failover: true, errorCode: null },
   ];
   (prisma.customer.aggregate as any) = async () => ({ _sum: { totalTokensUsed: 2095943 } });
   (prisma.customer.findMany as any) = async () => [
@@ -24,7 +26,9 @@ test('model usage separates providers and records failed requests without tokens
     await new AnalyticsController().getModelUsage({ query: { days: '7' } } as any, response);
     assert.deepEqual(result.summary, {
       groq: { inputTokens: 20, outputTokens: 8, totalTokens: 28, calls: 2, failures: 1 },
+      groq2: { inputTokens: 9, outputTokens: 3, totalTokens: 12, calls: 1, failures: 0 },
       gemini: { inputTokens: 30, outputTokens: 12, totalTokens: 42, calls: 1, failures: 0 },
+      gemini2: { inputTokens: 5, outputTokens: 2, totalTokens: 7, calls: 1, failures: 0 },
     });
     assert.equal(result.allTimeTokens, 2095943);
     assert.deepEqual(result.customerUsage, [
@@ -33,7 +37,9 @@ test('model usage separates providers and records failed requests without tokens
     ]);
     assert.equal(result.daily.length, 7);
     assert.equal(result.daily.at(-1).groq, 28);
+    assert.equal(result.daily.at(-1).groq2, 12);
     assert.equal(result.daily.at(-1).gemini, 42);
+    assert.equal(result.daily.at(-1).gemini2, 7);
     assert.equal(result.recent[0].failover, true);
     assert.equal(result.groqCooldownUntil, null);
   } finally {

@@ -1,5 +1,13 @@
 import { PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { EDITION_CATALOG_HEADER, EDITION_TERM_PATTERN } from './constants';
+import { stripAssistantEmojis } from './emoji-policy';
+import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
+
+export function rescheduleTargetText(message: string): string {
+  const clauses = message.split(/\.{2,}|[;\n,]|\b(?:because|but)\b/i)
+    .filter(clause => !/\b(?:busy|unavailable|can't|cannot|won't|will not|not free|not available)\b/i.test(clause));
+  return clauses.map(clause => clause.match(/\bfrom\b[\s\S]*?\bto\s+([\s\S]+)/i)?.[1] || clause).join(' ');
+}
 
 export type ConversationMessage = {
   role: 'user' | 'assistant';
@@ -24,8 +32,22 @@ export function isPlainGreeting(message: string): boolean {
   return /^\s*(?:hi+|hello+|hey+|hiya|helo|good\s+(?:morning|afternoon|evening|day)|habari(?:\s+yako)?|niaje|mambo|greetings)(?:\s+(?:there|team|fiesta(?:\s+house)?))?[\s!.,]*$/i.test(message);
 }
 
+export function isBookingPolicyQuestion(message: string): boolean {
+  return /\b(?:reschedul\w*|cancell?\w*|refund\w*)\b/i.test(message)
+    && /\b(?:polic(?:y|ies)|rules?|terms|conditions|notice|what happens if|how (?:far|long) (?:in advance|before))\b/i.test(message);
+}
+
 export class ConversationFlowMatcher {
+  isInitialRescheduleRequest(message: string): boolean {
+    if (isBookingPolicyQuestion(message)) return false;
+    if (!RESCHEDULE_KEYWORD_PATTERN.test(message)) return false;
+    if (/\b(?:not|don't|do not|never)\b[\s\S]{0,35}\b(?:reschedul\w*|change|move|postpone|push)\b/i.test(message)) return false;
+    return /\breschedul\w*|\bpostpon\w*|\bpush\b/i.test(message)
+      || /\b(?:change|move|shift)\b[\s\S]{0,60}\b(?:session|booking|appointment|shoot|date|day|time|it|this|that)\b/i.test(message);
+  }
+
   isPackageCatalogRequest(message: string, history: ConversationMessage[] = []): boolean {
+    history = stripAssistantEmojis(history);
     const text = message.toLowerCase().trim();
     const namesEdition = PACKAGE_NAMES_FOR_EXTRACTION.some((name) => new RegExp(`\\b${name.replace(/^THE /, '')}\\b`, 'i').test(text));
     const editionQuestion = new RegExp(`\\b(?:what|which|share|show|list|tell)\\b.*\\b${EDITION_TERM_PATTERN}\\b|\\byour\\s+${EDITION_TERM_PATTERN}\\b`, 'i');
@@ -48,6 +70,7 @@ export class ConversationFlowMatcher {
   }
 
   isPackageInclusionFollowUp(message: string, history: ConversationMessage[] = []): boolean {
+    history = stripAssistantEmojis(history);
     const text = message.toLowerCase().trim();
     const asksWhatEachIncludes = /^(?:so\s+)?what\s+(?:does|do)\s+each(?:\s+one)?\s+(?:come\s+with|include|includes)\s*[?.!]*$|^what\s+comes\s+with\s+each\s*[?.!]*$|^what(?:'s|\s+is)\s+included\s+(?:in|with)\s+each\s*[?.!]*$/.test(text);
     if (!asksWhatEachIncludes) return false;
@@ -99,6 +122,7 @@ export class ConversationFlowMatcher {
   }
 
   isTimeOnlyRescheduleSelection(message: string, history: ConversationMessage[]): boolean {
+    history = stripAssistantEmojis(history);
     if (!this.parseTimeOnly(message)) return false;
     const previousAssistantMessage = [...history].reverse().find((entry) => entry.role === 'assistant')?.content.toLowerCase() || '';
     return /what time.*work better|what new time|time would you like/.test(previousAssistantMessage);
@@ -106,8 +130,9 @@ export class ConversationFlowMatcher {
 
   /** The last assistant turn asked for a new date/time for an existing booking. */
   isRescheduleQuestion(history: ConversationMessage[]): boolean {
+    history = stripAssistantEmojis(history);
     const previousAssistantMessage = [...history].reverse().find((entry) => entry.role === 'assistant')?.content.toLowerCase() || '';
-    return /what time.*work better|what new time|share your preferred date and time|what (?:new )?(?:date and time|date or time|day and time) would you like|(?:move|reschedule|push) your (?:session|booking|appointment|shoot) to|when would you like to (?:move|reschedule)/.test(previousAssistantMessage);
+    return /what time.*work better|what new time|share your preferred date and time|which new date and time would suit you|what (?:new )?(?:date and time|date or time|day and time) would you like|(?:move|reschedule|push) your (?:session|booking|appointment|shoot) to|when would you like to (?:move|reschedule)/.test(previousAssistantMessage);
   }
 
   /** Accepts "5pm", "from 5:30 pm", "17:00" anywhere in the message. */

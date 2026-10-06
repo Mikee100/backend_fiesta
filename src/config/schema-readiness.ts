@@ -1,7 +1,23 @@
 export const SCHEMA_MAINTENANCE_REPLY = 'Our booking assistant is temporarily unavailable. Please contact the studio team to continue your request.';
 
+/** The only Prisma P2022 we intentionally handle as a schema-lag event. */
+const KNOWN_MISSING_COLUMN = 'booking_drafts.cancelProposedAt';
+
+/**
+ * Returns true only for the one specific missing-column error we handle
+ * gracefully (cancelProposedAt). Any other P2022 — including a typo in a
+ * new query — is treated as an unexpected bug so it bypasses the alert
+ * limiter and reaches normal error escalation.
+ */
 export function isMissingColumnError(error: unknown): boolean {
-  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'P2022');
+  if (!error || typeof error !== 'object' || !('code' in error) || (error as any).code !== 'P2022') return false;
+  const column = (error as any)?.meta?.column;
+  return typeof column === 'string' && column.includes('cancelProposedAt');
+}
+
+/** True when the error is any P2022, even one we don't recognise — use to detect unhandled schema errors. */
+export function isAnyMissingColumnError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as any).code === 'P2022');
 }
 
 export function safeSchemaDetails(error: unknown): { code: string; model: string | null; column: string | null } {

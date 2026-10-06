@@ -9,8 +9,11 @@ type Msg = { role: 'user' | 'assistant'; content: string };
 type HarnessOptions = { natural?: boolean; nullRoutes?: string[]; paymentPending?: boolean };
 
 const ASYNC_HANDLERS: Record<string, string> = {
+  getCustomerNameReply: 'customerName',
+  getInitialRescheduleReply: 'rescheduleEntry',
   getBookingIdentityCorrectionReply: 'identityCorrection',
   getBookingStatusReply: 'bookingStatus',
+  getConfirmedSessionFollowUpReply: 'confirmedSessionFollowUp',
   getUpcomingAppointmentTimeReply: 'upcomingAppointmentTime',
   getPastAppointmentsListReply: 'pastAppointmentsList',
   getLastAppointmentDetailsReply: 'lastAppointmentDetails',
@@ -113,6 +116,7 @@ function routeOf(reply: string): string {
   if (/^You may bring one outfit/.test(reply)) return 'personalOutfit';
   if (/^Basic hair styling is included/.test(reply)) return 'hairWigClarification';
   if (/^The express delivery fee is not listed/.test(reply)) return 'expressDeliveryFee';
+  if (/^Rescheduling: Changes within 72 hours/.test(reply)) return 'bookingPolicyInformation';
   if (reply.startsWith('ROUTE:')) return reply.split('\n')[0].slice('ROUTE:'.length);
   if (/^Yes\. Your original session date and time are still booked/.test(reply)) return 'rescheduleWithdrawalConfirmation';
   if (/^(No rush\.|You are welcome\.)/.test(reply)) return 'postActionAcknowledgement';
@@ -160,9 +164,15 @@ const CASES: Case[] = [
   { message: 'Is the 10k deposit refundable?', expected: 'ambiguousDeposit' },
   { message: 'ok', history: [assistant('Understood! We will keep your original session date and time, and your booking remains unchanged.')], expected: 'rescheduleWithdrawalConfirmation', note: 'beats postActionAcknowledgement' },
   { message: 'thanks', expected: 'postActionAcknowledgement' },
+  { message: 'What is the rescheduling and cancellation policy?', expected: 'bookingPolicyInformation' },
+  { message: 'So whats my name? Do you know it?', expected: 'customerName' },
+  { message: 'have you added the add-on', expected: 'previousAddon' },
+  { message: 'Did you save the Power Suit?', expected: 'previousAddon' },
 
   // Appointment info
   { message: 'Is my booking confirmed?', expected: 'bookingStatus' },
+  { message: 'Okay...is that it?', expected: 'confirmedSessionFollowUp' },
+  { message: 'Is that all?', nullRoutes: ['confirmedSessionFollowUp'], expected: 'runAgent' },
   { message: 'is it confirmed?', nullRoutes: ['bookingStatus'], expected: 'runAgent', note: 'status handler null falls through' },
   { message: 'What time does my session start?', expected: 'upcomingAppointmentTime', note: 'beats upcomingAppointmentDetails' },
   { message: 'Show me my previous bookings', expected: 'pastAppointmentsList' },
@@ -227,10 +237,10 @@ const CASES: Case[] = [
   { message: '3pm', history: [assistant('Of course. What time would work better for you that day?')], expected: 'rescheduleSelection' },
   { message: 'same day but from 5pm', history: [assistant('Sure! What date and time would you like to move your session to?')], expected: 'rescheduleSelection', note: 'reschedule replies keep the existing booking instead of starting a new one' },
   { message: "Let's not reschedule", history: [POLICY_72H], expected: 'rescheduleWithdrawal' },
-  { message: 'Can I change the time?', expected: 'timeOnlyRescheduleRequest' },
-  { message: "I'd like to move my appointment", expected: 'rescheduleRequest' },
+  { message: 'Can I change the time?', expected: 'rescheduleEntry' },
+  { message: "I'd like to move my appointment", expected: 'rescheduleEntry' },
   { message: 'can I exchange my outfit', expected: 'runAgent', note: 'Phase 1 #4 regression: "exchange" must not match the reschedule keyword' },
-  { message: 'reschedule to 8th October at 3pm', expected: 'runAgent' },
+  { message: 'reschedule to 8th October at 3pm', expected: 'rescheduleEntry' },
   { message: 'Same date and time please', expected: 'sameBookingSlot' },
 
   // Packages
@@ -304,6 +314,9 @@ test('message route order remains unchanged', () => {
   assert.deepEqual(routes.map((route: { name: string }) => route.name), [
     'familyStyling',
     'scopeBoundary',
+    'customerName',
+    'bookingPolicyInformation',
+    'rescheduleEntry',
     'identityCorrection',
     'recipientName',
     'ambiguousDeposit',
@@ -320,6 +333,7 @@ test('message route order remains unchanged', () => {
     'upcomingAppointmentDetails',
     'mixedIntent',
     'invoice',
+    'confirmedSessionFollowUp',
     'pastAppointment',
     'bookingForSomeoneElse',
     'multiPersonBooking',

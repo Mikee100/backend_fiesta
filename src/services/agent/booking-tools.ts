@@ -6,16 +6,16 @@ import { invoiceService } from '../invoice/invoice.service';
 import { mpesaService } from '../payment/mpesa.service';
 import { SERVICE_DURATIONS, DEFAULT_DURATION, MINIMUM_BOOKING_DEPOSIT, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { notifyAdmin } from '../notifications/notification.service';
-import { businessDay, inBusinessTimezone } from '../../utils/time';
+import { businessDay, bookingDateFacts, inBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import dayjs from 'dayjs';
 import { PAYMENT_ATTEMPTS_EXHAUSTED, PAYMENT_PROMPT_UNRECORDED, RESCHEDULE_COLLECTING_STEP } from './constants';
-import { sanitizeSlotValue } from './slot-memory';
+import { isUsableName, sanitizeSlotValue } from './slot-memory';
 import { draftVersion, MAX_PAYMENT_ATTEMPTS } from './payment-recovery';
 
 export async function executeProposeBookingTool(this: any, customerId: string, name: string, service: string, date: string) {
   name = sanitizeSlotValue(name || '');
-  if (!name || /^(?:unknown|whatsapp user)$/i.test(name) || !/[a-z]/i.test(name)) {
+  if (!isUsableName(name) || !/[a-z]/i.test(name)) {
     throw new Error('Customer name is required before proposing a booking. Ask the customer for their full name first.');
   }
 
@@ -45,6 +45,15 @@ export async function executeProposeBookingTool(this: any, customerId: string, n
   const requestedTime = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
   if (hour > 23 || minute > 59) {
     throw new Error('The requested time is invalid. Ask the customer to choose a valid time.');
+  }
+
+  // Explicit past-date guard. bookingDateFacts returns { isPast } but does NOT
+  // throw for past dates, so getAvailableSlots must never be reached for one -
+  // it would return an empty slot list and produce a confusing "time unavailable"
+  // error instead of a clear rejection.
+  const dateFacts = bookingDateFacts(requestedDate);
+  if (dateFacts.isPast) {
+    throw new Error(`${requestedDate} is in the past. Ask the customer to choose a future date.`);
   }
 
   const slotsResult: any = await bookingService.getAvailableSlots(
@@ -222,7 +231,8 @@ export async function executeProposeRescheduleTool(this: any, customerId: string
     throw new Error('I have not changed your current request or started a reschedule. Please finish that step or ask the studio team to help.');
   }
   const upcomingBooking = await prisma.booking.findFirst({
-    where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+    where: { customerId, status: 'confirmed', dateTime: { gte: new Date() },
+      ...(existingDraft?.bookingId ? { id: existingDraft.bookingId } : {}) },
     orderBy: { dateTime: 'asc' }
   });
 

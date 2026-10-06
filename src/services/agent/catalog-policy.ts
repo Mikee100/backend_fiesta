@@ -1,5 +1,6 @@
 import prisma from '../../config/prisma';
 import { OFFICIAL_WEBSITE_URLS } from './constants';
+import { stripAssistantEmojis } from './emoji-policy';
 
 export type CatalogKind = 'editions' | 'addons';
 export const CATALOG_LINK_TTL_MS = 24 * 60 * 60_000;
@@ -10,6 +11,7 @@ export function explicitCatalogListRequest(message: string): boolean {
 }
 
 export function catalogLinkFollowUp(message: string, history: { role: string; content: string }[]): boolean {
+  history = stripAssistantEmojis(history);
   const previous = [...history].reverse().find(entry => entry.role === 'assistant');
   return Boolean(previous?.content.includes(OFFICIAL_WEBSITE_URLS.packages)) && explicitCatalogListRequest(message);
 }
