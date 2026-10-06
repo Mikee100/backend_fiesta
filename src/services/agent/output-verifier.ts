@@ -4,6 +4,7 @@ import { ADDON_CATALOG, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/consta
 import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply } from './replies';
 import { ADDON_LINK_REPLY, EDITION_LINK_REPLY } from './constants';
 import { normalizeQuotes } from './regex';
+import { applyEmojiPolicy, type EmojiContext } from './emoji-policy';
 
 export const VERIFIER_FALLBACK = "I'd rather not guess on that, so I've passed your question to the studio team to confirm. You can also reach them on 0720 111928.";
 export const VERIFIER_ESCALATION_COOLDOWN_MS = 10 * 60_000;
@@ -15,6 +16,7 @@ export type VerifierFacts = {
   customerMessage?: string;
   packagePrices?: readonly { name: string; price: number }[];
   catalogListAllowed?: boolean;
+  emojiContext?: EmojiContext;
 };
 
 export function currencyAmounts(text: string): number[] {
@@ -176,6 +178,7 @@ export async function verifyWithOneRetry(
   escalate: (offendingText: string, reasons: string[]) => Promise<void>,
   templateFallback?: () => Promise<string | null>,
 ): Promise<{ reply: string; blocked: boolean }> {
+  if (facts.emojiContext) original = applyEmojiPolicy(original, facts.emojiContext);
   const first = verifyModelReply(original, facts);
   if (!first.reasons.length) { console.info('[AGENT_FLOW] verifier=passed'); return { reply: first.reply, blocked: false }; }
   console.warn(`[AGENT_FLOW] verifier=blocked ${blockedLog(first.reasons, first.rejectedAmounts, facts)}`);
@@ -185,6 +188,7 @@ export async function verifyWithOneRetry(
   let corrected = '';
   let retryFailed = false;
   try { corrected = await regenerate(first.reasons); } catch { retryFailed = true; }
+  if (facts.emojiContext) corrected = applyEmojiPolicy(corrected, facts.emojiContext);
   const second = verifyModelReply(corrected, facts);
   if (!retryFailed && second.reasons.length === 1 && second.reasons[0] === 'catalog_dump') {
     return { reply: catalogLinkReply(corrected), blocked: false };

@@ -1,5 +1,93 @@
 # Observed run regression fixes
 
+## Initial reschedule intent before slot capture (2026-10-06)
+
+The exact Muse follow-up "thats nice can we kindly reschedule it to some other
+date...i will be busy that Friday" reproduced a package question before any route
+ran. New-booking slot capture interpreted Friday as a stated date and intercepted
+the initial reschedule request. Prior protection only covered answers to an existing
+assistant reschedule question, not the initial customer request.
+
+A deterministic rescheduleEntry route now runs after budget/circuit checks but
+before slot capture. It uses an unambiguous upcoming confirmed booking, persists
+the existing reschedule context and asks for a replacement date/time. It rejects
+unrelated active drafts and clarifies multiple bookings without writing a draft.
+Negated reschedule requests still reach withdrawal rather than starting a move.
+
+Replacement-date parsing excludes busy/unavailable/cannot-attend clauses and takes
+the target in "from ... to ..." wording. Explicit replacement dates and times use
+the existing availability/proposal flow. Date-only picks persist in that booking's
+reschedule context, surviving trimmed history and reminders. Proposal queries now
+retain the bound bookingId rather than silently choosing the earliest booking.
+The actual booking, payment and extras stay unchanged until explicit confirmation;
+existing 72-hour disclosure and confirmation rules are preserved.
+
+Verification: eleven mocked reschedule-flow tests pass, including the exact opening,
+explicit target then confirmation, date-only/time follow-up after eight reminders,
+ambiguity, missing bookings and protected drafts. Route characterizations pass;
+existing replay passes 15/15. TypeScript and editor diagnostics pass.
+The full suite reported 473/477: three unrelated extraction tests still call the
+instance regexExtract API after a concurrent change made it static; one availability
+test asserts a fixed 6 October 2026 13:00 slot despite real-time past-slot filtering.
+Those unrelated paths were not changed or claimed green in this phase.
+
+Tests disabled configured database access via an unreachable local endpoint and
+mocked external operations. No live record inspection, stale-draft cleanup, payment,
+Calendar operation, schema change, deployment or commit was performed. Clause parsing
+is a conservative local rule, not general natural-language intent certification.
+
+## Durable customer name and saved-add-on status (2026-10-06)
+
+"So whats my name? Do you know it?" previously reached the model even though
+customer names are persisted in Customer.name. A deterministic customerName route
+now reads that profile directly, never a session recipient or trimmed chat history.
+Missing, placeholder and obvious command-shaped names produce an honest request
+for a name; storage failures produce a verification fallback. No profile is reset.
+Name questions bypass early booking-slot capture. The repeat-question guard also
+recognizes "share/provide your full name", including without a collecting draft.
+
+"Have you added the add-on" previously matched the additions catalog. Status
+wording now routes to the existing stored-extra lookup, bypassing slot capture.
+The lookup reports extras linked to upcoming non-cancelled sessions. With no such
+session, it explicitly says no linked extras were found rather than falling through
+to the catalog; failed reads do not claim that nothing was saved. This does not
+certify unlinked pending requests or refresh an invoice automatically.
+
+Verification: focused name/status regressions include empty history, a fresh agent
+instance, another person's session name, unusable profile values, actual scoped
+add-on reads, missing records and storage failures. Final default suite passes
+465/465 and existing replay passes 15/15; TypeScript and editor diagnostics pass.
+Database access was redirected to an unreachable local endpoint during tests,
+with external operations mocked. No live profile inspection/repair, customer message,
+payment, migration, deployment or commit was performed.
+
+## Confirmed Muse session and invoice follow-up (2026-10-06)
+
+The reported paid Muse -> Power Suit -> "Okay...is that it?" -> invoice sequence
+exposed two local control-flow gaps. Collection progression and repeated-question
+protection only covered collecting drafts. In addition, slot capture ran before
+invoice routing: after a stale "your name" question, "Send me the invoice" was
+parsed as a name answer and could return a package question before reaching the
+invoice handler. A red regression reproduced that interception.
+
+- Invoice requests now bypass early slot capture, preserving invoice-route priority.
+- Short completion questions read confirmed upcoming bookings and recorded extras
+	without relying on chat history. Active drafts take precedence; multiple confirmed
+	sessions require clarification. The route makes no payment or booking changes.
+- When no active draft exists, model context includes the confirmed edition/date/time
+	as known slots. A repeated collection question is replaced with stored session
+	details, without claiming payment receipt. Explicit new booking requests still pass.
+- A mocked transcript exercises actual add-on persistence and invoice refresh: the
+	Power Suit attaches to the same Muse booking, total becomes 35,000, paid deposit
+	remains 2,000, and balance becomes 33,000. The edition/date/time are unchanged.
+
+Verification: five focused checks, 455/455 default tests, 15/15 existing replay
+checks, TypeScript and editor diagnostics pass. Database access during tests was
+redirected to an unreachable local endpoint; external operations in these fixtures
+were mocked. No deployment, live customer record inspection, schema change, payment
+prompt, Calendar action or commit was performed. Existing live stale drafts or names
+have not been reset; production behavior still requires an authorised staging check.
+
 ## Memory hardening: draft collision phase (2026-10-05)
 
 The reported restart after STK failure is not proven to be draft loss. The prior

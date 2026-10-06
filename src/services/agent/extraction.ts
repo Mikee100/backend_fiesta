@@ -108,7 +108,7 @@ export function resolveCalendarDate(message: string): string | null {
 }
 
 export class BookingExtractor {
-  private clean(text: string): string {
+  private static cleanText(text: string): string {
     return text
       .replace(/[^ 0-\w\s]/gi, ' ')
       .replace(/\s+/g, ' ')
@@ -116,8 +116,9 @@ export class BookingExtractor {
       .toLowerCase();
   }
 
-  private regexExtract(text: string): BookingDetails {
-    const cleanText = this.clean(text);
+  /** Public so callers can use BookingExtractor.regexExtract(text) without a cast. */
+  public static regexExtract(text: string): BookingDetails {
+    const cleanText = BookingExtractor.cleanText(text);
 
     if (cleanText.length < 10) return { name: null, service: null, date: null, time: null };
 
@@ -204,7 +205,7 @@ export class BookingExtractor {
   }
 
   async extract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
-    const regex = this.regexExtract(message);
+    const regex = BookingExtractor.regexExtract(message);
     console.log('Regex result:', regex);
     if (regex.name && regex.service && regex.date && regex.time) {
       return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };

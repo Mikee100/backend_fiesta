@@ -9,6 +9,32 @@ import { circuitBreaker } from './resilience.service';
 import { AgentService } from './agent.service';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { VERIFIER_CORRECTION_PREFIX } from './output-verifier';
+import workflowBaseline from './workflow-baseline.fixtures.json';
+
+test('workflow baseline preserves reported turns and labels synthetic state honestly', () => {
+  assert.equal(workflowBaseline.historyLimit, 6);
+  assert.match(workflowBaseline.customerId, /^synthetic-/);
+  assert.equal(workflowBaseline.incidents.length, 4);
+  const blocked = workflowBaseline.incidents.find(incident => incident.id === 'blocked-reschedule-typo-recovery');
+  assert.ok(blocked);
+  assert.deepEqual(blocked.turns.map(turn => turn.message), [
+    'can we reschedule my upcoming session', 'i dont understand', 'is there any free slots on the 10th?', '1oam', 'on 10th at 10am',
+  ]);
+  assert.match(blocked.syntheticConflictEvidence || '', /not a live row/);
+  for (const incident of workflowBaseline.incidents) {
+    assert.ok(incident.initialContext);
+    for (const turn of incident.turns) {
+      assert.ok(turn.message && turn.observedReply && turn.requiredOutcome);
+      for (const text of [turn.message, turn.observedReply, turn.requiredOutcome]) {
+        assert.doesNotMatch(text, /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/);
+      }
+    }
+  }
+});
+
+test.todo('workflow gate: a blocked reschedule stays blocked through clarification without model-led state transitions');
+test.todo('workflow gate: date-only availability for an existing session is queried before asking for a time');
+test.todo('workflow gate: a time typo and provider outage preserve the stored reschedule operation and date');
 
 type Message = { role: 'user' | 'assistant'; content: string };
 type Turn = {
@@ -88,7 +114,7 @@ const turns: Turn[] = [
   },
   {
     message: 'Is the makeup inclusive of lashes?',
-    modelReply: 'The standard makeup package does not include lashes. Lashes are KSh 500 extra.',
+    modelReply: 'Lashes are included in all our makeup services, including every package. The extra professional makeup add-on also includes lashes.',
   },
   {
     message: 'Please continue.',

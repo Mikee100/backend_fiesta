@@ -13,28 +13,209 @@ import { bookingDateFacts, nextWeekRange, nowInBusinessTimezone } from '../../ut
 import { getBookingPolicyWindow, RESCHEDULE_FORFEITURE_WINDOW_HOURS } from '../../utils/booking-policy';
 import { AgentService, BookingExtractor } from './agent.service';
 import { resolveCalendarDate } from './extraction';
-import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
+import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, isUsableName, rememberBookingSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
+import { whatsappService } from '../messaging/whatsapp.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { differingInclusionFields, SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
-import { addonQuantity, addonSelectionClarification, selectedAddons } from './addon-capture';
+import { addonInquiryReply, addonQuantity, addonSelectionClarification, isExplicitSelfMakeupAnswer, selectedAddons } from './addon-capture';
+import { ADDON_MAKEUP_CLARIFICATION } from './constants';
+import { catalogLinkFollowUp } from './catalog-policy';
+import { wasUpcomingAppointmentDetailsJustProvided, isPastAppointmentFollowUp } from './appointment-replies';
 import { buildAdditionsReply, isAddonListFollowUp, formatCustomerTime } from './replies';
-import { shouldUseBookingStatusReply, getBookingStatusReply } from './appointment-replies';
-import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply, buildPackageBudgetReply, legacyPackageReply, LASHES_TEAM_REPLY } from './replies';
+import { shouldUseBookingStatusReply, getBookingStatusReply, isConfirmedSessionFollowUp } from './appointment-replies';
+import { FAMILY_STYLING_TEAM_REPLY, familyStylingReply, buildPackageBudgetReply, legacyPackageReply, LASHES_FAQ_REPLY } from './replies';
 import { ADDON_CATALOG } from '../../config/constants';
 import { DAILY_TOKEN_CAP } from './resilience.service';
 import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, BRAND_SLOGAN, VOICE_RULES, ADDON_LINK_REPLY, EDITION_LINK_REPLY, OFFICIAL_WEBSITE_URLS } from './constants';
 import { buildBookingProposalConfirmation, previousMessageRequestsConfirmation, buildPostShootProcessReply, isPostShootProcessRequest } from './replies';
-import { editionInText, repeatedCollectionQuestion } from './reply-voice';
+import { editionInText, repeatedCollectionQuestion, savedCustomerNameReply } from './reply-voice';
 import { containsSlogan, enforceSlogan, normalizeSlogan } from './slogan-guard';
-import { createVerifierEscalationLimiter, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
+import { createVerifierEscalationLimiter, currencyAmounts, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { explicitlySelectedDeliveryMethod, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
-import { isPlainGreeting, selectedEdition } from './conversation-flow.matcher';
+import { ConversationFlowMatcher, isPlainGreeting, selectedEdition } from './conversation-flow.matcher';
+import { applyEmojiPolicy, emojisIn, enforceEmojiPolicy, REPLY_EMOJI, stripAssistantEmojis, stripEmojis, templateEmojiReply } from './emoji-policy';
+
+test('emoji policy enforces whitelist, forbidden contexts, limits and sentence-end placement', () => {
+  const heart = REPLY_EMOJI.welcome;
+  const context = { replyType: 'welcome' as const, userMessage: heart, log: () => {} };
+  for (const text of ['Ksh 2,000.', 'The deposit is ready.', 'Payment failed.', 'Cancel this booking.', 'A refund is due.',
+    'Your complaint is recorded.', 'The team will confirm that.', 'Your invoice is ready.', 'Your balance is due.']) {
+    assert.equal(emojisIn(applyEmojiPolicy(`${text} ${heart}`, context)).length, 0, text);
+  }
+  assert.equal(applyEmojiPolicy(`Welcome. ${heart}`, { ...context, sentimentScore: -1 }), 'Welcome.');
+  assert.equal(applyEmojiPolicy(`Welcome. \u2728`, context), 'Welcome.');
+  assert.equal(applyEmojiPolicy(`I would ${heart} love to help.`, context), 'I would love to help.');
+  assert.equal(applyEmojiPolicy(`Welcome ${heart}\nWhat kind of session are you planning?`, context), `Welcome ${heart}\nWhat kind of session are you planning?`);
+  assert.equal(emojisIn(applyEmojiPolicy(`Welcome. ${heart} ${REPLY_EMOJI.family}`, { ...context, replyType: 'other' })).length, 1);
+  assert.equal(applyEmojiPolicy(`Welcome. ${heart}`, { ...context, previousAssistant: `Thank you. ${heart}` }), 'Welcome.');
+  assert.equal(stripEmojis('Family \u{1F469}\u200d\u{1F469}\u200d\u{1F467} \u{1F1F0}\u{1F1EA} 1\ufe0f\u20e3'), 'Family   ');
+  assert.equal(templateEmojiReply('The deposit is Ksh 2,000.', 'paymentConfirmed', context), 'The deposit is Ksh 2,000.');
+});
 
 const agent = new AgentService() as any;
-const extractor = new BookingExtractor() as any;
+
+test('name capture rejects acknowledgements and saved-name statements without touching storage', async (context) => {
+  const original = prisma.bookingDraft.findUnique;
+  context.after(() => { prisma.bookingDraft.findUnique = original; });
+  (prisma.bookingDraft.findUnique as any) = async () => assert.fail('non-name reply must not reach storage');
+  const prompts = ['What is your name?', 'I have your name as Maryanne. Is that correct?', 'I have your name saved as Maryanne.'];
+  for (const prompt of prompts) {
+    const history = [{ role: 'assistant' as const, content: prompt }];
+    for (const message of ['Thats correct thank you', "That's correct thank you", 'Thank you', 'Correct', 'Send me the invoice', 'Sounds good']) {
+      assert.equal(extractStatedSlots(message, history).name, undefined, `${prompt}: ${message}`);
+      assert.equal(await rememberBookingSlots('synthetic-name', message, history), null);
+    }
+  }
+  assert.equal(extractStatedSlots('Maryanne', [{ role: 'assistant', content: prompts[2] }]).name, undefined);
+  assert.equal(isUsableName('Thats correct thank you'), false);
+  assert.match(savedCustomerNameReply('Thats correct thank you'), /don't have your name saved yet/);
+  assert.match(knownSlotsLine(null, 'Thats correct thank you'), /name=none/);
+  assert.match(knownSlotsLine({ step: EARLY_SLOT_STEP, createdAt: new Date(), name: 'Thats correct thank you' }, 'Maryanne'), /name="Maryanne"/);
+});
+
+test('name capture accepts requested names and explicit identity corrections', () => {
+  for (const prompt of ['What is your name?', 'Could you share your name?', 'What name should I use?', 'May I have your full name?']) {
+    for (const name of ['Maryanne', 'Wairimu Kamau', "Anne-Marie O'Neil"]) {
+      assert.equal(extractStatedSlots(name, [{ role: 'assistant', content: prompt }]).name, name);
+    }
+  }
+  assert.equal(extractStatedSlots('My name is Maryanne').name, 'Maryanne');
+  assert.equal(extractStatedSlots('No its Joan', [{ role: 'assistant', content: 'I have your name as Maryanne. Is that correct?' }]).name, 'Joan');
+});
+
+test('emoji state prevents consecutive replies across restarts and concurrent claims', async (context) => {
+  const originals = { session: prisma.unifiedConversation.findFirst, message: prisma.message.findFirst,
+    upsert: prisma.customerMemory.upsert, find: prisma.customerMemory.findUnique, update: prisma.customerMemory.updateMany };
+  context.after(() => { prisma.unifiedConversation.findFirst = originals.session; prisma.message.findFirst = originals.message;
+    prisma.customerMemory.upsert = originals.upsert; prisma.customerMemory.findUnique = originals.find; prisma.customerMemory.updateMany = originals.update; });
+  let latest: any = null;
+  let insights = ['owner:preserve-this'];
+  (prisma.unifiedConversation.findFirst as any) = async () => ({ sessionId: 'emoji-session', startedAt: new Date(0) });
+  (prisma.message.findFirst as any) = async ({ where }: any) => { assert.equal(where.direction, 'outbound'); return latest; };
+  (prisma.customerMemory.upsert as any) = async () => ({});
+  (prisma.customerMemory.findUnique as any) = async () => ({ keyInsights: [...insights] });
+  (prisma.customerMemory.updateMany as any) = async ({ where, data }: any) => {
+    if (JSON.stringify(where.keyInsights.equals) !== JSON.stringify(insights)) return { count: 0 };
+    insights = data.keyInsights.set; return { count: 1 };
+  };
+  const reply = `Welcome. ${REPLY_EMOJI.welcome}`;
+  const settings = { replyType: 'welcome' as const, userMessage: '', log: () => {} };
+  const results = await Promise.all([enforceEmojiPolicy('emoji-customer', 'whatsapp', reply, settings), enforceEmojiPolicy('emoji-customer', 'whatsapp', reply, settings)]);
+  assert.equal(results.filter(value => emojisIn(value).length).length, 1);
+  assert.ok(insights.includes('owner:preserve-this'));
+  latest = { id: 'emoji-outbound', content: reply };
+  assert.equal(await enforceEmojiPolicy('emoji-customer', 'whatsapp', reply, settings), 'Welcome.');
+  latest = { id: 'plain-outbound', content: 'Your session details are saved.' };
+  assert.equal(await enforceEmojiPolicy('emoji-customer', 'whatsapp', reply, settings), reply);
+  (prisma.message.findFirst as any) = async () => { throw new Error('synthetic storage failure'); };
+  assert.equal(await enforceEmojiPolicy('emoji-customer', 'whatsapp', reply, settings), 'Welcome.');
+});
+
+test('emoji verifier preserves money checks and central template restrictions', async () => {
+  const facts = { amounts: [2000], deposits: [2000], editions: [], emojiContext: { userMessage: REPLY_EMOJI.welcome, replyType: 'other' as const } };
+  for (const text of [`Ksh 2,000 ${REPLY_EMOJI.welcome}`, `Ksh 2,000${REPLY_EMOJI.welcome}`]) {
+    assert.deepEqual(currencyAmounts(text), [2000]);
+    assert.deepEqual(verifyModelReply(text, facts).reasons, []);
+    const verified = await verifyWithOneRetry(text, facts, async () => assert.fail('emoji cleanup needs no model retry'), async () => assert.fail('valid price needs no escalation'));
+    assert.equal(verified.reply, 'Ksh 2,000');
+  }
+  assert.ok(verifyModelReply(`Ksh 9,999 ${REPLY_EMOJI.welcome}`, facts).reasons.length);
+  const greeting = `Welcome. ${REPLY_EMOJI.welcome}\nYour family is welcome. ${REPLY_EMOJI.family}`;
+  assert.equal(emojisIn(applyEmojiPolicy(greeting, { replyType: 'welcome', userMessage: '' })).length, 2);
+  assert.equal(emojisIn(templateEmojiReply('The Muse it is. What date would suit you?', 'packageChosen', { userMessage: '' })).length, 0);
+  assert.equal(emojisIn(templateEmojiReply('The Muse it is. What date would suit you?', 'packageChosen', { userMessage: REPLY_EMOJI.welcome })).length, 1);
+  assert.equal(applyEmojiPolicy(`Welcome. ${REPLY_EMOJI.welcome}`, { replyType: 'welcome', forbidden: true }), 'Welcome.');
+  const history = [{ role: 'assistant', content: `Reply yes. ${REPLY_EMOJI.slotAvailable}` }, { role: 'user', content: REPLY_EMOJI.welcome }];
+  assert.equal(stripAssistantEmojis(history)[0].content, 'Reply yes. ');
+  assert.equal(stripAssistantEmojis(history)[1].content, REPLY_EMOJI.welcome);
+  const source = readFileSync(path.resolve(__dirname, 'emoji-policy.ts'), 'utf8');
+  assert.doesNotMatch(source, /[\u00c3\u00c2\u00e2\u00f0\ufffd]/);
+  assert.equal(emojisIn(source).length, 0);
+});
+
+test('emoji-bearing templates preserve confirmation, addon, reschedule and catalog matchers', async () => {
+  const flows = new ConversationFlowMatcher();
+  const withEmoji = (text: string) => [{ role: 'assistant' as const, content: `${text} ${REPLY_EMOJI.slotAvailable}` }];
+  const proposal = buildBookingProposalConfirmation('THE MUSE', '2026-10-09', '14:00', 2000);
+  assert.equal(previousMessageRequestsConfirmation(withEmoji(proposal)), true);
+  assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: `Reply ${REPLY_EMOJI.welcome}yes to confirm.` }]), true);
+  assert.equal(isAddonListFollowUp('show me', withEmoji('Noted for your session: Fiesta House Power Suit.')), true);
+  assert.equal(isAddonListFollowUp('show me', withEmoji(ADDON_LINK_REPLY)), false);
+  assert.equal(flows.isTimeOnlyRescheduleSelection('11am', withEmoji('What new time would you like?')), true);
+  assert.equal(flows.isRescheduleQuestion(withEmoji('What date and time would you like?')), true);
+  assert.equal(flows.isRescheduleSelection('Friday at 2pm', withEmoji('What date and time would you like?')), true);
+  assert.equal(flows.isPackageCatalogRequest('tell me about them', withEmoji('Our editions are listed on the website.')), true);
+  assert.equal(flows.isPackageInclusionFollowUp('what does each include?', withEmoji('All current editions are listed here.')), true);
+  assert.equal(extractStatedSlots('Maryanne', stripAssistantEmojis(withEmoji('What is your name?'))).name, 'Maryanne');
+  const instance = withQuietAgent({
+    rememberBookingSlots: async () => null,
+    tryImmediateConfirmation: async () => 'Financial reply remains exact: Ksh 2,000.',
+    runAgent: async () => assert.fail('decorated proposal must still match confirmation'),
+  });
+  assert.equal(await instance.handleMessage('emoji-matcher', 'yes', withEmoji(proposal), 'whatsapp'), 'Financial reply remains exact: Ksh 2,000.');
+  assert.equal(instance.shouldUseInvoiceRequestReply('send it again', stripAssistantEmojis(withEmoji('Your invoice is attached.'))), true);
+  assert.equal(instance.shouldUseInvoiceRequestReply('send it again', withEmoji('Your invoice is attached.')), true);
+  assert.equal(catalogLinkFollowUp('list them here', withEmoji(ADDON_LINK_REPLY)), true);
+  assert.deepEqual(selectedAddons('yes', withEmoji('Would you like to add styled wig hire?')).map(value => value.sku), ['wig_hire']);
+  assert.ok(addonSelectionClarification('yes', withEmoji('Would you like extra makeup or styled wig hire?')));
+  assert.equal(isExplicitSelfMakeupAnswer('for me'), true);
+  assert.equal(isExplicitSelfMakeupAnswer("No, I don't want it for me"), false);
+  const past = withEmoji('The most recent past booking I have on record is THE MUSE.');
+  assert.equal(isPastAppointmentFollowUp('yes', past), isPastAppointmentFollowUp('yes', stripAssistantEmojis(past)));
+  const appointment = [{ role: 'user' as const, content: 'Tell me about my upcoming session' }, ...withEmoji('Your Muse session is confirmed.')];
+  assert.equal(wasUpcomingAppointmentDetailsJustProvided(appointment), true);
+});
+
+test('emoji pipeline applies templates, cleans model suggestions and keeps negative replies plain', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach(restore => restore()));
+  let insights: string[] = [];
+  let latest: any = null;
+  stub(prisma.unifiedConversation, 'findFirst', async () => ({ sessionId: 'pipeline-emoji', startedAt: new Date(0) }));
+  stub(prisma.message, 'findFirst', async () => latest);
+  stub(prisma.customerMemory, 'upsert', async () => ({}));
+  stub(prisma.customerMemory, 'findUnique', async () => ({ keyInsights: [...insights], preferredPackages: [], totalBookings: 0, relationshipStage: 'new' }));
+  stub(prisma.customerMemory, 'updateMany', async ({ where, data }: any) => {
+    if (JSON.stringify(where.keyInsights.equals) !== JSON.stringify(insights)) return { count: 0 };
+    insights = data.keyInsights.set; return { count: 1 };
+  });
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Maryanne', bookings: [] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  const instance = withQuietAgent({
+    decorateTemplateEmoji: (AgentService.prototype as any).decorateTemplateEmoji,
+    getGreetingReply: async () => 'Welcome to Fiesta House Maternity. What kind of session are you planning?',
+    runAgent: (AgentService.prototype as any).runAgent,
+    createCompletionWithToolNameGuard: async () => ({ provider: 'groq', completionCalls: 1,
+      response: { choices: [{ message: { role: 'assistant', content: `Welcome. ${REPLY_EMOJI.welcome} \u2728` } }], usage: { total_tokens: 1 } } }),
+  });
+  const greeting = await instance.handleMessage('emoji-pipeline', 'Hi', [], 'whatsapp');
+  assert.equal(greeting, `Welcome to Fiesta House Maternity. ${REPLY_EMOJI.welcome} What kind of session are you planning?`);
+  latest = { id: 'greeting-outbound', content: greeting };
+  assert.equal(await instance.handleMessage('emoji-pipeline', 'Hi', [], 'whatsapp'), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
+  latest = { id: 'plain-outbound', content: 'Your details are saved.' };
+  const model = await instance.runAgent('emoji-pipeline', 'Tell me about your studio.', [], 'whatsapp');
+  assert.equal(model.content, `Welcome. ${REPLY_EMOJI.welcome}`);
+  const negative = await instance.runAgent('emoji-pipeline', 'I am frustrated.', [], 'whatsapp');
+  assert.equal(negative.content, 'Welcome.');
+  const reasons: string[] = [];
+  applyEmojiPolicy(`Ksh 2,000. ${REPLY_EMOJI.welcome}`, { log: reason => reasons.push(reason) });
+  assert.deepEqual(reasons, ['financial']);
+  const long = 'a'.repeat(4094) + '.';
+  assert.equal(applyEmojiPolicy(`${long} ${REPLY_EMOJI.welcome}`, { replyType: 'welcome' }), long);
+  const oldRule = 'No emojis unless the customer uses them.';
+  const newRule = 'Emojis are suggestions only; code enforces whitelist, sentence-end placement, limits, context and repetition. Prefer plain text; never decorate money or handoffs.';
+  const prompt = instance.getSystemPrompt('', 'whatsapp', false, false);
+  const oldPrompt = prompt.replace(newRule, oldRule);
+  assert.ok(prompt.includes(newRule));
+  console.info('[EMOJI_PROMPT_SIZE]', JSON.stringify({ oldChars: oldPrompt.length, newChars: prompt.length, deltaChars: prompt.length - oldPrompt.length }));
+});
 
 test('Legend detail withholds disputed wig inclusions even when runtime and seed both say included', async (context) => {
   const original = prisma.package.findMany;
@@ -317,7 +498,7 @@ test('brand and voice replace redundant rules while retaining the complete clien
   assert.match(BRAND_RULES, /all-women, professionally trained.*relevant AND verified/);
   assert.ok(BRAND_RULES.includes(BRAND_SLOGAN));
   assert.match(BRAND_RULES, /at most once per conversation.*greeting or closing.*never in a price, policy or booking/);
-  assert.match(VOICE_RULES, /never photoshoot.*glow.*hashtags.*emojis unless/);
+  assert.match(VOICE_RULES, /never photoshoot.*glow.*hashtags.*Emojis are suggestions only/);
   assert.doesNotMatch(prompt, /D1\. IDENTITY|D2\. VOICE|D3\. CONTEXT|D6\. OWN ERRORS/);
 });
 
@@ -334,6 +515,264 @@ test('reworded replies preserve confirmation and add-on matchers', () => {
   assert.equal(repeatedCollectionQuestion('What is your name and which package would you like?', draft), 'Your session details are noted. Would you like to go ahead?');
   assert.equal(repeatedCollectionQuestion('Which package?', { ...draft, date: null }), 'What date would suit you?');
   assert.equal(repeatedCollectionQuestion('Which package?', { ...draft, step: 'awaiting_confirmation' }), null);
+});
+
+test('customer name recall uses the durable profile without model or collection', async (context) => {
+  const original = prisma.customer.findUnique;
+  context.after(() => { prisma.customer.findUnique = original; });
+  let storedName: string | null = 'Maryanne';
+  (prisma.customer.findUnique as any) = async ({ where }: any) => {
+    assert.equal(where.id, 'synthetic-name-recall'); return storedName === null ? null : { name: storedName };
+  };
+  const instance = withQuietAgent({
+    rememberBookingSlots: async () => assert.fail('name recall must not collect booking details'),
+    runAgent: async () => assert.fail('name recall must not reach the model'),
+  });
+  const history = [{ role: 'assistant' as const, content: 'The session is for your sister Joan. Could you share your full name?' }];
+  for (const message of ['So whats my name? Do you know it?', "What's my name?", 'Do you remember my name?', 'Tell me my name']) {
+    assert.equal(await instance.handleMessage('synthetic-name-recall', message, history, 'whatsapp'), 'I have your name saved as Maryanne.');
+  }
+  const restarted = withQuietAgent({ rememberBookingSlots: async () => assert.fail('name recall must be read-only'),
+    runAgent: async () => assert.fail('restart must still use the profile') });
+  assert.equal(await restarted.handleMessage('synthetic-name-recall', 'Do you know my name?', [], 'whatsapp'), 'I have your name saved as Maryanne.');
+  for (const value of [null, 'WhatsApp User', 'Unknown', 'No its Joan', 'Send me the invoice', '']) {
+    storedName = value;
+    const reply = await instance.handleMessage('synthetic-name-recall', 'What is my name?', history, 'whatsapp');
+    assert.match(reply, /don't have your name saved.*What name/);
+    assert.doesNotMatch(reply, /Joan|package|full name/);
+  }
+});
+
+test('addon status question checks recorded extras instead of the catalog', async () => {
+  const instance = withQuietAgent({
+    rememberBookingSlots: async () => assert.fail('addon status must not collect booking details'),
+    getPreviousAddonReply: async () => 'Recorded for your Muse session: Fiesta House Power Suit (Ksh 10,000).',
+    getCatalogDisplayReply: async () => assert.fail('status question must not show the catalog'),
+    runAgent: async () => assert.fail('status question must not reach the model'),
+  });
+  for (const message of ['have you added the add-on', 'Did you save the Power Suit?', 'Have you included my extras?']) {
+    assert.match(await instance.handleMessage('synthetic-addon-status', message, [], 'whatsapp'), /Recorded.*Power Suit/);
+  }
+});
+
+test('addon status reads booking-linked records and handles missing or failed storage honestly', async (context) => {
+  const originals = { bookings: prisma.booking.findMany, addons: prisma.bookingAddon.findMany, customer: prisma.customer.findUnique };
+  context.after(() => { prisma.booking.findMany = originals.bookings; prisma.bookingAddon.findMany = originals.addons; prisma.customer.findUnique = originals.customer; });
+  const booking = { id: 'synthetic-status-session', service: 'THE MUSE', dateTime: new Date(), recipientName: null, customer: { name: 'Maryanne' } };
+  let bookings: any[] = [booking];
+  let addons: any[] = [{ bookingId: booking.id, name: 'Fiesta House Power Suit', quantity: 1, totalPrice: 10000 }];
+  let fail = false;
+  (prisma.booking.findMany as any) = async ({ where }: any) => {
+    if (fail) throw new Error('synthetic storage failure');
+    assert.equal(where.customerId, 'synthetic-status'); assert.equal(where.status.not, 'cancelled'); return bookings;
+  };
+  (prisma.bookingAddon.findMany as any) = async ({ where }: any) => {
+    assert.deepEqual(where.bookingId.in, bookings.map(value => value.id));
+    assert.deepEqual(where.status.in, ['pending', 'confirmed', 'invoiced']); return addons;
+  };
+  const instance = withQuietAgent({
+    rememberBookingSlots: async () => assert.fail('read-only question must not capture slots'),
+    getPreviousAddonReply: (AgentService.prototype as any).getPreviousAddonReply,
+    getCatalogDisplayReply: async () => assert.fail('status must not fall through to catalog'),
+    runAgent: async () => assert.fail('status must not fall through to model'),
+  });
+  const status = () => instance.handleMessage('synthetic-status', 'have you added the add-on', [], 'whatsapp');
+  assert.match(await status(), /selected add-ons.*THE MUSE.*Power Suit.*10,000/);
+  addons = [];
+  assert.match(await status(), /don't see any add-ons selected for your upcoming sessions/);
+  bookings = [];
+  assert.match(await status(), /could not find add-ons linked to an upcoming session/);
+  fail = true;
+  assert.match(await status(), /could not check your saved add-ons/);
+  (prisma.customer.findUnique as any) = async () => { throw new Error('synthetic profile failure'); };
+  assert.match(await instance.handleMessage('synthetic-status', 'What is my name?', [], 'whatsapp'), /could not check your saved name/);
+  assert.equal(instance.shouldUsePreviousAddonReply('What add-ons are available?'), false);
+  assert.equal(instance.shouldUsePreviousAddonReply('Add the Fiesta House Power Suit'), false);
+});
+
+test('full-name request is blocked when the customer name is already saved', () => {
+  const reply = 'Could you please share your full name so we can address you correctly?';
+  assert.equal(repeatedCollectionQuestion(reply, null, 'Maryanne'), 'I have your name saved as Maryanne.');
+  const draft = { step: 'collecting_slots', name: 'Maryanne', service: 'THE MUSE', date: null, time: null };
+  assert.equal(repeatedCollectionQuestion(reply, draft, 'Maryanne'), 'What date would suit you?');
+  assert.equal(repeatedCollectionQuestion(reply, null, 'Unknown'), null);
+  assert.equal(repeatedCollectionQuestion(reply, { ...draft, step: 'payment_pending' }, 'Maryanne'), null);
+});
+
+test('confirmed session guard blocks collection restart without a draft but permits a new booking', () => {
+  const booking = { status: 'confirmed', service: 'THE MUSE', dateTime: new Date('2026-10-09T11:00:00Z') };
+  const guard = repeatedCollectionQuestion;
+  const restart = 'Could you share your name, the package you would like, and a preferred date and time for the shoot?';
+  const reply = guard(restart, null, 'Maryanne', 'Okay...is that it?', booking);
+  assert.match(reply || '', /Muse.*9 October 2026.*2:00 PM/);
+  assert.doesNotMatch(reply || '', /deposit.*paid|payment.*received/i);
+  assert.equal(guard('Which package would you like?', null, 'Maryanne', 'I want to book another session', booking), null);
+  assert.equal(guard('Which package would you like?', { step: 'collecting_slots', service: null }, 'Maryanne', 'Okay', booking), null);
+  const cancelledReply = guard(restart, null, 'Maryanne', 'Okay', { ...booking, status: 'cancelled' });
+  assert.equal(cancelledReply, 'I have your name saved as Maryanne.');
+  assert.doesNotMatch(cancelledReply || '', /confirmed/);
+});
+
+test('confirmed session follow-up uses saved extras without history and yields to active drafts', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, bookings: prisma.booking.findMany };
+  context.after(() => { prisma.bookingDraft.findUnique = originals.draft; prisma.booking.findMany = originals.bookings; });
+  let draft: any = null;
+  const booking = { id: 'muse-session', status: 'confirmed', service: 'THE MUSE', dateTime: new Date(Date.now() + 7 * 86400000),
+    bookingAddons: [{ name: 'Fiesta House Power Suit', quantity: 1, totalPrice: 10000 }] };
+  let bookings = [booking];
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.booking.findMany as any) = async ({ where, take }: any) => {
+    assert.equal(where.status, 'confirmed'); assert.equal(take, 2);
+    assert.ok(where.dateTime.gte instanceof Date);
+    return bookings;
+  };
+  const instance = withQuietAgent({ getConfirmedSessionFollowUpReply: (AgentService.prototype as any).getConfirmedSessionFollowUpReply,
+    runAgent: async () => assert.fail('confirmed follow-up must not reach the model') });
+  for (const message of ['Okay...is that it?', 'Is that all?', 'Are we all set?', 'Anything else?']) {
+    assert.equal(isConfirmedSessionFollowUp(message), true);
+    const reply = await instance.handleMessage('synthetic-confirmed', message, [], 'whatsapp');
+    assert.match(reply, /Muse.*remains confirmed.*Power Suit.*10,000/);
+    assert.doesNotMatch(reply, /which package|share your name|deposit.*paid/i);
+  }
+  assert.equal(isConfirmedSessionFollowUp('Okay, is that it? I want another session'), false);
+  for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending', 'reschedule_collecting', 'reschedule_confirm', 'cancel_confirm']) {
+    draft = { step, createdAt: new Date(), service: 'THE ICON' };
+    assert.equal(await instance.getConfirmedSessionFollowUpReply('synthetic-confirmed'), null);
+  }
+  draft = null;
+  bookings = [booking, { ...booking, id: 'second-session', service: 'THE ICON' }];
+  assert.match(await instance.getConfirmedSessionFollowUpReply('synthetic-confirmed'), /more than one confirmed session.*Which session/);
+  bookings = [];
+  assert.equal(await instance.getConfirmedSessionFollowUpReply('synthetic-confirmed'), null);
+});
+
+test('invoice request bypasses slot capture even after a stale name question', async () => {
+  const history = [{ role: 'assistant' as const, content: 'Could you share your name, the package you would like, and a preferred date and time for the shoot?' }];
+  assert.equal(extractStatedSlots('Send me the invoice', history).name, undefined);
+  let captures = 0;
+  const instance = withQuietAgent({
+    rememberBookingSlots: async () => { captures++; return 'Which package would you like for your session?'; },
+    sendStoredInvoiceToCustomer: async () => 'Saved invoice delivered.',
+    runAgent: async () => assert.fail('invoice request must not reach the model'),
+  });
+  assert.equal(await instance.handleMessage('synthetic-invoice', 'Send me the invoice', history, 'whatsapp'), 'Saved invoice delivered.');
+  assert.equal(captures, 0);
+});
+
+test('confirmed Muse transcript preserves the session and refreshes its invoice after the Power Suit', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  const customerId = 'synthetic-muse-customer';
+  const addons: any[] = [];
+  const notes: any[] = [];
+  const booking = { id: 'synthetic-muse-booking', customerId, status: 'confirmed', service: 'THE MUSE',
+    dateTime: new Date('2026-10-09T11:00:00Z'), recipientName: null,
+    customer: { name: 'Maryanne', phone: 'synthetic-phone' }, bookingAddons: addons };
+  const before = { service: booking.service, status: booking.status, dateTime: booking.dateTime.getTime() };
+  let invoice: any = { id: 'synthetic-muse-invoice', invoiceNumber: 'INV-2026-010', bookingId: booking.id, customerId,
+    total: 25000, depositPaid: 2000, balanceDue: 23000, tax: 0, discount: 0, status: 'sent',
+    createdAt: new Date(), sentAt: new Date(), booking, pdfData: Buffer.from('original-pdf') };
+  const documents: any[] = [];
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  for (const method of ['upsert', 'updateMany', 'deleteMany']) {
+    stub(prisma.bookingDraft, method, async () => assert.fail('confirmed follow-ups must not create or change a draft'));
+  }
+  stub(prisma.booking, 'findFirst', async ({ where }: any) => { assert.equal(where.customerId, customerId); return booking; });
+  stub(prisma.booking, 'findMany', async ({ where }: any) => { assert.equal(where.customerId, customerId); return [booking]; });
+  stub(prisma.booking, 'findUnique', async ({ where }: any) => { assert.equal(where.id, booking.id); return booking; });
+  stub(prisma.booking, 'update', async () => assert.fail('confirmed follow-ups must not alter the booking'));
+  stub(prisma.customerSessionNote, 'findFirst', async () => null);
+  stub(prisma.customerSessionNote, 'create', async ({ data }: any) => {
+    assert.equal(data.bookingId, booking.id);
+    const note = { id: 'synthetic-addon-note', ...data }; notes.push(note); return note;
+  });
+  stub(prisma.customerSessionNote, 'findMany', async ({ where }: any) => {
+    assert.equal(where.bookingId, booking.id); return notes;
+  });
+  stub(prisma.bookingAddon, 'findFirst', async () => null);
+  stub(prisma.bookingAddon, 'create', async ({ data }: any) => {
+    assert.equal(data.bookingId, booking.id); addons.push({ id: 'synthetic-power-suit', ...data }); return addons[0];
+  });
+  stub(prisma.bookingAddon, 'findMany', async ({ where }: any) => {
+    assert.ok(where.OR.some((scope: any) => scope.bookingId === booking.id)); return addons;
+  });
+  stub(prisma.bookingAddon, 'updateMany', async () => {
+    addons.forEach(addon => { addon.status = 'invoiced'; }); return { count: addons.length };
+  });
+  stub(prisma.notification, 'create', async () => ({}));
+  stub(prisma.invoice, 'findFirst', async ({ where }: any) => { assert.equal(where.customerId, customerId); return invoice; });
+  stub(prisma.invoice, 'findUnique', async ({ where }: any) => { assert.equal(where.bookingId, booking.id); return invoice; });
+  stub(prisma.invoice, 'update', async ({ where, data }: any) => {
+    assert.equal(where.id, invoice.id); invoice = { ...invoice, ...data }; return invoice;
+  });
+  stub(prisma.package, 'findFirst', async () => ({ name: 'THE MUSE', price: 25000 }));
+  stub(prisma.payment, 'findMany', async ({ where }: any) => {
+    assert.equal(where.bookingId, booking.id); assert.equal(where.status, 'success');
+    return [{ amount: 2000, mpesaReceipt: 'SYNTHETIC-RECEIPT' }];
+  });
+  stub(invoiceService, 'generatePdf', async (data: any) => {
+    assert.equal(data.total, 35000); assert.equal(data.depositPaid, 2000); assert.equal(data.balanceDue, 33000);
+    assert.match(data.addonLines[0].name, /Power Suit/); return Buffer.from('updated-pdf');
+  });
+  stub(whatsappService, 'sendDocument', async (recipient: string, pdf: Buffer, filename: string, caption: string) => {
+    assert.equal(recipient, customerId); documents.push({ pdf, filename, caption });
+  });
+  stub(whatsappService, 'sendMessage', async () => assert.fail('PDF send must succeed in this fixture'));
+  const instance = withQuietAgent({
+    naturalAssistantMode: true,
+    rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots,
+    getBookingProgressReply: (AgentService.prototype as any).getBookingProgressReply,
+    getConfirmedSessionFollowUpReply: (AgentService.prototype as any).getConfirmedSessionFollowUpReply,
+    getCatalogDisplayReply: async () => ADDON_LINK_REPLY,
+    executeProposeBookingTool: async () => assert.fail('must not propose another booking'),
+    executeConfirmBookingTool: async () => assert.fail('must not send another payment prompt'),
+    runAgent: async () => assert.fail('transcript must remain code-controlled'),
+  });
+  const history: { role: 'user' | 'assistant'; content: string }[] = [{ role: 'assistant', content:
+    'Payment received successfully. Your THE MUSE session is confirmed. Amount paid: KSh 2,000. Session: Friday, 9 October 2026 at 14:00. Invoice: INV-2026-010.' }];
+  const turn = async (message: string) => {
+    const reply = await instance.handleMessage(customerId, message, history.slice(-6), 'whatsapp');
+    history.push({ role: 'user', content: message }, { role: 'assistant', content: reply }); return reply;
+  };
+  assert.match(await turn('What are these add-ons?'), /session-packages/);
+  assert.match(await turn('I want we include the fiesta house power suit'), /Power Suit.*10,000/);
+  assert.equal(addons.length, 1);
+  assert.match(await turn('Okay...is that it?'), /Muse.*9 October 2026.*2:00 PM.*Power Suit/);
+  assert.match(await turn('Send me the invoice'), /sent your invoice as a PDF/);
+  assert.equal(documents.length, 1);
+  assert.equal(documents[0].filename, 'INV-2026-010.pdf');
+  assert.match(documents[0].caption, /Power Suit.*10,000[\s\S]*Total: KSh 35,000[\s\S]*Deposit Paid: KSh 2,000[\s\S]*Balance Due: KSh 33,000/);
+  assert.equal(documents[0].pdf.toString(), 'updated-pdf');
+  assert.deepEqual({ service: booking.service, status: booking.status, dateTime: booking.dateTime.getTime() }, before);
+  assert.equal(invoice.bookingId, booking.id);
+});
+
+test('confirmed session model context supplies known slots and blocks an actual collection restart', async (context) => {
+  const restores: (() => void)[] = [];
+  const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
+    const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
+  };
+  context.after(() => restores.reverse().forEach((restore) => restore()));
+  const booking = { id: 'synthetic-model-session', status: 'confirmed', service: 'THE MUSE', dateTime: new Date('2026-10-09T11:00:00Z'),
+    bookingAddons: [], sessionNotes: [], recipientName: null };
+  stub(prisma.customer, 'findUnique', async () => ({ name: 'Maryanne', bookings: [booking] }));
+  stub(prisma.bookingDraft, 'findUnique', async () => null);
+  stub(prisma.payment, 'findFirst', async () => ({ status: 'success', amount: 2000 }));
+  stub(prisma.customerMemory, 'findUnique', async () => null);
+  stub(knowledgeRetrieval, 'search', async () => []);
+  const instance = withQuietAgent({ runAgent: (AgentService.prototype as any).runAgent,
+    createCompletionWithToolNameGuard: async ({ messages }: any) => {
+      assert.match(messages[0].content, /Known so far: name="Maryanne"; package="THE MUSE"; date="2026-10-09"; time="14:00"/);
+      return { provider: 'groq', completionCalls: 1, response: { choices: [{ message: { role: 'assistant',
+        content: 'Could you share your name, the package you would like, and a preferred date and time for the shoot?' } }], usage: { total_tokens: 1 } } };
+    },
+  });
+  const result = await instance.runAgent('synthetic-model-customer', 'What do you still need from me?', [], 'whatsapp');
+  assert.match(result.content, /Muse.*9 October 2026.*2:00 PM.*remains confirmed/);
+  assert.doesNotMatch(result.content, /share your name|which package|preferred date/i);
 });
 
 test('warm booking closing requires both a confirmed booking and successful payment', async (context) => {
@@ -733,7 +1172,7 @@ test('verifier escalation cooldown is customer-scoped and expires after ten minu
   assert.equal(notify('customer-a'), true);
 });
 
-test('retired package names, lashes and the budget reply never invent editions or facts', async () => {
+test('retired package names, the lashes FAQ and the budget reply use approved facts', async () => {
   assert.doesNotMatch(buildPackageBudgetReply(), /ROYAL/);
   assert.match(legacyPackageReply('Do you have a standard package?') || '', /^We don't have a Standard package\..*THE BLOOM is the entry option/);
   assert.match(legacyPackageReply('is there a vip session') || '', /VIP package/);
@@ -744,9 +1183,10 @@ test('retired package names, lashes and the budget reply never invent editions o
     escalate: async (_customer: string, _type: string, description: string) => { escalations.push(description); },
     runAgent: async () => assert.fail('lashes and retired package names must not reach the model'),
   });
-  assert.equal(await instance.handleMessage('synthetic-lashes', 'Do you offer eye lashes services in the makeup?', [], 'whatsapp'), LASHES_TEAM_REPLY);
-  assert.equal(escalations.length, 1);
-  assert.match(escalations[0], /owner_fact_question.*lashes/);
+  assert.equal(await instance.handleMessage('synthetic-lashes', 'Do you offer eye lashes services in the makeup?', [], 'whatsapp'), LASHES_FAQ_REPLY);
+  assert.equal(escalations.length, 0);
+  assert.match(LASHES_FAQ_REPLY, /included in all our makeup services/);
+  assert.match(LASHES_FAQ_REPLY, /extra professional makeup add-on also includes lashes/);
   assert.match(await instance.handleMessage('synthetic-lashes', 'Do you have a standard package?', [], 'whatsapp'), /We don't have a Standard package/);
   assert.match(VERIFIER_FALLBACK, /passed your question to the studio team.*0720 111928/);
 });
@@ -1022,8 +1462,19 @@ test('add-on consent rejects questions and scopes quantities to each explicit ch
   });
 });
 
+test('extra-makeup inquiries explain the add-on without implying it was selected', () => {
+  const reply = addonInquiryReply('In the add-ons I saw extra professional makeup..tell me about that..what does it entail');
+  assert.ok(reply);
+  assert.match(reply, /Ksh 3,500 per session/);
+  assert.match(reply, /included in all packages/);
+  assert.match(reply, /for you or someone joining your session/);
+  assert.match(reply, /includes lashes/);
+  assert.match(reply, /add it for yourself or someone else/);
+  assert.equal(selectedAddons('In the add-ons I saw extra professional makeup..tell me about that..what does it entail').length, 0);
+});
+
 test('negated extras never save and mixed negation selects only the wanted outfit', async (context) => {
-  assert.equal(addonSelectionClarification('I want extra makeup'), 'Is the extra makeup for another person?');
+  assert.equal(addonSelectionClarification('I want extra makeup'), ADDON_MAKEUP_CLARIFICATION);
   assert.match(addonSelectionClarification('yes', [{ role: 'assistant', content: 'Would you like extra makeup or styled wig hire?' }]) || '', /Which add-on/);
   const original = prisma.customerSessionNote.findFirst;
   (prisma.customerSessionNote.findFirst as any) = async () => { assert.fail('negation must stop before storage'); };
@@ -1085,7 +1536,7 @@ test('single versus multi offers and makeup recipients require unambiguous conse
   assert.match(multi, /Which add-on/);
   assert.equal(notes.length, 0);
   const question = await instance.handleMessage('offer', 'I want extra makeup', [], 'whatsapp');
-  assert.equal(question, 'Is the extra makeup for another person?');
+  assert.equal(question, ADDON_MAKEUP_CLARIFICATION);
   assert.equal(notes.length, 0);
   await instance.handleMessage('offer', 'For my sister', [{ role: 'assistant', content: question }], 'whatsapp');
   assert.equal(notes.length, 1);
@@ -1696,7 +2147,7 @@ test('collecting_slots ignores confirmations and reports nothing pending', async
 });
 
 test('proposals require a usable name and preserve a fuller customer name', async (context) => {
-  for (const name of ['', ' ', 'Unknown', 'WhatsApp User', '\r\n', '123']) {
+  for (const name of ['', ' ', 'Unknown', 'WhatsApp User', '\r\n', '123', 'Thats correct thank you', 'Thank you', 'Send me the invoice', 'No its Joan']) {
     await assert.rejects(agent.executeProposeBookingTool('name-customer', name, 'THE BLOOM', '2026-10-06T10:00'), /Customer name is required/);
   }
   const originals = {
@@ -1726,7 +2177,9 @@ function withQuietAgent(overrides: Record<string, unknown>) {
   const instance = new AgentService() as any;
   Object.assign(instance, {
     rememberBookingSlots: async () => null,
+    decorateTemplateEmoji: async (_customer: string, _platform: string, reply: string) => reply,
     getBookingProgressReply: async () => null,
+    getConfirmedSessionFollowUpReply: async () => null,
     getCatalogBookingQuestion: async () => null,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
@@ -2409,22 +2862,24 @@ test('payment-pending reply uses a real apostrophe', async () => {
 });
 
 // #2 Date hijacking
-test('regex extraction never treats pregnancy months or hours as a day of month', () => {
+test('regex extraction never treats pregnancy months or hours as a day of month', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-06T06:00:00Z').getTime() });
   for (const message of [
     "I'm 7 months pregnant, can we do Saturday at 3pm?",
     'Can we book THE ICON at 3pm please',
     'Can we do 15:00 on Saturday for the icon',
     'october at 3pm would be lovely',
   ]) {
-    assert.equal(extractor.regexExtract(message).date, null, message);
+    assert.equal(BookingExtractor.regexExtract(message).date, null, message);
   }
 });
 
-test('regex extraction accepts ordinals, month-adjacent days and ISO dates', () => {
-  assert.equal(dayjs(extractor.regexExtract('the 12th at 3pm please').date).date(), 12);
-  assert.equal(dayjs(extractor.regexExtract('can we do 3 Oct at 3pm').date).date(), 3);
-  assert.equal(dayjs(extractor.regexExtract('October 3 at 10am works').date).date(), 3);
-  assert.equal(extractor.regexExtract('book 2026-11-14 at 3pm').date, '2026-11-14');
+test('regex extraction accepts ordinals, month-adjacent days and ISO dates', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-06T06:00:00Z').getTime() });
+  assert.equal(dayjs(BookingExtractor.regexExtract('the 12th at 3pm please').date).date(), 12);
+  assert.equal(dayjs(BookingExtractor.regexExtract('can we do 3 Oct at 3pm').date).date(), 3);
+  assert.equal(dayjs(BookingExtractor.regexExtract('October 3 at 10am works').date).date(), 3);
+  assert.equal(BookingExtractor.regexExtract('book 2026-11-14 at 3pm').date, '2026-11-14');
 });
 
 test('a bare number cannot override the requested weekday', () => {
@@ -2581,19 +3036,20 @@ test('date signals ignore bare numbers but keep weekdays, relative days and real
 });
 
 // Follow-up #3: month names
-test('regex extraction uses the month name and rolls into next year when it has passed', () => {
+test('regex extraction uses the month name and rolls into next year when it has passed', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-06T06:00:00Z').getTime() });
   const today = nowInBusinessTimezone().startOf('day');
   for (const [message, month, day] of [
     ['can we do 3 Dec at 3pm', 11, 3],
     ['how about Jan 15 at 10am', 0, 15],
     ['the 5th of March at 2pm please', 2, 5],
   ] as const) {
-    const date = dayjs(extractor.regexExtract(message).date);
+    const date = dayjs(BookingExtractor.regexExtract(message).date);
     assert.equal(date.month(), month, message);
     assert.equal(date.date(), day, message);
     assert.ok(!date.isBefore(today, 'day') && date.isBefore(today.add(1, 'year').add(1, 'day')), message);
   }
-  assert.equal(extractor.regexExtract('can we book 31 Nov at 3pm').date, null);
+  assert.equal(BookingExtractor.regexExtract('can we book 31 Nov at 3pm').date, null);
 });
 
 // Follow-up #4: prompt sent but not recorded

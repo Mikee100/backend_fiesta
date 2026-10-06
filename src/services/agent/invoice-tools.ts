@@ -3,6 +3,7 @@ import { bookingAddonService } from '../booking/booking-addon.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { whatsappService } from '../messaging/whatsapp.service';
 import { nowInBusinessTimezone } from '../../utils/time';
+import { stripAssistantEmojis } from './emoji-policy';
 
 type HistoryMessage = { role: 'user' | 'assistant'; content: string };
 
@@ -28,13 +29,14 @@ export function extractInvoiceSessionDateRange(userMessage: string): { start: Da
   return { start: start.toDate(), end: start.add(1, 'day').toDate() };
 }
 
-export function shouldUseInvoiceRequestReply(this: any, userMessage: string, history: HistoryMessage[] = []): boolean {
+export function shouldUseInvoiceRequestReply(userMessage: string, history: HistoryMessage[] = []): boolean {
+  history = stripAssistantEmojis(history);
   const text = userMessage.toLowerCase();
   const invoiceKeywords = /(invoice|receipt|payment summary)/.test(text);
   const actionKeywords = /(send|sent|share|download|get|give(?: me)?|provide|view|need|can you|could you)/.test(text);
   if (invoiceKeywords && actionKeywords) return true;
 
-  const selectedSessionDate = this.extractInvoiceSessionDateRange(userMessage);
+  const selectedSessionDate = extractInvoiceSessionDateRange(userMessage);
   const assistantAskedForInvoiceDate = history.slice(-6).some((message) =>
     message.role === 'assistant'
     && /\binvoices?\b[\s\S]{0,300}\bwhich session date\b/i.test(message.content)
@@ -51,9 +53,11 @@ export function shouldUseInvoiceRequestReply(this: any, userMessage: string, his
   return refersToInvoice && (reportsNotReceived || resendRequest);
 }
 
-export function getInvoiceSessionDateFromHistory(this: any, history: HistoryMessage[]): { start: Date; end: Date } | null {
+export function getInvoiceSessionDateFromHistory(history: HistoryMessage[]): { start: Date; end: Date } | null {
+  history = stripAssistantEmojis(history);
   let latestInvoiceDeliveryIndex = -1;
-  history.forEach((message, index) => {
+  history.forEach((message, index) =>
+  {
     if (
       message.role === 'assistant'
       && /\binvoice\b/i.test(message.content)
@@ -67,8 +71,8 @@ export function getInvoiceSessionDateFromHistory(this: any, history: HistoryMess
   const selectedDate = history
     .slice(0, latestInvoiceDeliveryIndex)
     .reverse()
-    .find((message) => message.role === 'user' && this.extractInvoiceSessionDateRange(message.content));
-  return selectedDate ? this.extractInvoiceSessionDateRange(selectedDate.content) : null;
+    .find((message) => message.role === 'user' && extractInvoiceSessionDateRange(message.content));
+  return selectedDate ? extractInvoiceSessionDateRange(selectedDate.content) : null;
 }
 
 export function shouldDeclineConsolidatedInvoiceRequest(userMessage: string): boolean {

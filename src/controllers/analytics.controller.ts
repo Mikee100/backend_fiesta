@@ -37,17 +37,19 @@ export class AnalyticsController {
       }));
       const summary = {
         groq: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
+        groq2: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
         gemini: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
+        gemini2: { inputTokens: 0, outputTokens: 0, totalTokens: 0, calls: 0, failures: 0 },
       };
       const daily = Array.from({ length: days }, (_, index) => {
         const date = new Date(since);
         date.setUTCDate(date.getUTCDate() + index);
-        return { date: date.toISOString().slice(0, 10), groq: 0, gemini: 0 };
+        return { date: date.toISOString().slice(0, 10), groq: 0, groq2: 0, gemini: 0, gemini2: 0 };
       });
       const byDate = new Map(daily.map((day) => [day.date, day]));
 
       for (const row of rows) {
-        if (row.provider !== 'groq' && row.provider !== 'gemini') continue;
+        if (row.provider !== 'groq' && row.provider !== 'groq2' && row.provider !== 'gemini' && row.provider !== 'gemini2') continue;
         const totals = summary[row.provider];
         totals.calls++;
         if (row.status !== 'success') totals.failures++;

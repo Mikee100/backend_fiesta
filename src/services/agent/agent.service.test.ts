@@ -88,6 +88,39 @@ test('falls back to Gemini on a Groq quota error and keeps later tool rounds on 
   }
 });
 
+test('uses the secondary Groq key before Gemini and keeps later rounds on that provider', async () => {
+  const calls: string[] = [];
+  const saved: any[] = [];
+  const originalCreate = prisma.aiModelUsage.create;
+  (prisma.aiModelUsage.create as any) = async ({ data }: any) => { saved.push(data); };
+  const response = { choices: [{ message: { content: 'Ready' } }], usage: { total_tokens: 7 } };
+  const clients = {
+    groq: { chat: { completions: { create: async () => {
+      calls.push('groq');
+      throw Object.assign(new Error('primary key rate limited'), { status: 429 });
+    } } } },
+    groq2: { chat: { completions: { create: async (params: any) => {
+      calls.push(`groq2:${params.model}`);
+      return response;
+    } } } },
+    gemini: { chat: { completions: { create: async () => { calls.push('gemini'); return response; } } } },
+  } as any;
+  try {
+    const first = await createChatCompletion({ model: 'primary-model', messages: [] }, 'groq', clients);
+    assert.equal(first.provider, 'groq2');
+    const next = await createChatCompletion({ model: 'primary-model', messages: [] }, first.provider, clients);
+    assert.equal(next.provider, 'groq2');
+    assert.deepEqual(calls, ['groq', `groq2:${process.env.GROQ_2_CHAT_MODEL || process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant'}`, `groq2:${process.env.GROQ_2_CHAT_MODEL || process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant'}`]);
+    assert.deepEqual(saved.map(({ provider, status, failover }) => ({ provider, status, failover })), [
+      { provider: 'groq', status: 'failed', failover: false },
+      { provider: 'groq2', status: 'success', failover: true },
+      { provider: 'groq2', status: 'success', failover: true },
+    ]);
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
 test('skips Groq during its Retry-After cooldown and retries it after expiry', async () => {
   const originalCreate = prisma.aiModelUsage.create;
   const originalNow = Date.now;
@@ -125,7 +158,7 @@ test('skips Groq during its Retry-After cooldown and retries it after expiry', a
   }
 });
 
-test('does not route invalid Groq credentials to Gemini', async () => {
+test('routes around invalid primary Groq credentials to Gemini', async () => {
   let fallbackCalled = false;
   const originalCreate = prisma.aiModelUsage.create;
   (prisma.aiModelUsage.create as any) = async () => ({});
@@ -133,11 +166,39 @@ test('does not route invalid Groq credentials to Gemini', async () => {
     groq: { chat: { completions: { create: async () => {
       throw Object.assign(new Error('unauthorized'), { status: 401 });
     } } } },
-    gemini: { chat: { completions: { create: async () => { fallbackCalled = true; } } } },
+    gemini: { chat: { completions: { create: async () => {
+      fallbackCalled = true;
+      return { choices: [{ message: { content: 'Ready' } }] };
+    } } } },
   } as any;
   try {
-    await assert.rejects(createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients), /unauthorized/);
-    assert.equal(fallbackCalled, false);
+    const result = await createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients);
+    assert.equal(result.provider, 'gemini');
+    assert.equal(fallbackCalled, true);
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
+test('falls through all providers when each account exhausts its quota', async () => {
+  const calls: string[] = [];
+  const originalCreate = prisma.aiModelUsage.create;
+  (prisma.aiModelUsage.create as any) = async () => ({});
+  const clients = Object.fromEntries(['groq', 'groq2', 'gemini'].map((provider) => [provider, {
+    chat: { completions: { create: async () => {
+      calls.push(provider);
+      throw Object.assign(new Error('quota exhausted'), { status: 429 });
+    } } },
+  }])) as any;
+  clients.gemini2 = { chat: { completions: { create: async () => {
+    calls.push('gemini2');
+    return { choices: [{ message: { content: 'Ready' } }] };
+  } } } };
+  try {
+    const result = await createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients);
+    assert.equal(result.provider, 'gemini2');
+    assert.equal(result.completionCalls, 4);
+    assert.deepEqual(calls, ['groq', 'groq2', 'gemini', 'gemini2']);
   } finally {
     prisma.aiModelUsage.create = originalCreate;
   }
@@ -197,6 +258,10 @@ test('only applies confirmation after the assistant presented a proposal', () =>
     role: 'assistant',
     content: 'What time on Sunday, September 11 would you like to schedule the session?'
   }]), false);
+  assert.equal(agent.previousMessageRequestsConfirmation([{
+    role: 'assistant',
+    content: "To make sure I have this exactly right for you, could you please confirm that you'd like to reschedule your Goddess session to Sunday, October 11th at 2:00 PM?"
+  }]), true);
 });
 
 test('ignores duplicate yes replies after a payment prompt has already been sent', async () => {
@@ -529,7 +594,8 @@ test('date-range availability is bounded and skips Mondays and fully booked days
   assert.deepEqual(await bookingService.getAvailableSlots('2026-10-03', 90), { status: 'closed', reason: 'That date is in the past' });
 });
 
-test('availability excludes occupied appointments and competing booking drafts', async () => {
+test('availability excludes occupied appointments and competing booking drafts', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-06T06:00:00Z').getTime() });
   const originals = {
     bookingFindMany: prisma.booking.findMany,
     bookingDraftFindMany: prisma.bookingDraft.findMany,
@@ -770,6 +836,12 @@ test('confirms the original booking after a withdrawal follow-up', () => {
 
   assert.equal(agent.shouldConfirmRescheduleWithdrawal('Sure?', history), true);
   assert.equal(agent.shouldConfirmRescheduleWithdrawal('What time is it?', history), false);
+  const rescheduleConfirmation = [
+    { role: 'assistant' as const, content: 'Your current booking remains unchanged until you confirm a proposed change.' },
+    { role: 'user' as const, content: 'Lets go with 2:00 PM.' },
+    { role: 'assistant' as const, content: "Could you please confirm that you'd like to reschedule your Goddess session to Sunday at 2:00 PM?" },
+  ];
+  assert.equal(agent.shouldConfirmRescheduleWithdrawal('yes', rescheduleConfirmation), false);
 });
 
 test('returns reschedule confirmation without waiting for Google Calendar', { timeout: 1000 }, async () => {
@@ -812,7 +884,7 @@ test('returns reschedule confirmation without waiting for Google Calendar', { ti
 
   try {
     const reply = await agent.tryImmediateConfirmation('customer-123', 'yes', [{
-      role: 'assistant', content: 'If that works for you, reply yes and I will confirm it.',
+      role: 'assistant', content: "To make sure I have this exactly right for you, could you please confirm that you'd like to move your session to Sunday, October 11th at 2:00 PM?",
     }]);
 
     assert.match(reply, /session has been moved/i);

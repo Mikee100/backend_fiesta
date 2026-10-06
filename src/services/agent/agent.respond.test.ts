@@ -17,6 +17,7 @@ function createAgent(overrides: Record<string, unknown> = {}) {
   const agent = new AgentService() as any;
   Object.assign(agent, {
     checkTokenBudget: async () => true,
+    decorateTemplateEmoji: async (_customer: string, _platform: string, reply: string) => reply,
     getBookingProgressReply: async () => null,
     trackSentiment: async () => {},
     escalate: async () => {},

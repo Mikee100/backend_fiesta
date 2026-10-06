@@ -132,12 +132,22 @@
   {
     "id": "cmo8l2wb5000d10wybjgkemt1",
     "question": "Do you provide makeup?",
-    "answer": "Professional makeup is included in all our packages. Our talented makeup artists are specialized in maternity styling to ensure you look and feel your absolute best.",
+    "answer": "Professional makeup is included in all our packages. Our talented makeup artists are specialized in maternity styling to ensure you look and feel your absolute best. Lashes are included in all makeup services.",
     "category": "Services",
     "embedding": "[]",
     "mediaUrls": "[]",
     "createdAt": "2026-04-21 12:12:02.705",
     "updatedAt": "2026-04-21 12:26:08.522"
+  },
+  {
+    "id": "faq_extra_makeup_lashes_20261006",
+    "question": "Are lashes included in all makeup services, including the extra professional makeup add-on?",
+    "answer": "Lashes are included in all our makeup services, including all packages. Extra professional makeup also comes with lashes.",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-10-06 22:30:00.000",
+    "updatedAt": "2026-10-06 22:30:00.000"
   },
   {
     "id": "cmo8l2wjo000f10wyuaounzns",

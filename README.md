@@ -6,6 +6,7 @@ Product positioning:
 - Fiesta AI — Conversational Booking and Business Assistant
 
 Detailed Operational Guidelines:
+- Booking drafts, conflicts, policy routing and safe recovery: [docs/BOOKING_DRAFTS_README.md](docs/BOOKING_DRAFTS_README.md)
 - Full engine walkthrough (ingress → RAG → tools → payments → follow-ups): [docs/AI_ENGINE_DEEP_DIVE.md](docs/AI_ENGINE_DEEP_DIVE.md)
 - See comprehensive rules specification: [docs/AI_SYSTEM_RULES_AND_POLICIES.md](docs/AI_SYSTEM_RULES_AND_POLICIES.md)
 

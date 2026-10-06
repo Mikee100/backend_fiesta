@@ -5,9 +5,9 @@ import prisma from '../../config/prisma';
 import { bookingService } from '../booking/booking.service';
 import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { AgentService } from './agent.service';
-import { ADDON_DECISION_QUESTION, ADDON_OTHER_DECISION_QUESTION, nextStep, sampleSlots, STEP_QUESTIONS, type BookingSlots, type BookingStep } from './booking-progress';
+import { ADDON_DECISION_QUESTION, nextStep, sampleSlots, STEP_QUESTIONS, type BookingSlots, type BookingStep } from './booking-progress';
 import { ADDON_LINK_REPLY, ADDON_MAKEUP_CLARIFICATION, EDITION_LINK_REPLY, OFFICIAL_WEBSITE_URLS } from './constants';
-import { isAddonListRequest, isMakeupForSelf } from './addon-capture';
+import { isAddonListRequest, selectedAddons } from './addon-capture';
 import { verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { normalizeQuotes } from './regex';
 
@@ -129,16 +129,15 @@ test('a model reply claiming "I\u2019ve added ... extra" without a saved note is
   assert.match(result.content, /couldn't save that add-on/);
 });
 
-test('"No, it\'s for me" after the extra-makeup question explains it is included and saves nothing', async (context) => {
+test('"No, it\'s for me" after the extra-makeup question completes the opted-in add-on', async (context) => {
   const { state, history, say, reset } = harness(context, null);
   for (const answer of ["No it's for me", 'No it\u2019s for me', 'its for myself']) {
     reset({ service: 'THE MUSE', date: '2026-10-09', time: '14:00', name: 'Maryanne' });
     history.push({ role: 'user', content: 'I want the extra professional makeup' }, { role: 'assistant', content: ADDON_MAKEUP_CLARIFICATION });
-    assert.equal(isMakeupForSelf(answer, history), true, answer);
+    assert.deepEqual(selectedAddons(answer, history).map((item) => item.sku), ['extra_makeup'], answer);
     const reply = await say(answer);
-    assert.equal(reply, "Professional makeup is already included in your Muse session, so there's nothing to add for you. Extra makeup is for another person, such as your sister.\n"
-      + ADDON_OTHER_DECISION_QUESTION, answer);
-    assert.deepEqual(state.notes, []);
+    assert.match(reply, /^Noted for your session: Extra professional makeup \(Ksh 3,500\)\./, answer);
+    assert.deepEqual(state.notes, ['Extra professional makeup']);
     assert.equal(state.modelCalls, 0);
   }
 });
@@ -146,7 +145,7 @@ test('"No, it\'s for me" after the extra-makeup question explains it is included
 test('"Yes, for my sister" after the extra-makeup question saves it for her', async (context) => {
   const { state, history, say } = harness(context, { service: 'THE MUSE', date: '2026-10-09', time: '14:00', name: 'Maryanne' });
   history.push({ role: 'user', content: 'I want the extra professional makeup' }, { role: 'assistant', content: ADDON_MAKEUP_CLARIFICATION });
-  assert.equal(isMakeupForSelf('Yes, for my sister', history), false);
+  assert.deepEqual(selectedAddons('Yes, for my sister', history).map((item) => item.sku), ['extra_makeup']);
   const reply = await say('Yes, for my sister');
   assert.deepEqual(state.notes, ['Extra professional makeup for my sister']);
   assert.match(reply, /^Noted for your session: Extra professional makeup/);
@@ -219,9 +218,8 @@ test('"No" or "skip" at the add-on step is remembered beyond the six-message his
   }
 });
 
-// Exact customer turns from the 5 Oct run, from the extra-makeup question onwards.
-// Earlier history is the bot text as it was sent; the draft is as it stood then.
-test('Maryanne run: makeup clarification, name and add-on answers end at the deposit proposal with no repeated question', async (context) => {
+// A selected makeup add-on for the customer is retained while collecting the remaining booking details.
+test('self makeup selection, name collection, then deposit proposal do not repeat add-on clarification', async (context) => {
   const { state, history, say } = harness(context, { service: 'THE MUSE', date: '2026-10-09', time: '14:00', name: null });
   history.push(
     { role: 'user', content: 'Show me the add ons' },
@@ -229,14 +227,13 @@ test('Maryanne run: makeup clarification, name and add-on answers end at the dep
     { role: 'user', content: 'I want the extra professional makeup' },
     { role: 'assistant', content: ADDON_MAKEUP_CLARIFICATION },
   );
-  const replies = [await say("No it's for me"), await say('Maryanne'), await say('No I dont')];
-  assert.equal(replies[0], "Professional makeup is already included in your Muse session, so there's nothing to add for you. Extra makeup is for another person, such as your sister.\n"
-    + STEP_QUESTIONS.need_name);
+  const replies = [await say("No it's for me"), await say('Maryanne')];
+  assert.match(replies[0], /^Noted for your session: Extra professional makeup \(Ksh 3,500\)\./);
+  assert.ok(replies[0].includes(STEP_QUESTIONS.need_name));
   assert.equal(state.draft.name, 'Maryanne');
-  assert.equal(replies[1], ADDON_OTHER_DECISION_QUESTION);
-  assert.equal(replies[2], 'Your details for the Muse edition are ready for Friday, 9 October 2026 at 2:00 PM. The deposit is Ksh 2,000. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.');
+  assert.equal(replies[1], 'Your details for the Muse edition are ready for Friday, 9 October 2026 at 2:00 PM. The deposit is Ksh 2,000. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.');
   assert.deepEqual(state.proposals, [{ name: 'Maryanne', service: 'THE MUSE', dateTime: '2026-10-09T14:00' }]);
-  assert.deepEqual(state.notes, [], 'nothing was saved for makeup that is already included');
+  assert.deepEqual(state.notes, ['Extra professional makeup'], 'the extra makeup was explicitly selected for the customer');
   const questions = replies.flatMap((reply) => reply.split('\n').filter((line) => line.endsWith('?')));
   assert.equal(new Set(questions).size, questions.length, 'no question is asked twice');
   assert.ok(replies.every((reply) => !/I.ve added|full name/i.test(reply)));

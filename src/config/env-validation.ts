@@ -20,12 +20,6 @@ function isPlaceholder(value: string): boolean {
   return PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed));
 }
 
-function mask(value: string): string {
-  if (!value) return '<empty>';
-  if (value.length <= 8) return '********';
-  return `${value.slice(0, 4)}...${value.slice(-4)}`;
-}
-
 function validateGoogleServiceKey(rawValue: string): string[] {
   const errors: string[] = [];
 
@@ -68,6 +62,10 @@ export function validateStartupEnv(): void {
   if (groqKey && !groqKey.startsWith('gsk_')) {
     errors.push('GROQ_API_KEY must start with gsk_');
   }
+  const groqBackupKey = process.env.GROQ_2;
+  if (groqBackupKey && !groqBackupKey.startsWith('gsk_')) {
+    errors.push('GROQ_2 must start with gsk_');
+  }
 
   const authJwtSecret = process.env.AUTH_JWT_SECRET;
   if (authJwtSecret && authJwtSecret.length < 32) {
@@ -93,8 +91,11 @@ export function validateStartupEnv(): void {
     process.exit(1);
   }
 
-  const groqMasked = mask(process.env.GROQ_API_KEY || '');
   const dbConfigured = Boolean(process.env.DATABASE_URL);
   const pineconeConfigured = Boolean(process.env.PINECONE_API_KEY);
-  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, GROQ_API_KEY=${groqMasked}, PINECONE_API_KEY=${pineconeConfigured})`);
+  const groqConfigured = Boolean(groqKey);
+  const groqBackupConfigured = Boolean(groqBackupKey);
+  const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
+  const geminiBackupConfigured = Boolean(process.env.GEMINI_BACKUP2);
+  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, GROQ_API_KEY=${groqConfigured}, GROQ_2=${groqBackupConfigured}, GEMINI_API_KEY=${geminiConfigured}, GEMINI_BACKUP2=${geminiBackupConfigured}, PINECONE_API_KEY=${pineconeConfigured})`);
 }

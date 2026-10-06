@@ -2,11 +2,19 @@ import { ADDON_CATALOG, MINIMUM_BOOKING_DEPOSIT } from '../../config/constants';
 import { OFFICIAL_WEBSITE_URLS, ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_ADDITIONS_HEADER, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { businessDay } from '../../utils/time';
 import { editionInText } from './reply-voice';
+import { stripAssistantEmojis } from './emoji-policy';
+import { RESCHEDULE_FORFEITURE_WINDOW_HOURS } from '../../utils/booking-policy';
 export { isBookingProcessRequest } from './booking-process-reply';
 
 export const FAMILY_STYLING_TEAM_REPLY = 'Your partner and children are welcome. The team will confirm what styling is available for them.';
 
+export function buildBookingPolicyReply(): string {
+  const hours = RESCHEDULE_FORFEITURE_WINDOW_HOURS;
+  return `Rescheduling: Changes within ${hours} hours before your session forfeit the deposit. At exactly ${hours} hours, the current rule does not forfeit it.\n\nCancellation: Refund eligibility applies only when cancelling more than ${hours} hours before the session. At ${hours} hours or less, the deposit is not eligible for a refund. A new booking requires a new deposit.\n\nNo booking change or cancellation has been made.`;
+}
+
 export function familyStylingReply(message: string, history: { role: 'user' | 'assistant'; content: string }[] = []): string | null {
+  history = stripAssistantEmojis(history);
   const family = /\b(?:family|partners?|husbands?|wives|wife|children|kids|sons?|daughters?|fathers?|dads?|brothers?|sisters?)\b/i;
   const styling = /\b(?:dress(?:ing|ed|es)?|groom(?:ing|ed)?|styl(?:ing|e|ed)|outfits?|clothes|clothing|attire|accessories|hair|make[ -]?up)\b/i;
   const extraMakeup = ADDON_CATALOG.find(item => item.sku === 'extra_makeup');
@@ -52,6 +60,7 @@ export function isAddonListFollowUp(
   userMessage: string,
   history: { role: 'user' | 'assistant'; content: string }[]
 ): boolean {
+  history = stripAssistantEmojis(history);
   const text = normalizeHyphens(userMessage).trim().toLowerCase().replace(/[.!?]+$/, '');
   const affirmative = /^(show(\s+me)?(\s+the)?(\s+(full\s+)?(list|options|extras|add[\s-]?ons?))?|see\s+them|list\s+them|list\s+the\s+(extras|add[\s-]?ons?)|what\s+(are\s+they|else)|yes(\s+please)?|yeah|yep|sure|ok(ay)?|please)$/.test(text);
   if (!affirmative && !/^list\s+them\s+here$/.test(text)) return false;
@@ -104,8 +113,9 @@ export function buildCancellationProposal(service: string, session: string, refu
 export function previousMessageRequestsConfirmation(
   history: { role: 'user' | 'assistant'; content: string }[]
 ): boolean {
+  history = stripAssistantEmojis(history);
   const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm)/.test(previousAssistantMessage);
+  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm|(?:could\s+you\s+please\s+)?confirm\s+(?:that\s+)?you(?:['’]d|\s+would)\s+like\s+to\s+(?:reschedule|move|change)\b[\s\S]{0,160}\bto\b)/.test(previousAssistantMessage);
 }
 
 export function isPackageBudgetRequest(userMessage: string): boolean {
@@ -128,7 +138,7 @@ export function legacyPackageReply(message: string): string | null {
   return `We don't have a ${name} package. Our editions run from THE BLOOM to THE GODDESS, and THE BLOOM is the entry option. Would you like its details, or the full rate card?`;
 }
 
-export const LASHES_TEAM_REPLY = "Our edition details don't list lashes, so I've passed your question to the studio team to confirm. You can also reach them on 0720 111928.";
+export const LASHES_FAQ_REPLY = 'Yes. Lashes are included in all our makeup services, including every package. The extra professional makeup add-on also includes lashes.';
 
 export function isLashesQuestion(message: string): boolean {
   return /\b(?:eye)?lash(?:es)?\b/i.test(message);

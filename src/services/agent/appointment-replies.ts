@@ -4,10 +4,41 @@ import { DEFAULT_DURATION } from '../../config/constants';
 import { bookingDateFacts, businessDay, inBusinessTimezone } from '../../utils/time';
 import { customerReplyTemplates } from '../messaging/customer-reply.templates';
 import { buildBookingProposalConfirmation, formatCustomerTime, isBookingProcessRequest, isPostShootProcessRequest } from './replies';
-import { editionInText } from './reply-voice';
+import { confirmedSessionReply, editionInText } from './reply-voice';
 import { BOOKING_WELCOME_CLOSING } from './constants';
+import { earlySlotsExpired } from './slot-memory';
+import { stripAssistantEmojis } from './emoji-policy';
 
 type ConversationMessage = { role: 'user' | 'assistant'; content: string };
+
+export function isConfirmedSessionFollowUp(userMessage: string): boolean {
+  const text = userMessage.trim().replace(/[.!?,]/g, ' ').replace(/\s+/g, ' ').trim();
+  return /^(?:(?:okay|ok|alright|great|sawa)\s+)?(?:is that (?:it|all)|are we (?:done|all set)|anything else)$/i.test(text);
+}
+
+export async function getConfirmedSessionFollowUpReply(customerId: string): Promise<string | null> {
+  const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  if (draft && !earlySlotsExpired(draft)) return null;
+  const bookings = await prisma.booking.findMany({
+    where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+    orderBy: { dateTime: 'asc' },
+    take: 2,
+    include: {
+      bookingAddons: {
+        where: { status: { in: ['pending', 'confirmed', 'invoiced'] } },
+        orderBy: { createdAt: 'asc' },
+        select: { name: true, quantity: true, totalPrice: true },
+      },
+    },
+  });
+  if (!bookings.length) return null;
+  if (bookings.length > 1) {
+    return `You have more than one confirmed session: ${bookings.map((booking) => `${editionInText(booking.service)} on ${inBusinessTimezone(booking.dateTime).format('D MMMM YYYY [at] h:mm A')}`).join('; ')}. Which session do you mean?`;
+  }
+  const booking = bookings[0];
+  const extras = booking.bookingAddons.map((addon) => `${addon.name}${addon.quantity > 1 ? ` x${addon.quantity}` : ''}${addon.totalPrice > 0 ? ` (Ksh ${addon.totalPrice.toLocaleString()})` : ''}`);
+  return `${confirmedSessionReply(booking)}${extras.length ? ` Recorded add-ons: ${extras.join('; ')}. These are settled with the session balance, not the deposit.` : ''}`;
+}
 
 export function shouldUseBookingStatusReply(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
@@ -46,6 +77,7 @@ export function formatBookingDuration(durationMinutes?: number | null): string {
 }
 
 export function wasUpcomingAppointmentDetailsJustProvided(history: ConversationMessage[]): boolean {
+  history = stripAssistantEmojis(history);
   const previousUserMessage = [...history].reverse().find((message) => message.role === 'user')?.content;
   const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
   return Boolean(
@@ -221,6 +253,7 @@ export function shouldUsePastAppointmentReply(userMessage: string): boolean {
 }
 
 export function isPastAppointmentFollowUp(userMessage: string, history: ConversationMessage[]): boolean {
+  history = stripAssistantEmojis(history);
   const text = userMessage.toLowerCase().trim();
   const isFollowUp = /^(say|tell|repeat)\s+(that|it|again)\b|^(so\s+)?(how|what)\b|what\s+(do|should)\s+i\s+do|which\s+(one|option)|(?:do|choose|pick|i(?:'ll| will) take)\s+(?:number\s+)?[12]\b/.test(text);
   const recentAssistantMessages = history

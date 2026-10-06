@@ -31,8 +31,9 @@ import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
-import { editionInText, repeatedCollectionQuestion } from './reply-voice';
+import { editionInText, isCustomerNameQuestion, repeatedCollectionQuestion, savedCustomerNameReply } from './reply-voice';
 import { enforceSlogan } from './slogan-guard';
+import { applyEmojiPolicy, emojiReplyType, emojisIn, enforceEmojiPolicy, stripAssistantEmojis, templateEmojiReply, type EmojiReplyType } from './emoji-policy';
 import { claimCatalogLink, explicitCatalogListRequest, type CatalogKind } from './catalog-policy';
 import { ADDON_LINK_REPLY, EDITION_LINK_REPLY } from './constants';
 import { bookingProgressReply, addonPickQuestion, nextStep, openTimesReply, sampleSlots, STEP_QUESTIONS } from './booking-progress';
@@ -50,7 +51,7 @@ import {
   buildPackageBudgetReply,
   legacyPackageReply,
   isLashesQuestion,
-  LASHES_TEAM_REPLY,
+  LASHES_FAQ_REPLY,
   buildPortfolioReply,
   buildPostShootProcessReply,
   buildRawFilesReply,
@@ -90,7 +91,7 @@ import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROV
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, bookingDateFacts, formatCustomerDate, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
-import { ConversationFlowMatcher, isPlainGreeting } from './conversation-flow.matcher';
+import { ConversationFlowMatcher, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
@@ -136,6 +137,7 @@ import {
   shouldUsePastAppointmentsListReply as matchesPastAppointmentsListRequest,
 } from './booking-history-replies';
 import {
+  getConfirmedSessionFollowUpReply as buildConfirmedSessionFollowUpReply,
   formatBookingDuration as formatAppointmentDuration,
   getBookingStatusReply as buildBookingStatusReply,
   getLastAppointmentDetailsReply as buildLastAppointmentDetailsReply,
@@ -187,6 +189,8 @@ export class AgentService {
   private readonly conversationFlowHandler = new ConversationFlowHandler(this.conversationFlows);
   private readonly shouldEscalateVerifier = createVerifierEscalationLimiter();
   private readonly shouldAlertSchemaMismatch = createSchemaAlertLimiter();
+  /** Rate-limits frustration escalations to at most one per 5 minutes, matching the outage-alert pattern. */
+  private readonly shouldEscalateFrustration = createSchemaAlertLimiter(5 * 60_000);
 
   private isNaturalAssistantModeEnabled(): boolean {
     return this.naturalAssistantMode;
@@ -228,7 +232,10 @@ export class AgentService {
     userMessage = '',
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): string {
-    const formattedReply = formatCustomerReply(reply);
+    const formattedReply = formatCustomerReply(reply, {
+      userMessage, replyType: emojiReplyType(reply), sentimentScore: scoreSentiment(userMessage).score,
+      previousAssistant: [...history].reverse().find(message => message.role === 'assistant')?.content,
+    });
     const aboutSuspendingConcept = /suspending\s+concept/i.test(userMessage)
       || history.slice(-6).some((message) => /suspending\s+concept/i.test(message.content));
 
@@ -534,13 +541,13 @@ export class AgentService {
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): boolean {
-    return matchesInvoiceRequest.call(this, userMessage, history);
+    return matchesInvoiceRequest(userMessage, history);
   }
 
   private getInvoiceSessionDateFromHistory(
     history: { role: 'user' | 'assistant'; content: string }[]
   ): { start: Date; end: Date } | null {
-    return resolveInvoiceSessionDateFromHistory.call(this, history);
+    return resolveInvoiceSessionDateFromHistory(history);
   }
 
   private shouldDeclineConsolidatedInvoiceRequest(userMessage: string): boolean {
@@ -683,15 +690,8 @@ export class AgentService {
     return legacyPackageReply(userMessage);
   }
 
-  /** Lashes are not in any confirmed edition data, so the question goes to the team rather than the model. */
-  private async getLashesReply(customerId: string, userMessage: string): Promise<string> {
-    if (this.shouldEscalateVerifier(customerId, userMessage)) {
-      await this.escalate(customerId, 'booking', JSON.stringify({
-        event: 'owner_fact_question', topic: 'lashes', customerMessage: userMessage.slice(0, 2000),
-        note: 'Lashes are not in confirmed edition data. Reply to the customer once the owner confirms.',
-      }));
-    }
-    return LASHES_TEAM_REPLY;
+  private getLashesReply(): string {
+    return LASHES_FAQ_REPLY;
   }
 
   private shouldClarifyMixedIntent(userMessage: string): boolean {
@@ -800,6 +800,8 @@ export class AgentService {
     history: { role: 'user' | 'assistant'; content: string }[] = []
   ): boolean {
     const text = userMessage.toLowerCase();
+    const addonStatus = /\b(?:have|did)\s+you\s+(?:(?:already|actually)\s+)?(?:add(?:ed)?|sav(?:e|ed)|record(?:ed)?|include(?:d)?|note(?:d)?)\b/i.test(text);
+    if (addonStatus && (/\b(?:add-?ons?|extras?)\b/i.test(text) || ADDON_CATALOG.some((item) => item.match.test(text)))) return true;
     if (/\b(package|edition|bloom|muse|icon|legend|queen|empress|goddess|price|cost)\b/.test(text)) return false;
     const explicitAddonHistoryQuestion = /\b(which|what)\b[\s\S]{0,50}\b(?:add-?ons?|extras?)\b[\s\S]{0,40}\b(?:did i|have i)\b[\s\S]{0,25}\b(?:choose|chose|chosen|pick|picked|select|selected|add|added|include|included)\b/.test(text)
       || /\b(which|what)\b[\s\S]{0,50}\b(?:did i|have i)\s+(?:choose|chose|chosen|pick|picked|select|selected|add|added|include|included)\b[\s\S]{0,40}\b(?:add-?ons?|extras?)\b/.test(text)
@@ -819,7 +821,7 @@ export class AgentService {
       select: { id: true, service: true, dateTime: true, recipientName: true, customer: { select: { name: true } } },
     });
 
-    if (bookings.length === 0) return null;
+    if (bookings.length === 0) return 'I could not find add-ons linked to an upcoming session. The studio team can check any pending requests.';
 
     const bookingAddons = await prisma.bookingAddon.findMany({
       where: {
@@ -1119,6 +1121,41 @@ export class AgentService {
     return buildSameBookingSlotReply(customerId, history);
   }
 
+  private async getInitialRescheduleReply(customerId: string, message: string,
+    history: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (draft && !this.isActiveRescheduleDraft(draft)
+      && !(draft.step === EARLY_SLOT_STEP && !draft.service && !draft.date)) {
+      const reason = draft.step === 'payment_pending'
+        ? 'A deposit-payment step is still open on your account. Its payment status must be checked before I can start rescheduling.'
+        : draft.step === 'awaiting_confirmation'
+        ? 'A saved booking proposal is still awaiting your decision. It needs to be resolved before I can start rescheduling.'
+        : draft.step === EARLY_SLOT_STEP
+        ? 'Unfinished booking details are still saved on your account. They need to be checked before I can replace that request with a reschedule.'
+        : 'Another saved booking step needs to be checked before I can start rescheduling.';
+      return `I have not changed your current request or your session. ${reason} The studio team can help review it on 0720 111928. No session has been moved or cancelled by this request.`;
+    }
+    const bookings = await prisma.booking.findMany({
+      where: { customerId, status: 'confirmed', dateTime: { gte: new Date() },
+        ...(this.isActiveRescheduleDraft(draft) && draft?.bookingId ? { id: draft.bookingId } : {}) },
+      orderBy: { dateTime: 'asc' }, take: 2, select: { id: true, service: true, dateTime: true },
+    });
+    if (!bookings.length) return 'I could not find an upcoming confirmed session to reschedule. The studio team can help check your booking.';
+    if (bookings.length > 1) return `You have more than one upcoming session: ${bookings.map(booking => `${editionInText(booking.service)} on ${inBusinessTimezone(booking.dateTime).format('D MMMM YYYY [at] h:mm A')}`).join('; ')}. Which session would you like to reschedule?`;
+    const booking = bookings[0];
+    await this.rememberRescheduleContext(customerId, booking);
+    const target = rescheduleTargetText(message);
+    if (this.conversationFlows.hasRescheduleSlotSignal(target)) {
+      const selection = await this.getRescheduleSelectionReply(customerId, target, history);
+      if (selection) return selection;
+    }
+    if (this.isRescheduleWithin72Hours(booking.dateTime)) return this.getReschedulePolicyMessage();
+    if (this.conversationFlows.isTimeOnlyRescheduleRequest(message) || /\bother time\b/i.test(message)) {
+      return `Of course. Your ${booking.service} session is currently on ${inBusinessTimezone(booking.dateTime).format('dddd, MMMM D')} at ${inBusinessTimezone(booking.dateTime).format('h:mm A')}. What time would work better for you that day?`;
+    }
+    return `Which new date and time would suit you for your session for ${editionInText(booking.service)}? Your current booking remains unchanged until you confirm a proposed change.`;
+  }
+
   private async getRescheduleTimeReply(customerId: string): Promise<string | null> {
     const booking = await prisma.booking.findFirst({
       where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
@@ -1179,14 +1216,22 @@ export class AgentService {
     const edition = editionInText(booking.service);
     let statedDate: string | null;
     try {
-      statedDate = resolveCalendarDate(userMessage);
+      statedDate = resolveCalendarDate(rescheduleTargetText(userMessage));
     } catch {
       return `That calendar date is not valid. Which date and time would you like for your session for ${edition}?`;
     }
-    const newDate = statedDate || existingDate;
+    const newDate = statedDate || (draft?.step === RESCHEDULE_COLLECTING_STEP ? draft.date : null) || existingDate;
     const newDateLabel = businessDay(newDate).format('dddd, D MMMM');
-    const newTime = this.conversationFlows.parseCustomerTime(userMessage);
-    if (!newTime) return `What time on ${newDateLabel} would you like for your session for ${edition}?`;
+    const newTime = this.conversationFlows.parseCustomerTime(rescheduleTargetText(userMessage));
+    if (!newTime) {
+      if (!statedDate && /\b(?:busy|unavailable|can't|cannot|not free|not available|other date|another date)\b/i.test(userMessage)) {
+        return `Which new date and time would suit you for your session for ${edition}?`;
+      }
+      if (statedDate && draft?.step === RESCHEDULE_COLLECTING_STEP) {
+        await prisma.bookingDraft.updateMany({ where: { id: draft.id, step: RESCHEDULE_COLLECTING_STEP, bookingId: booking.id }, data: { date: statedDate } });
+      }
+      return `What time on ${newDateLabel} would you like for your session for ${edition}?`;
+    }
     if (newDate === existingDate && newTime === current.format('HH:mm')) {
       return `Your session for ${edition} is already on ${newDateLabel} at ${formatCustomerTime(newTime)}. Which other time would you like?`;
     }
@@ -1345,6 +1390,15 @@ export class AgentService {
 
   private async getBookingStatusReply(customerId: string): Promise<string | null> {
     return buildBookingStatusReply.call(this, customerId);
+  }
+
+  private async getCustomerNameReply(customerId: string): Promise<string> {
+    const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: { name: true } });
+    return savedCustomerNameReply(customer?.name);
+  }
+
+  private async getConfirmedSessionFollowUpReply(customerId: string): Promise<string | null> {
+    return buildConfirmedSessionFollowUpReply(customerId);
   }
 
   private async getPastAppointmentReply(customerId: string): Promise<string | null> {
@@ -1637,8 +1691,14 @@ D8. PROACTIVE CLOSING: Guide the conversation naturally with a warm next-step in
     const relevantKnowledge = await knowledgeRetrieval.search(userMessage, MAX_RAG_CONTEXT_CHUNKS);
     const contextString = relevantKnowledge.map(k => k.content).join('\n---\n');
 
+    const contextSlots = currentSlots || (upcomingBooking?.status === 'confirmed' ? {
+      step: 'confirmed', service: upcomingBooking.service,
+      date: inBusinessTimezone(upcomingBooking.dateTime).format('YYYY-MM-DD'),
+      time: inBusinessTimezone(upcomingBooking.dateTime).format('HH:mm'),
+      name: upcomingBooking.recipientName || customer?.name,
+    } : null);
     const fullContext = `Customer Name: ${JSON.stringify(sanitizeSlotValue(customerName))}
-  ${knownSlotsLine(draftBeforeThisTurn, customer?.name)}
+  ${knownSlotsLine(contextSlots, customer?.name)}
   Computed calendar facts (authoritative, never infer weekdays): today=${nowInBusinessTimezone().format('YYYY-MM-DD dddd')}; requested=${requestedCalendarDate ? JSON.stringify(bookingDateFacts(requestedCalendarDate)) : 'none'}; next week=${JSON.stringify(nextWeekRange())}.
   Booking Draft: ${draftBeforeThisTurn?.recipientName ? `This booking is for ${draftBeforeThisTurn.recipientName}, on behalf of the WhatsApp customer. Do not ask for the recipient's name again.` : 'None'}
 Upcoming Booking (their next appointment, if any): ${currentSlots?.step === 'collecting_slots' ? `SEPARATE EXISTING BOOKING, NOT the current unbooked request: ${upcomingBookingSummary}. The collecting_slots request is NOT confirmed or paid; do not substitute this older appointment.` : upcomingBookingSummary}
@@ -2064,7 +2124,7 @@ ${contextString}`;
     }
 
     const repeatedQuestionReply = !proposedThisTurn && !confirmedActionThisTurn
-      ? repeatedCollectionQuestion(modelContent, currentSlots, customer?.name, userMessage) : null;
+      ? repeatedCollectionQuestion(modelContent, currentSlots, customer?.name, userMessage, upcomingBooking) : null;
     const codeOwnedReply = cancellationReply || exactProposalReply || (!proposedThisTurn && !confirmedActionThisTurn ? calendarReply : null) || (unverifiedActionReply
       ? unverifiedActionReply
       : this.isUnverifiedBookingConfirmation(modelContent, userMessage, history, upcomingBooking)
@@ -2079,6 +2139,7 @@ ${contextString}`;
       const facts: VerifierFacts = {
         amounts: [...new Set([...ADDON_CATALOG.filter((addon) => addon.unitPrice > 0).map((addon) => addon.unitPrice), ...verifiedToolAmounts])],
         deposits: [...verifiedToolDeposits], editions: [], customerMessage: userMessage, packagePrices: [],
+        emojiContext: { userMessage, replyType: emojiReplyType(safeModelContent), sentimentScore: scoreSentiment(userMessage).score },
         catalogListAllowed: explicitCatalogListRequest(userMessage)
           && (/\b(?:packages?|editions?|add-ons?|extras)\b/i.test(userMessage) || history.some(entry => entry.role === 'assistant' && entry.content.includes(OFFICIAL_WEBSITE_URLS.packages))),
       };
@@ -2146,14 +2207,23 @@ ${contextString}`;
       verifierBlocked = verified.blocked;
     }
     safeModelContent = await enforceSlogan(customerId, platform, safeModelContent, history);
+    if (codeOwnedReply && calendarReply && !exactProposalReply && !cancellationReply) {
+      safeModelContent = await this.decorateTemplateEmoji(customerId, platform, safeModelContent, 'slotAvailable', userMessage, history);
+    }
+    if (!codeOwnedReply) safeModelContent = await enforceEmojiPolicy(customerId, platform, safeModelContent, {
+      userMessage, replyType: emojiReplyType(safeModelContent), sentimentScore: scoreSentiment(userMessage).score,
+      forbidden: verifierBlocked, previousAssistant: [...history].reverse().find(message => message.role === 'assistant')?.content,
+    });
     console.info('[AGENT_USAGE]', JSON.stringify({
       customerRef: this.customerReference(customerId), model: CHAT_MODEL,
       completionCalls: usage.completionCalls, toolCalls,
       verifierChecked: !codeOwnedReply && !emptyResponse,
       verifierBypassReason: !codeOwnedReply ? emptyResponse ? 'empty_model_reply' : null
-        : cancellationReply || exactProposalReply ? 'exact_tool_reply'
+        : cancellationReply ? 'exact_cancellation_reply'
+        : exactProposalReply ? 'exact_tool_reply'
         : calendarReply && !proposedThisTurn && !confirmedActionThisTurn ? 'backend_calendar_reply'
-        : codeOwnedReply === repeatedQuestionReply ? 'known_slot_question_guard' : 'backend_action_guard',
+        : codeOwnedReply === repeatedQuestionReply ? 'known_slot_question_guard'
+        : unverifiedActionReply ? 'unverified_action_guard' : 'backend_action_guard',
       verifierRetries, correctionChars,
       inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens,
       latencyMs: Date.now() - modelRunStartedAt, rateLimited: false,
@@ -2186,7 +2256,7 @@ ${contextString}`;
    */
   async handleMessage(customerId: string, rawMessage: string, rawHistory: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
     const userMessage = normalizeQuotes(rawMessage);
-    const history = rawHistory.map((entry) => ({ ...entry, content: normalizeQuotes(entry.content) }));
+    const history = stripAssistantEmojis(rawHistory).map((entry) => ({ ...entry, content: normalizeQuotes(entry.content) }));
     const startedAt = Date.now();
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
@@ -2203,7 +2273,8 @@ ${contextString}`;
     const scopeBoundaryRoute = routes[0];
     if (scopeBoundaryRoute.when()) {
       console.log(`[AGENT_FLOW] route=${scopeBoundaryRoute.name}`);
-      return await scopeBoundaryRoute.handle() as string;
+      const scopeResult = await scopeBoundaryRoute.handle() as string;
+      return this.respond(ctx, scopeResult);
     }
 
     console.log('[AGENT_FLOW] handleMessage start:', JSON.stringify({
@@ -2214,7 +2285,6 @@ ${contextString}`;
       naturalAssistantMode
     }));
 
-    this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
 
     if (circuitBreaker.isOpen()) {
       console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
@@ -2251,8 +2321,32 @@ ${contextString}`;
       return this.respond(ctx, BUDGET_HANDOFF_REPLY, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
     }
 
+    // Sentiment tracking runs after circuit-breaker and budget checks so
+    // an angry burst during an outage doesn't flood escalations.
+    this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
+
+    for (const route of routes.filter(candidate => candidate.beforeSlotCapture)) {
+      if (!route.when()) continue;
+      console.log(`[AGENT_FLOW] route=${route.name}`);
+      try {
+        const result = await route.handle();
+        if (typeof result === 'string') return this.respond(ctx, result);
+        if (result) return this.respond(ctx, result.reply, result.outcome);
+      } catch (error) {
+        if (isMissingColumnError(error)) {
+          const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+          return this.respond(ctx, failure.reply, failure.outcome);
+        }
+        return this.respond(ctx, 'I could not prepare that change, so your session is unchanged. The studio team can help on 0720 111928.',
+          { success: false, isFallback: true, failureReason: 'reschedule_entry_failed' });
+      }
+    }
+
     // A reply to a reschedule question changes an existing booking, so it must not seed a new-booking draft.
-    if ((platform === 'whatsapp' || platform === 'web') && !this.conversationFlows.isRescheduleQuestion(history)) {
+    if ((platform === 'whatsapp' || platform === 'web') && !this.conversationFlows.isRescheduleQuestion(history)
+      && !this.shouldUseInvoiceRequestReply(userMessage, history)
+      && !isCustomerNameQuestion(userMessage)
+      && !this.shouldUsePreviousAddonReply(userMessage, history)) {
       try {
         const slotReply = await this.rememberBookingSlots(customerId, userMessage, history);
         if (slotReply) return this.respond(ctx, slotReply);
@@ -2270,6 +2364,7 @@ ${contextString}`;
     }
 
     for (const route of routes.slice(1)) {
+      if (route.beforeSlotCapture) continue;
       if (route.replyMode === 'natural' && naturalAssistantMode) continue;
       if (!route.when()) continue;
       console.log(`[AGENT_FLOW] route=${route.name}`);
@@ -2281,11 +2376,26 @@ ${contextString}`;
         result = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
       }
       if (result === null) continue;
-      if (typeof result === 'string') return this.respond(ctx, result);
+      if (typeof result === 'string') {
+        const types: Record<string, EmojiReplyType> = { greeting: 'welcome', packageSelection: 'packageChosen', postActionAcknowledgement: 'closing' };
+        const type = types[route.name];
+        if (type) result = await this.decorateTemplateEmoji(customerId, platform, result, type, userMessage, rawHistory);
+        return this.respond(ctx, result);
+      }
       return this.respond(ctx, result.reply, result.outcome);
     }
 
     return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'no_matching_route' });
+  }
+
+  private async decorateTemplateEmoji(customerId: string, platform: string, reply: string, replyType: EmojiReplyType,
+    userMessage: string, history: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
+    const context = { userMessage, replyType, sentimentScore: scoreSentiment(userMessage).score,
+      previousAssistant: [...history].reverse().find(message => message.role === 'assistant')?.content };
+    const decorated = templateEmojiReply(reply, replyType, context);
+    if (decorated === reply) return reply;
+    const result = await enforceEmojiPolicy(customerId, platform, decorated, context);
+    return emojisIn(result).length ? result : reply;
   }
 
   private async handleSchemaMismatch(customerId: string, userMessage: string, platform: string, error: unknown) {
@@ -2438,7 +2548,7 @@ ${contextString}`;
 
   private hasCancellationBookingSelector(userMessage: string): boolean {
     const text = userMessage.toLowerCase();
-    const date = (new BookingExtractor() as any).regexExtract(userMessage).date;
+    const date = BookingExtractor.regexExtract(userMessage).date;
     const time = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{2}:\d{2}\b/i.test(text);
     const service = PACKAGE_NAMES_FOR_EXTRACTION.some((packageName) =>
       text.includes(packageName.toLowerCase().replace(/ package$/i, ''))
@@ -2489,7 +2599,7 @@ ${contextString}`;
       return { reply: 'I could not find an upcoming booking to cancel.', proposed: false };
     }
 
-    const extractedDate = (new BookingExtractor() as any).regexExtract(userMessage).date as string | null;
+    const extractedDate = BookingExtractor.regexExtract(userMessage).date as string | null;
     const timeMatch = userMessage.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
     let requestedTime: string | null = null;
     if (timeMatch) {
@@ -2572,11 +2682,8 @@ ${contextString}`;
   ): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
     if (!/^(sure|yes|yeah|yep|okay|ok)$/.test(normalized)) return false;
-
-    return history
-      .filter((message) => message.role === 'assistant')
-      .slice(-3)
-      .some((message) => /original session date and time|booking remains unchanged|deposit is still held/i.test(message.content));
+    const lastAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
+    return /^(?:understood[.!]?\s*)?we(?:'ll| will) keep your original session date and time\b|^yes\.\s*your original session date and time are still booked\b/i.test(lastAssistantMessage.trim());
   }
 
   private previousMessageRequestsConfirmation(history: { role: 'user' | 'assistant', content: string }[]): boolean {
@@ -2676,6 +2783,11 @@ ${contextString}`;
    * Keyword-based frustration check, run on every inbound message. Cheap
    * enough to never skip - no LLM call involved. Best-effort: failures here
    * must never break the actual reply.
+   *
+   * The DB sentimentScore row is always written so analytics stay complete.
+   * The escalation is rate-limited to one per 5 minutes so an angry burst
+   * during an outage (when many messages arrive before the circuit breaker
+   * trips) doesn't flood the dashboard with duplicate escalations.
    */
   private async trackSentiment(customerId: string, userMessage: string): Promise<void> {
     const { score, sentiment, confidence } = scoreSentiment(userMessage);
@@ -2684,7 +2796,7 @@ ${contextString}`;
       data: { customerId, score, sentiment, confidence, triggeredAlert: score <= -0.6 }
     });
 
-    if (score <= -0.6) {
+    if (score <= -0.6 && this.shouldEscalateFrustration()) {
       await this.escalate(customerId, 'frustration', `Customer message scored ${score.toFixed(2)} (${sentiment}) on the frustration heuristic.`, score);
     }
   }
