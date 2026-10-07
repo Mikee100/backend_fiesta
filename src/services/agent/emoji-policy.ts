@@ -9,11 +9,28 @@ export const REPLY_EMOJI = {
   reminder: '\u{1F4F8}',
   family: '\u{1F380}',
   closing: '\u{1F90D}',
+  nameCaptured: '\u{1F338}',
+  addonNoted: '\u{1F490}',
+  extrasQuestion: '\u{1F476}',
+  timeOptions: '\u{1F4C5}',
+  sessionReminder: '\u{1F54A}\uFE0F',
+  delivery: '\u{1F4F8}',
+  thankYou: '\u{1F60A}',
 } as const;
 
 export type EmojiReplyType = keyof typeof REPLY_EMOJI | 'other';
-export const EMOJI_POLICY = { maximum: 1, greetingClosingMaximum: 2, maximumReplyLength: 4096 } as const;
-export const EMOJI_WHITELIST: readonly string[] = [...new Set(Object.values(REPLY_EMOJI))];
+export const EMOJI_LEVEL: 'restrained' | 'warm' = 'warm';
+const restrainedTypes: readonly EmojiReplyType[] = ['welcome', 'slotAvailable', 'packageChosen', 'paymentConfirmed', 'closing'];
+export const EMOJI_LEVEL_SETTINGS = {
+  restrained: { maximum: 1, greetingClosingMaximum: 2, replyTypes: restrainedTypes,
+    repeatRule: 'never_consecutive', shortListStarts: false, modelSuggestions: false, mirrorCustomer: true },
+  warm: { maximum: 2, greetingClosingMaximum: 3,
+    replyTypes: [...restrainedTypes, 'nameCaptured', 'addonNoted', 'extrasQuestion', 'timeOptions', 'sessionReminder', 'delivery', 'thankYou', 'location', 'reminder', 'family'] as readonly EmojiReplyType[],
+    repeatRule: 'after_one_different_reply', shortListStarts: true, modelSuggestions: true, mirrorCustomer: false },
+} as const;
+export const EMOJI_POLICY = { ...EMOJI_LEVEL_SETTINGS[EMOJI_LEVEL], maximumReplyLength: 4096 } as const;
+export const EMOJI_WHITELIST: readonly string[] = [...new Set([...Object.values(REPLY_EMOJI), '\u{1F389}', '\u{1F49B}'])];
+export const EMOJI_PROMPT_RULE = `Emojis are suggestions only; code enforces whitelist, placement, limits, context and repetition. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings. ${EMOJI_POLICY.modelSuggestions ? `Use warm emojis where appropriate, only from: ${EMOJI_WHITELIST.join(' ')}. Place at sentence ends or line starts in short lists.` : 'Prefer plain text and mirror customer tone.'} Never repeat an emoji from the immediately previous reply. Never decorate money, deposits, invoices, payment failures, cancellations, refunds, escalation, team-confirmation lines or replies to upset customers.`;
 const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
 const emojiPattern = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Presentation}|\u20e3/u;
 
@@ -46,7 +63,8 @@ export function emojiForbiddenReason(reply: string, context: EmojiContext): stri
   if (/\b(?:fail\w*|cancel\w*|refund\w*|complaints?|escalat\w*|sorry|could not|couldn't|unable|not received)\b/i.test(reply)) return 'failure_or_handoff';
   if (/\b(?:team|studio|member of (?:our|the) team)\b[\s\S]{0,80}\b(?:confirm|verify|check|help|pick this up|contact)\b/i.test(reply)) return 'team_confirmation';
   const replyType = context.replyType || 'other';
-  if (!emojisIn(context.userMessage || '').length && !['welcome', 'closing', 'paymentConfirmed', 'slotAvailable'].includes(replyType)) return 'formal_tone';
+  if (!EMOJI_POLICY.replyTypes.includes(replyType) && !(EMOJI_POLICY.modelSuggestions && context.mode !== 'template')) return 'reply_type';
+  if (EMOJI_POLICY.mirrorCustomer && !emojisIn(context.userMessage || '').length && !['welcome', 'closing', 'paymentConfirmed', 'slotAvailable'].includes(replyType)) return 'formal_tone';
   return null;
 }
 
@@ -69,12 +87,17 @@ export function applyEmojiPolicy(reply: string, context: EmojiContext = {}): str
     const priorEmoji = emojiPattern.test([...segmenter.segment(before)].at(-1)?.segment || '');
     const lineEnd = /^\s*(?:\n|$)/.test(after) || !stripEmojis(after).trim();
     const sentenceEnd = /[.!?]$/.test(before) && (lineEnd || /^\s+[A-Z]/.test(after));
-    if (!reason && (!before || priorEmoji || (!sentenceEnd && !lineEnd))) reason = 'placement';
+    const line = reply.slice(0, value.index).split('\n').at(-1) || '';
+    const listLines = reply.split('\n').filter(value => value.trim());
+    const shortListStart = EMOJI_POLICY.shortListStarts && listLines.length >= 2 && listLines.length <= 3
+      && listLines.every(value => value.length <= 100) && /^\s*(?:[-*]\s+)?$/.test(line)
+      && /^\s+\S/.test(after) && !emojiPattern.test([...segmenter.segment(after.trimStart())][0]?.segment || '');
+    if (!reason && !shortListStart && (!before || priorEmoji || (!sentenceEnd && !lineEnd))) reason = 'placement';
     if (!reason && (kept >= maximum || used.has(value.segment))) reason = 'maximum';
-    if (!reason && previous.has(value.segment)) reason = 'consecutive_repeat';
+    if (!reason && ['never_consecutive', 'after_one_different_reply'].includes(EMOJI_POLICY.repeatRule) && previous.has(value.segment)) reason = 'consecutive_repeat';
     if (reason) { reasons.add(reason); return ''; }
     used.add(value.segment); kept++;
-    return ` ${value.segment}`;
+    return shortListStart ? value.segment : ` ${value.segment}`;
   }).join('').replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+\n/g, '\n').trim();
   if (result.length > EMOJI_POLICY.maximumReplyLength) {
     reasons.add('length');
@@ -95,8 +118,16 @@ export function templateEmojiReply(reply: string, replyType: EmojiReplyType, con
 
 export function emojiReplyType(reply: string): EmojiReplyType {
   if (/\b(?:payment received|payment succeeded|deposit has been paid)\b/i.test(reply)) return 'paymentConfirmed';
+  if (/\b(?:you are welcome|you're welcome|thank you|thanks)\b/i.test(reply)) return EMOJI_POLICY.replyTypes.includes('thankYou') ? 'thankYou' : 'closing';
   if (/\b(?:welcome|hello|hi)\b/i.test(reply)) return 'welcome';
-  if (/\b(?:you are welcome|you're welcome|thank you|thanks|looking forward)\b/i.test(reply)) return 'closing';
+  if (/\b(?:looking forward|can't wait to meet|see you soon)\b/i.test(reply)) return 'closing';
+  if (/\b(?:have your name (?:as|saved)|name (?:is )?saved|nice to meet you)\b/i.test(reply)) return 'nameCaptured';
+  if (/\bnoted for your session\b/i.test(reply)) return 'addonNoted';
+  if (/\b(?:any extras|would you like to add|like any extras)\b/i.test(reply)) return 'extrasQuestion';
+  if (/\b(?:which.*times|what time|these times)\b/i.test(reply)) return 'timeOptions';
+  if (/\b(?:reminder|see you tomorrow)\b/i.test(reply)) return 'sessionReminder';
+  if (/\b(?:edited photos|working days|photo delivery)\b/i.test(reply)) return 'delivery';
+  if (/\b(?:diamond plaza|4th avenue|we are at|our location)\b/i.test(reply)) return 'location';
   if (/\b(?:available|is open)\b/i.test(reply) && /\b(?:am|pm|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(reply)) return 'slotAvailable';
   return 'other';
 }
