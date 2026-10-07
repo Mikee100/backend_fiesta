@@ -36,7 +36,7 @@ import { containsSlogan, enforceSlogan, normalizeSlogan } from './slogan-guard';
 import { createVerifierEscalationLimiter, currencyAmounts, VERIFIER_ESCALATION_COOLDOWN_MS, VERIFIER_FALLBACK, verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { explicitlySelectedDeliveryMethod, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
 import { ConversationFlowMatcher, isPlainGreeting, selectedEdition } from './conversation-flow.matcher';
-import { applyEmojiPolicy, emojisIn, enforceEmojiPolicy, REPLY_EMOJI, stripAssistantEmojis, stripEmojis, templateEmojiReply } from './emoji-policy';
+import { applyEmojiPolicy, emojiReplyType, EMOJI_LEVEL, EMOJI_LEVEL_SETTINGS, EMOJI_PROMPT_RULE, EMOJI_WHITELIST, emojisIn, enforceEmojiPolicy, REPLY_EMOJI, stripAssistantEmojis, stripEmojis, templateEmojiReply } from './emoji-policy';
 
 test('emoji policy enforces whitelist, forbidden contexts, limits and sentence-end placement', () => {
   const heart = REPLY_EMOJI.welcome;
@@ -53,6 +53,47 @@ test('emoji policy enforces whitelist, forbidden contexts, limits and sentence-e
   assert.equal(applyEmojiPolicy(`Welcome. ${heart}`, { ...context, previousAssistant: `Thank you. ${heart}` }), 'Welcome.');
   assert.equal(stripEmojis('Family \u{1F469}\u200d\u{1F469}\u200d\u{1F467} \u{1F1F0}\u{1F1EA} 1\ufe0f\u20e3'), 'Family   ');
   assert.equal(templateEmojiReply('The deposit is Ksh 2,000.', 'paymentConfirmed', context), 'The deposit is Ksh 2,000.');
+});
+
+test('emoji warm level controls caps, new reply types, list starts and model suggestions', () => {
+  assert.equal(EMOJI_LEVEL, 'warm');
+  assert.equal(EMOJI_LEVEL_SETTINGS.restrained.maximum, 1);
+  assert.equal(EMOJI_LEVEL_SETTINGS.restrained.greetingClosingMaximum, 2);
+  assert.equal(EMOJI_LEVEL_SETTINGS.warm.maximum, 2);
+  assert.equal(EMOJI_LEVEL_SETTINGS.warm.greetingClosingMaximum, 3);
+  const settings = { userMessage: '', log: () => {} };
+  const candidates = `Welcome. ${REPLY_EMOJI.welcome}\nYour session. ${REPLY_EMOJI.packageChosen}\nSee you soon. ${REPLY_EMOJI.addonNoted}\nThank you. ${REPLY_EMOJI.thankYou}`;
+  assert.equal(emojisIn(applyEmojiPolicy(candidates, { ...settings, replyType: 'welcome' })).length, 3);
+  assert.equal(emojisIn(applyEmojiPolicy(candidates, { ...settings, replyType: 'closing' })).length, 3);
+  assert.equal(emojisIn(applyEmojiPolicy(candidates, { ...settings, replyType: 'other', mode: 'model' })).length, 2);
+  const samples = [
+    ['Nice to meet you, Maryanne.', 'nameCaptured'], ['Noted for your session.', 'addonNoted'],
+    ['Would you like to add any extras?', 'extrasQuestion'], ['Which of these times suits you?', 'timeOptions'],
+    ['We are at Diamond Plaza Annex, 4th Avenue, Parklands.', 'location'],
+    ['Edited photos are ready in 10 working days.', 'delivery'], ["You're welcome.", 'thankYou'],
+    ['A reminder for your session tomorrow.', 'sessionReminder'],
+    ['I have your name as Maryanne. Would you like any extras?', 'nameCaptured'],
+  ] as const;
+  for (const [reply, replyType] of samples) {
+    assert.equal(emojiReplyType(reply), replyType);
+    assert.equal(emojisIn(templateEmojiReply(reply, replyType, settings)).length, 1, replyType);
+  }
+  for (const emoji of EMOJI_WHITELIST) {
+    assert.equal(applyEmojiPolicy(`Thank you. ${emoji}`, { ...settings, mode: 'model' }), `Thank you. ${emoji}`);
+  }
+  assert.equal(applyEmojiPolicy('Thank you. \u2728 \u{1F496}', settings), 'Thank you.');
+  const list = `${REPLY_EMOJI.slotAvailable} Friday\n${REPLY_EMOJI.location} Parklands`;
+  assert.equal(applyEmojiPolicy(list, settings), list);
+  assert.equal(applyEmojiPolicy(`${REPLY_EMOJI.location} Parklands`, settings), 'Parklands');
+  for (const emoji of EMOJI_WHITELIST) {
+    for (const reply of ['Price is Ksh 2,000.', 'Extras go on the balance, not the deposit.', 'Payment failed.',
+      'Cancel this booking.', 'Refund requested.', 'Escalation recorded.', 'The team will confirm.', 'Invoice attached.']) {
+      assert.equal(emojisIn(applyEmojiPolicy(`${reply} ${emoji}`, settings)).length, 0);
+    }
+    assert.equal(emojisIn(applyEmojiPolicy(`Thank you. ${emoji}`, { ...settings, sentimentScore: -1 })).length, 0);
+    assert.equal(emojisIn(applyEmojiPolicy(`Thank you. ${emoji}`, { ...settings, previousAssistant: `Hello. ${emoji}` })).length, 0);
+    assert.equal(emojisIn(applyEmojiPolicy(`Thank you. ${emoji}`, { ...settings, previousAssistant: 'Your details are saved.' })).length, 1);
+  }
 });
 
 const agent = new AgentService() as any;
@@ -125,7 +166,7 @@ test('emoji verifier preserves money checks and central template restrictions', 
   assert.ok(verifyModelReply(`Ksh 9,999 ${REPLY_EMOJI.welcome}`, facts).reasons.length);
   const greeting = `Welcome. ${REPLY_EMOJI.welcome}\nYour family is welcome. ${REPLY_EMOJI.family}`;
   assert.equal(emojisIn(applyEmojiPolicy(greeting, { replyType: 'welcome', userMessage: '' })).length, 2);
-  assert.equal(emojisIn(templateEmojiReply('The Muse it is. What date would suit you?', 'packageChosen', { userMessage: '' })).length, 0);
+  assert.equal(emojisIn(templateEmojiReply('The Muse it is. What date would suit you?', 'packageChosen', { userMessage: '' })).length, 1);
   assert.equal(emojisIn(templateEmojiReply('The Muse it is. What date would suit you?', 'packageChosen', { userMessage: REPLY_EMOJI.welcome })).length, 1);
   assert.equal(applyEmojiPolicy(`Welcome. ${REPLY_EMOJI.welcome}`, { replyType: 'welcome', forbidden: true }), 'Welcome.');
   const history = [{ role: 'assistant', content: `Reply yes. ${REPLY_EMOJI.slotAvailable}` }, { role: 'user', content: REPLY_EMOJI.welcome }];
@@ -138,7 +179,8 @@ test('emoji verifier preserves money checks and central template restrictions', 
 
 test('emoji-bearing templates preserve confirmation, addon, reschedule and catalog matchers', async () => {
   const flows = new ConversationFlowMatcher();
-  const withEmoji = (text: string) => [{ role: 'assistant' as const, content: `${text} ${REPLY_EMOJI.slotAvailable}` }];
+  for (const emoji of EMOJI_WHITELIST) {
+  const withEmoji = (text: string) => [{ role: 'assistant' as const, content: `${emoji} ${text} ${REPLY_EMOJI.slotAvailable}` }];
   const proposal = buildBookingProposalConfirmation('THE MUSE', '2026-10-09', '14:00', 2000);
   assert.equal(previousMessageRequestsConfirmation(withEmoji(proposal)), true);
   assert.equal(previousMessageRequestsConfirmation([{ role: 'assistant', content: `Reply ${REPLY_EMOJI.welcome}yes to confirm.` }]), true);
@@ -167,6 +209,7 @@ test('emoji-bearing templates preserve confirmation, addon, reschedule and catal
   assert.equal(isPastAppointmentFollowUp('yes', past), isPastAppointmentFollowUp('yes', stripAssistantEmojis(past)));
   const appointment = [{ role: 'user' as const, content: 'Tell me about my upcoming session' }, ...withEmoji('Your Muse session is confirmed.')];
   assert.equal(wasUpcomingAppointmentDetailsJustProvided(appointment), true);
+  }
 });
 
 test('emoji pipeline applies templates, cleans model suggestions and keeps negative replies plain', async (context) => {
@@ -210,7 +253,7 @@ test('emoji pipeline applies templates, cleans model suggestions and keeps negat
   const long = 'a'.repeat(4094) + '.';
   assert.equal(applyEmojiPolicy(`${long} ${REPLY_EMOJI.welcome}`, { replyType: 'welcome' }), long);
   const oldRule = 'No emojis unless the customer uses them.';
-  const newRule = 'Emojis are suggestions only; code enforces whitelist, sentence-end placement, limits, context and repetition. Prefer plain text; never decorate money or handoffs.';
+  const newRule = EMOJI_PROMPT_RULE;
   const prompt = instance.getSystemPrompt('', 'whatsapp', false, false);
   const oldPrompt = prompt.replace(newRule, oldRule);
   assert.ok(prompt.includes(newRule));

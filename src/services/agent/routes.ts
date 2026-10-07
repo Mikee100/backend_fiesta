@@ -543,8 +543,10 @@ export function createMessageRoutes(
       handle: async () => {
         try {
           const progress = platform === 'whatsapp' || platform === 'web' ? await this.getBookingProgressReply(customerId, userMessage, history) : null;
-          if (progress) return emojiReplyType(progress) === 'slotAvailable'
-            ? this.decorateTemplateEmoji(customerId, platform, progress, 'slotAvailable', userMessage, history) : progress;
+          if (progress) {
+            const type = emojiReplyType(progress);
+            return type !== 'other' ? this.decorateTemplateEmoji(customerId, platform, progress, type, userMessage, history) : progress;
+          }
           console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
           const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
           console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({

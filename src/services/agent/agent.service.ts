@@ -2378,8 +2378,8 @@ ${contextString}`;
       if (result === null) continue;
       if (typeof result === 'string') {
         const types: Record<string, EmojiReplyType> = { greeting: 'welcome', packageSelection: 'packageChosen', postActionAcknowledgement: 'closing' };
-        const type = types[route.name];
-        if (type) result = await this.decorateTemplateEmoji(customerId, platform, result, type, userMessage, rawHistory);
+        const type = types[route.name] || (route.name !== 'runAgent' ? emojiReplyType(result) : 'other');
+        if (type !== 'other') result = await this.decorateTemplateEmoji(customerId, platform, result, type, userMessage, rawHistory);
         return this.respond(ctx, result);
       }
       return this.respond(ctx, result.reply, result.outcome);
