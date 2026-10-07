@@ -15,35 +15,38 @@ renewal of the earlier approval. The catalog below is retained as a last resort.
 
 ## Link-first replies (pending approval)
 
-First edition request:
+Generic edition request, including repeats:
 
 ```text
 You can see all our editions, inclusions and prices here: https://www.fiestahousematernity.com/session-packages
 Tell me which edition catches your eye.
 ```
 
-First add-on request:
+Generic add-on request, including repeats:
 
 ```text
 All the optional extras and their prices are here: https://www.fiestahousematernity.com/session-packages
 Tell me which you would like for your session.
 ```
 
-Specific items keep their existing verified answer and append the same link.
-Comparisons remain limited to two editions. A repeated catalog request, explicit
-request to list it in chat, or broken-link follow-up uses the existing full-list
-builder. Bare "yes" or "show me" after a generic link is not full-list consent.
+Website-first correction (2026-10-07): specific items keep their existing verified
+answer and append the same link. Comparisons remain limited to two editions. Only
+an explicit request to list it in chat or a broken-link follow-up uses the existing
+full-list builder. Repeated generic requests, "show me the packages in the studio",
+and old catalog markers do not authorize a full catalog. Bare "yes" or "show me"
+after a generic link is not full-list consent.
 During slot collection the second sentence is replaced by the next missing
 edition/date/time/name question, without saving or proposing anything.
 
-State uses namespaced CustomerMemory.keyInsights entries scoped to the active
-UnifiedConversation session, or customer/platform thread fallback. Separate
-edition/add-on markers expire after 24 hours. Atomic compare-and-set preserves
-other insights and prunes expired catalog markers. If storage fails, visible
-history is the fallback; trimmed history can then cause another link rather than
-an unsolicited list. Claiming before delivery can consume a marker on failed
-delivery. Mocked state tests are not live PostgreSQL/concurrency certification.
+Legacy namespaced catalog-link markers remain available to existing model-link
+bookkeeping, but their presence or expiry no longer decides deterministic catalog
+display. Generic requests return the website link without reading or claiming
+those markers; no marker cleanup or memory reset is needed for this correction.
 No schema migration, price/deposit edit, booking mutation or ingestion was run.
+
+Website-first correction validation, 2026-10-07: seven focused catalog/copy checks
+passed; full suite 511 passed with five existing 6 October date-dependent failures.
+TypeScript and editor diagnostics pass. No live request or deployment performed.
 
 Offline validation, 2026-10-05: full backend suite 421/421 passed (exit 0),
 TypeScript no-emit check passed (exit 0), and diff whitespace check passed.

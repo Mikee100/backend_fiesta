@@ -1091,7 +1091,7 @@ export class AgentService {
       const detail = await this.getPackageCatalogReply(true, userMessage);
       return detail ? `${detail}\n${OFFICIAL_WEBSITE_URLS.packages}` : linkReply;
     }
-    if (!explicitCatalogListRequest(userMessage) && await claimCatalogLink(customerId, platform, kind, history)) {
+    if (!explicitCatalogListRequest(userMessage)) {
       const question = await this.getCatalogBookingQuestion(customerId, kind);
       return question ? `${linkReply.split('\n')[0]}\n${question}` : linkReply;
     }
@@ -1527,7 +1527,7 @@ A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancel
 A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
 A9. VERIFIED WEBSITE LINKS: Use only these exact Fiesta House website URLs: ${Object.values(OFFICIAL_WEBSITE_URLS).join(', ')}. Never guess or construct a page path. The reviews page is /reviews; the Suspending Concept gallery is /gallery/suspending-concept. If no verified link fits, share the homepage or offer to check with the team.
-LINK-FIRST CATALOG: For editions, packages and optional add-ons share ${OFFICIAL_WEBSITE_URLS.packages}, not the whole catalog. Keep all catalog knowledge for specific-item answers, comparisons and booking calculations. Answer one item or compare two briefly, then append the link. Only list the catalog when the customer explicitly asks for it here, cannot open the link, or repeats a catalog request after the link; code handles repeat state. A bare yes or show me after the link is not a request for a full list. Do not change prices, deposits or selected add-ons.
+LINK-FIRST CATALOG: For editions, packages and optional add-ons share ${OFFICIAL_WEBSITE_URLS.packages}, not the whole catalog, including repeated generic requests. Keep all catalog knowledge for specific-item answers, comparisons and booking calculations. Answer one item or compare two briefly, then append the link. Only list the catalog when the customer explicitly asks for it in this chat or cannot open the link. A bare yes, show me, or reference to the studio is not a request for a full list in chat. Do not change prices, deposits or selected add-ons.
 LEGEND INCLUSION HOLD: The public page does not list a Legend wig, while local data does. Do not assert that a wig is included or excluded with Legend, even if retrieval says otherwise. Withhold that inclusion until the owner confirms; say the team will confirm the remaining inclusions. Other verified Legend details may still be answered.
 
 [B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
