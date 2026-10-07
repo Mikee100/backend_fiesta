@@ -143,8 +143,10 @@ export function classifyPaymentMessage(message: string): PaymentMessageKind | nu
 function promptSentReply(s: PaymentSituation, phoneFallback: string, alreadySent: boolean): string {
   const amount = s.payment ? ` for Ksh ${s.payment.amount.toLocaleString()}` : '';
   const digits = lastDigits(s.payment?.phone || phoneFallback);
-  const lead = alreadySent ? `I’ve already sent the M-Pesa deposit prompt${amount} to the number ending ${digits}.` : `I sent the M-Pesa prompt${amount} to the number ending ${digits}.`;
-  return `${lead} Please enter your M-Pesa PIN on your phone to complete it.${holdLine(s.holdEndsAt)} If it hasn't arrived, reply resend.`;
+  const lead = s.payment?.checkoutRequestId
+    ? `M-Pesa has ${alreadySent ? 'already ' : ''}accepted the deposit request${amount} for the number ending ${digits}.`
+    : `The M-Pesa deposit request${amount} for the number ending ${digits} is still being processed.`;
+  return `${lead} If a prompt appears on your phone, enter your M-Pesa PIN there to complete it.${holdLine(s.holdEndsAt)} If it hasn't arrived, reply resend.`;
 }
 
 function situationReply(s: PaymentSituation, customerId: string): string {
@@ -170,7 +172,7 @@ function notArrivedReply(s: PaymentSituation, customerId: string): string {
   const next = s.attempts >= MAX_PAYMENT_ATTEMPTS
     ? exhaustedText()
     : `Reply resend and I'll send a new prompt, or reach the studio team on ${STUDIO_CONTACT}.`;
-  return `I sent the prompt to the number ending ${lastDigits(s.payment?.phone || customerId)}. Please check that your phone is on, has signal, and that the M-Pesa SIM is active.${holdLine(s.holdEndsAt)} ${next}`;
+  return `The payment request is for the number ending ${lastDigits(s.payment?.phone || customerId)}. I can't verify that a prompt reached your phone. Please check that your phone is on, has signal, and that the M-Pesa SIM is active.${holdLine(s.holdEndsAt)} ${next}`;
 }
 
 async function escalateAttemptsExhausted(this: any, customerId: string, s: PaymentSituation): Promise<string> {
@@ -236,7 +238,7 @@ async function resendPrompt(this: any, customerId: string, s: PaymentSituation):
     return PAYMENT_PROMPT_UNRECORDED_REPLY;
   }
   const hold = new Date(Date.now() + PAYMENT_HOLD_MS);
-  return `I've sent a new M-Pesa prompt for Ksh ${payment.amount.toLocaleString()} to the number ending ${lastDigits(payment.phone || customerId)}. Please enter your PIN to complete it.${holdLine(hold)}`;
+  return `M-Pesa has accepted a new deposit request for Ksh ${payment.amount.toLocaleString()} for the number ending ${lastDigits(payment.phone || customerId)}. If a prompt appears on your phone, enter your PIN there to complete it.${holdLine(hold)} If no prompt appears, reply "it hasn't arrived".`;
 }
 
 async function handlePaidClaim(this: any, customerId: string, message: string, s: PaymentSituation): Promise<string> {
