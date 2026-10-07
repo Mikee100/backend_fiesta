@@ -293,30 +293,21 @@ test('link-first verifier replaces unrequested catalogs but preserves money vali
   assert.ok(verifyModelReply(`${text}\nDeposit is Ksh 500.`, facts).reasons.includes('deposit_mismatch'));
 });
 
-test('link-first catalog state survives trimming, separates catalogs and expires without losing other memory', async (context) => {
-  const originals = { session: prisma.unifiedConversation.findFirst, upsert: prisma.customerMemory.upsert, find: prisma.customerMemory.findUnique, update: prisma.customerMemory.updateMany };
-  let sessionId = 'link-session';
-  let insights = ['owner:keep-this'];
-  context.after(() => { prisma.unifiedConversation.findFirst = originals.session; prisma.customerMemory.upsert = originals.upsert; prisma.customerMemory.findUnique = originals.find; prisma.customerMemory.updateMany = originals.update; });
-  (prisma.unifiedConversation.findFirst as any) = async () => ({ sessionId });
-  (prisma.customerMemory.upsert as any) = async () => ({});
-  (prisma.customerMemory.findUnique as any) = async () => ({ keyInsights: [...insights] });
-  (prisma.customerMemory.updateMany as any) = async ({ where, data }: any) => {
-    if (JSON.stringify(where.keyInsights.equals) !== JSON.stringify(insights)) return { count: 0 };
-    insights = data.keyInsights.set;
-    return { count: 1 };
-  };
+test('link-first generic package and addon requests stay on the website despite repeats or old markers', async (context) => {
+  const policy = require('./catalog-policy');
+  const originalClaim = policy.claimCatalogLink;
+  policy.claimCatalogLink = async () => assert.fail('old catalog-link state must not authorize a catalog dump');
+  context.after(() => { policy.claimCatalogLink = originalClaim; });
   const instance = withQuietAgent({ getPackageCatalogReply: async () => 'FULL EDITIONS', getAdditionsReply: async () => 'FULL ADDONS' });
-  assert.match(await instance.handleMessage('synthetic-link', 'show packages', [], 'whatsapp'), /session-packages/);
-  assert.equal(await instance.handleMessage('synthetic-link', 'show packages', [], 'whatsapp'), 'FULL EDITIONS');
-  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'addons', 'what add-ons do you have', []), /session-packages/);
+  const history = [{ role: 'assistant' as const, content: EDITION_LINK_REPLY }];
+  for (const message of ['Yess show me the packages in the studio', 'show packages', 'show packages']) {
+    assert.equal(await instance.handleMessage('synthetic-link', message, history, 'whatsapp'), EDITION_LINK_REPLY);
+  }
+  for (const message of ['show me the extras', 'what add-ons do you have', 'show me the extras']) {
+    assert.equal(await instance.handleMessage('synthetic-link', message, [{ role: 'assistant', content: ADDON_LINK_REPLY }], 'whatsapp'), ADDON_LINK_REPLY);
+  }
   assert.equal(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'addons', 'list them here', []), 'FULL ADDONS');
-  sessionId = 'new-session';
-  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'editions', 'show packages', []), /session-packages/);
-  assert.ok(insights.includes('owner:keep-this'));
-  insights = insights.map(item => item.startsWith('system:catalog-link:v1:') ? item.replace(/\d+$/, '1') : item);
-  assert.match(await instance.getCatalogDisplayReply('synthetic-link', 'whatsapp', 'editions', 'show packages', []), /session-packages/);
-  assert.equal(insights.filter(item => item.startsWith('system:catalog-link:v1:')).length, 1);
+  assert.equal(await instance.getCatalogDisplayReply('synthetic-link', 'web', 'editions', 'show packages', []), EDITION_LINK_REPLY);
 });
 
 test('link-first specific edition and addon inquiry keep their facts and append the pricing link', async () => {
@@ -1790,6 +1781,11 @@ test('money and policy routes are deterministic and rendered copy matches the ap
   const copyReview = readFileSync(path.join(__dirname, '../../../docs/PHASE_8_3_REPLY_REVIEW.md'), 'utf8').replace(/\r\n/g, '\n');
   assert.ok(copyReview.includes(process), 'booking-process approval text must match the rendered reply');
   for (const message of ['share the packages that you offer', 'what packages do you have', 'what do you offer', 'your editions']) {
+    const catalog = await instance.handleMessage('copy-customer', message, [], 'whatsapp');
+    assert.equal(catalog, EDITION_LINK_REPLY);
+    assert.ok(copyReview.includes(catalog), 'website-first copy must match the review document');
+  }
+  for (const message of ['show me the packages here', 'list the packages in chat']) {
     const catalog = await instance.handleMessage('copy-customer', message, [], 'whatsapp');
     assert.match(catalog, /Rate Card 2026/);
     assert.ok(catalog.length < 800);
