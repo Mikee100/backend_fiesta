@@ -143,7 +143,7 @@ export class MpesaService {
         }
       });
 
-      console.log('M-Pesa STK Push Initiated:', response.data);
+      console.log('M-Pesa STK Push Initiated:', { environment: ENVIRONMENT, ...response.data });
       return response.data;
     } catch (error: any) {
       const rawData = error.response?.data;

@@ -501,6 +501,15 @@ export class AgentService {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     // A profile name alone is not booking progress.
     if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) return null;
+    try {
+      const upcoming = await prisma.booking.findFirst({
+        where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
+        select: { id: true },
+      });
+      if (upcoming) return 'Welcome back. How can I help with your session?';
+    } catch {
+      console.warn('[AGENT_FLOW] Greeting booking lookup failed; using the general welcome.');
+    }
     return buildBusinessIntroductionReply();
   }
 
@@ -747,8 +756,8 @@ export class AgentService {
     history: { role: 'user' | 'assistant'; content: string }[]
   ): boolean {
     const lastAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content || '';
-    return /^(?:no(?:\s*,?\s*i\s+(?:do(?:n't| not)\s+want|don't need))?.*|none|skip|no thanks|no thank you)\s*[.!]*$/i.test(userMessage.trim())
-      && /optional (?:add-ons|extras)|(?:add-ons|extras).*(?:optional|include|like)/i.test(lastAssistantMessage);
+    return /^(?:no(?:\s*,?\s*i\s+(?:do(?:n't| not)\s+want|don't need))?.*|none|skip|no thanks|no thank you|i\s+(?:don't|dont|do not)\s+(?:want|need)\s+(?:them|(?:any\s+|the\s+)?(?:extras|add-ons|additions))(?:\s+(?:please|thanks|thank you))?)\s*[.!]*$/i.test(userMessage.trim())
+      && /optional (?:add-ons|extras|additions)|(?:add-ons|extras|additions).*(?:optional|include|like)/i.test(lastAssistantMessage);
   }
 
   private shouldExposeTools(
@@ -2736,7 +2745,8 @@ ${contextString}`;
         }
         throw error;
       }
-      return `I've sent the M-Pesa deposit prompt of Ksh ${result.depositAmount.toLocaleString()} to your phone. Enter your PIN to complete it, and I'll confirm your ${result.service} session once the payment goes through.`;
+      const sessionLabel = result.service ? `your session for ${editionInText(result.service)}` : 'your session';
+      return `M-Pesa has accepted the deposit request of Ksh ${result.depositAmount.toLocaleString()} for the number ending ${customerId.replace(/\D/g, '').slice(-3)}. If a prompt appears on your phone, enter your PIN there to complete it. I'll confirm ${sessionLabel} once the payment goes through. If no prompt appears, reply "it hasn't arrived".`;
     }
 
     if (draft.step === 'reschedule_confirm' && this.previousMessageRequestsConfirmation(history)) {

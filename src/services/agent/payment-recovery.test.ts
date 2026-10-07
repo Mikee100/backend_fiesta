@@ -205,7 +205,7 @@ test('pending, then cancelled callback, then retry sends a new prompt as attempt
   assert.doesNotMatch(state.sent.at(-1) || '', /\.\./);
 
   const reply = await say('can we retry this');
-  assert.match(reply, /sent a new M-Pesa prompt for Ksh 2,000 to the number ending 678/);
+  assert.match(reply, /accepted a new deposit request for Ksh 2,000 for the number ending 678/);
   assert.equal(state.stkPushes, 1);
   assert.equal(attemptsOf(state.draft), 2);
   assert.equal(state.payment.status, 'pending');
@@ -216,7 +216,7 @@ test('cancelled twice, then yes resends and never claims the prompt is already s
   const { state, say } = harness(context, { draft: { version: 3 }, payment: { status: 'cancelled' } });
   const reply = await say('yes');
   assert.doesNotMatch(reply, /already sent/i);
-  assert.match(reply, /sent a new M-Pesa prompt/);
+  assert.match(reply, /accepted a new deposit request/);
   assert.equal(state.stkPushes, 1);
   assert.equal(attemptsOf(state.draft), 3);
   state.payment.status = 'cancelled';
@@ -225,9 +225,12 @@ test('cancelled twice, then yes resends and never claims the prompt is already s
   assert.equal(state.stkPushes, 1);
 });
 
-test('a young pending prompt is the only state that answers already sent', async (context) => {
+test('a young pending request reports accepted without claiming phone delivery or sending again', async (context) => {
   const { state, say } = harness(context, { payment: { updatedAt: new Date(Date.now() - 20_000) } });
-  assert.match(await say('yes'), /already sent the M-Pesa deposit prompt.*ending 678/);
+  const reply = await say('yes');
+  assert.match(reply, /already accepted the deposit request.*ending 678/);
+  assert.match(reply, /If a prompt appears on your phone/);
+  assert.doesNotMatch(reply, /sent.*to your phone|booking is confirmed|session.*is booked/i);
   assert.equal(state.stkPushes, 0);
 });
 
@@ -248,6 +251,20 @@ test('it has not arrived after 30 seconds answers from state without the model o
   assert.match(reply, /reply resend/i);
   assert.match(reply, /0720 111928/);
   assert.equal(state.stkPushes, 0);
+});
+
+test('the reported prompt never came keeps payment pending and does not push or confirm again', async (context) => {
+  const { state, say } = harness(context);
+  const reply = await say('The prompt never came');
+  assert.equal(classifyPaymentMessage('The prompt never came'), 'not_arrived');
+  assert.match(reply, /can't verify that a prompt reached your phone/);
+  assert.match(reply, /number ending 678/);
+  assert.doesNotMatch(reply, /sent.*to your phone|payment (?:is )?confirmed/i);
+  assert.equal(state.stkPushes, 0);
+  assert.equal(state.bookingsCreated, 0);
+  assert.equal(state.calendarEvents, 0);
+  assert.equal(state.payment.status, 'pending');
+  assert.equal(state.draft.step, 'payment_pending');
 });
 
 test('an expired 16 minute hold rechecks the slot before re-proposing, never pushing directly', async (context) => {
@@ -312,8 +329,8 @@ test('duplicate yes within 5 seconds sends one STK push', async (context) => {
   const { state, say } = harness(context, { payment: { status: 'cancelled' } });
   const replies = await Promise.all([say('yes'), say('yes')]);
   assert.equal(state.stkPushes, 1);
-  assert.equal(replies.filter((reply) => /sent a new M-Pesa prompt/.test(reply)).length, 1);
-  assert.equal(replies.filter((reply) => /already sent/.test(reply)).length, 1);
-  assert.match(await say('yes'), /already sent/);
+  assert.equal(replies.filter((reply) => /accepted a new deposit request/.test(reply)).length, 1);
+  assert.equal(replies.filter((reply) => /already accepted|still being processed/.test(reply)).length, 1);
+  assert.match(await say('yes'), /already accepted/);
   assert.equal(state.stkPushes, 1);
 });

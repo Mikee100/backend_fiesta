@@ -426,7 +426,7 @@ export function createMessageRoutes(
     {
       name: 'additions',
       replyMode: 'deterministic',
-      when: () => this.shouldUseAdditionsReply(userMessage),
+      when: () => this.shouldUseAdditionsReply(userMessage) && !this.isDecliningOptionalAddons(userMessage, history),
       handle: () => this.getCatalogDisplayReply(customerId, platform, 'addons', userMessage, history),
     },
     {

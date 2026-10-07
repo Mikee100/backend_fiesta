@@ -10,6 +10,7 @@ import { ADDON_LINK_REPLY, ADDON_MAKEUP_CLARIFICATION, EDITION_LINK_REPLY, OFFIC
 import { isAddonListRequest, selectedAddons } from './addon-capture';
 import { verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { normalizeQuotes } from './regex';
+import { buildAdditionsReply } from './replies';
 
 const CUSTOMER = 'synthetic-maryanne';
 const NOW = new Date('2026-10-05T20:44:00Z').getTime();
@@ -203,6 +204,23 @@ test('a blocked add-on list from the model falls back to the add-on link, not th
   assert.equal(result.reply, ADDON_LINK_REPLY);
   const editionDump = 'THE BLOOM, THE MUSE and THE ICON are our editions.';
   assert.equal((await verifyWithOneRetry(editionDump, { amounts: [], deposits: [], editions: [] }, async () => '', async () => {})).reply, EDITION_LINK_REPLY);
+});
+
+test('declining the displayed optional additions proceeds to the Bloom proposal without a model or payment call', async (context) => {
+  const { state, history, say, reset, agent } = harness(context, null);
+  agent.executeConfirmBookingTool = async () => assert.fail('declining extras is not payment consent');
+  for (const answer of ["No I don't want the extras", "I don't want them", "I don\u2019t want them", 'I do not want any extras']) {
+    reset({ service: 'THE BLOOM', date: '2026-10-13', time: '14:00', name: 'Maryanne' });
+    history.push({ role: 'assistant', content: buildAdditionsReply(2000) });
+    assert.equal(agent.isDecliningOptionalAddons(normalizeQuotes(answer), history), true, answer);
+    const reply = await say(answer);
+    assert.equal(reply, 'Your details for the Bloom edition are ready for Tuesday, 13 October 2026 at 2:00 PM. The deposit is Ksh 2,000. Reply yes if you would like me to send the M-Pesa prompt. Your booking is confirmed once the deposit is received.');
+    assert.equal(state.proposals.length, 1);
+    assert.deepEqual(state.notes, []);
+    assert.deepEqual(state.insights, ['system:addons-decided:v1:muse-draft']);
+    assert.equal(state.modelCalls, 0);
+  }
+  assert.equal(agent.isDecliningOptionalAddons("I don't want them", [{ role: 'assistant', content: 'Which edition would you like?' }]), false);
 });
 
 test('"No" or "skip" at the add-on step is remembered beyond the six-message history window', async (context) => {

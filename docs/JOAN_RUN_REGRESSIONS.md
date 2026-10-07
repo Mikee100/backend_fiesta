@@ -1,5 +1,40 @@
 # Observed run regression fixes
 
+## Bloom extras refusal and STK acceptance (2026-10-07)
+
+The supplied run repeated the optional-additions list after "No I don't want the
+extras", then sent "I don't want them" through the model. The broad additions
+route matched the word "extras" before booking progression. The decline helper
+also omitted the displayed "optional additions" heading and the pronoun refusal.
+The helper now accepts these contextual refusals, and the additions route yields
+to the existing code-owned booking progression. A complete collecting draft gets
+the deposit proposal, not another list or an automatic payment request.
+
+The supplied STK response has ResponseCode 0 and a CheckoutRequestID. This proves
+request acceptance, not prompt delivery to the handset or successful payment.
+The initial, pending and retry replies now distinguish accepted/processing state
+from handset delivery and make PIN instructions conditional on seeing a prompt.
+"The prompt never came" uses existing recovery without an automatic push or
+booking confirmation. Explicit resend consent, cooldown, attempt cap and callback
+confirmation rules are unchanged. Edition labels use the existing running-text
+formatter instead of emitting THE BLOOM inside the new reply.
+
+The service defaults to sandbox unless MPESA_ENVIRONMENT selects production.
+The STK response log now includes the selected non-secret environment. No runtime
+mode, credentials or callback destination was inspected or changed in this task.
+For the missing live prompt, an operator must verify the running process's mode,
+the intended active Safaricom M-Pesa SIM, and the final callback ResultCode or
+Daraja query outcome for the matching CheckoutRequestID. WhatsApp message-status
+webhooks are not STK callbacks. Sandbox acceptance is not evidence of real-phone
+delivery. Do not blindly resend or mark the payment failed/paid without evidence.
+
+Offline booking-step suite: 13 passed. Payment recovery suite: 14 passed, including
+duplicate consent and non-arrival with no extra push/booking/Calendar operation.
+Full suite: 511 passed, five existing 6 October date-dependent failures. TypeScript
+passes. External services were mocked and DATABASE_URL redirected to an unreachable
+local endpoint. No live STK request, callback query, database mutation, deployment
+or commit was performed. The live delivery cause remains unverified.
+
 ## Initial reschedule intent before slot capture (2026-10-06)
 
 The exact Muse follow-up "thats nice can we kindly reschedule it to some other

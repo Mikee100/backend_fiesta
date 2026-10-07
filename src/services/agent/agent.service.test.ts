@@ -281,7 +281,7 @@ test('ignores duplicate yes replies after a payment prompt has already been sent
 
   try {
     const result = await agent.tryImmediateConfirmation('customer-123');
-    assert.match(result || '', /already sent the M-Pesa.*prompt|already sent the M-Pesa/i);
+    assert.match(result || '', /already accepted the deposit request|deposit request.*still being processed/i);
   } finally {
     prisma.bookingDraft.findUnique = originalFindUnique;
     prisma.payment.findFirst = originalPaymentFindFirst;
