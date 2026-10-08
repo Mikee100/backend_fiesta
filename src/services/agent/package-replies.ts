@@ -196,6 +196,22 @@ export async function getPackageSelectionReply(customerId: string, userMessage: 
   }
 
   if (draft?.step && !['collecting_slots', 'service'].includes(draft.step)) return null;
+
+  if (draft && ['collecting_slots', 'service'].includes(draft.step)) {
+    await prisma.bookingDraft.updateMany({
+      where: { id: draft.id, step: draft.step },
+      data: { service: selectedPackage.name, step: 'collecting_slots' },
+    });
+  } else if (!draft) {
+    try {
+      await prisma.bookingDraft.create({
+        data: { customerId, service: selectedPackage.name, step: 'collecting_slots' },
+      });
+    } catch (e: any) {
+      if (e?.code !== 'P2002') throw e;
+    }
+  }
+
   if (!draft?.date) return editionSelectedDateQuestion(selectedPackage.name);
   if (!draft.time) return `You've chosen ${editionInText(selectedPackage.name)}. What time would suit you?`;
   return `Your details for ${editionInText(selectedPackage.name)} are noted. Would you like to go ahead?`;

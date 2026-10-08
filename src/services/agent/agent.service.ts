@@ -1533,7 +1533,7 @@ LEGEND INCLUSION HOLD: The public page does not list a Legend wig, while local d
 [B] TOOL-USE WORKFLOW (how and when to call tools, once [A] allows it)
 B1. If the customer asks about their upcoming appointment, its date/time, or its details (e.g. "tell me about my appointment", "when is my session", "what are its details") - this is an INFO REQUEST, NOT a reschedule request. Just answer directly using the "Upcoming Booking" / "Past Bookings" information already provided above. Do NOT call propose_reschedule, get_available_slots, or ask them for a new date/time unless they explicitly say they want to reschedule, change, move, postpone, or cancel it.
 B2. BOOKING FLOW, IN THIS EXACT ORDER - never skip or reorder a step:
-    a) Gather their real Name, the Service they want, a Date, and a Time. Track which of these are already known from earlier in this same conversation (e.g. they already agreed to a themed backdrop, or already named a package) and only ask for what's still missing - ask for it in ONE clear question, do not re-ask about something already settled, and do not pivot to an unrelated topic when they've just answered the specific question you asked. If a date/time they give looks like a typo of a real day or time (e.g. "Sundat" for "Sunday"), interpret it as they most likely meant rather than ignoring it or changing the subject; only ask them to clarify if it's genuinely ambiguous.
+    a) Strictly gather details in this order: 1. Package -> 2. Date -> 3. Time -> 4. Name -> 5. Optional Add-ons decision -> 6. Propose booking. Check what is already known in 'Known so far' above and NEVER re-ask for a package if package is known. If the package is known, ask for the date next. Only ask for the customer's real name AFTER the date and time have been checked and agreed. Ask for missing details in ONE clear question. If a date/time they give looks like a typo of a real day or time (e.g. "Sundat" for "Sunday"), interpret it as they most likely meant rather than ignoring it or changing the subject; only ask them to clarify if it's genuinely ambiguous.
     b) Call 'get_available_slots' for that specific date and service to see which times are free. If their preferred time is taken, suggest the closest available slots from the list returned.
     c) Once the time is confirmed free, ask ONCE if they'd like any optional add-ons (e.g. "Would you like to include any optional add-ons with your shoot, such as an extra outfit, styled wig hire, or extra edited photos? It's completely optional!"). Make clear it's optional. If they accept an add-on, save it with 'add_session_note'. If they decline ("no", "none", "skip") or don't respond to it after one ask, move on immediately - never ask about add-ons more than once per booking.
     d) Only now call 'propose_booking'. This only tells the customer the deposit amount - it does NOT charge anything or send any payment prompt. STOP THERE and wait.
@@ -2115,7 +2115,7 @@ ${contextString}`;
       } else if (requestedCalendarDate && knownService
         && (platform === 'whatsapp' || platform === 'web')
         && !/\b(cancel|reschedule|move|postpone|note|bringing)\b/i.test(userMessage)
-        && (/\b(available|availability|slots?|open|closed|weekday)\b/i.test(userMessage)
+        && (/\b(available|availability|slots?|open|closed|weekday|schedule)\b/i.test(userMessage)
           || /^\s*(?:\d{1,2}(?:st|nd|rd|th)?\s+|\d{4}-\d{2}-\d{2})/.test(userMessage))) {
         await checkCalendarSlots(requestedCalendarDate, knownService);
       }
@@ -2279,8 +2279,8 @@ ${contextString}`;
     }
     if (cancellationDraftReply) return this.respond(ctx, cancellationDraftReply);
     const routes = this.createMessageRoutes(customerId, userMessage, history, platform, startedAt);
-    const scopeBoundaryRoute = routes[0];
-    if (scopeBoundaryRoute.when()) {
+    const scopeBoundaryRoute = routes.find(candidate => candidate.name === 'scopeBoundary');
+    if (scopeBoundaryRoute?.when()) {
       console.log(`[AGENT_FLOW] route=${scopeBoundaryRoute.name}`);
       const scopeResult = await scopeBoundaryRoute.handle() as string;
       return this.respond(ctx, scopeResult);
@@ -2309,28 +2309,7 @@ ${contextString}`;
       });
     }
 
-    const withinBudget = await this.checkTokenBudget(customerId);
-    console.log('[AGENT_FLOW] Budget check result:', { customerId, withinBudget });
-    if (!withinBudget) {
-      console.log('[AGENT_FLOW] Daily token budget exceeded; returning fallback reply.', {
-        customerId,
-        dailyTokenCap: DAILY_TOKEN_CAP,
-        platform
-      });
-      await this.escalate(
-        customerId,
-        'quota',
-        JSON.stringify({
-          event: 'quota_handoff_requested', platform, customerMessage: userMessage.slice(0, 2000),
-          dailyTokenCap: DAILY_TOKEN_CAP, requiresHumanReply: true,
-          responseTarget: 'within the business day', assignedOwner: null,
-          note: 'Automated replies stopped. A studio team member must claim this handoff and reply; no booking or payment action was taken.',
-        })
-      );
-      return this.respond(ctx, BUDGET_HANDOFF_REPLY, { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' });
-    }
-
-    // Sentiment tracking runs after circuit-breaker and budget checks so
+    // Sentiment tracking runs after circuit-breaker check so
     // an angry burst during an outage doesn't flood escalations.
     this.trackSentiment(customerId, userMessage).catch(err => console.error('Sentiment tracking failed:', err));
 
@@ -2422,6 +2401,40 @@ ${contextString}`;
     return { reply: SCHEMA_MAINTENANCE_REPLY, outcome: { success: false, isFallback: true, failureReason: 'database_schema_out_of_date' } };
   }
 
+  private async escalateQuotaHandoff(customerId: string, userMessage: string, platform: string): Promise<void> {
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+      select: { name: true, phone: true }
+    });
+    const customerLabel = customer?.name && customer.name !== 'WhatsApp User'
+      ? `${customer.name} (${customer.phone || customerId})`
+      : customer?.phone || customerId;
+    const bookingSummary = draft?.service
+      ? `Package: ${draft.service}${draft.date ? `, Date: ${draft.date}` : ''}${draft.time ? `, Time: ${draft.time}` : ''}`
+      : 'No active booking draft';
+
+    const readableMessage = `Customer ${customerLabel} reached the daily automated conversation limit. Latest message: "${userMessage.slice(0, 200)}". Current booking state: ${bookingSummary}. A studio team member must claim this handoff and reply.`;
+
+    await this.escalate(
+      customerId,
+      'quota',
+      JSON.stringify({
+        event: 'quota_handoff_requested',
+        platform,
+        customerName: customer?.name || null,
+        customerPhone: customer?.phone || null,
+        bookingSummary,
+        customerMessage: userMessage.slice(0, 2000),
+        dailyTokenCap: DAILY_TOKEN_CAP,
+        requiresHumanReply: true,
+        responseTarget: 'within the business day',
+        assignedOwner: null,
+        note: readableMessage,
+      })
+    );
+  }
+
   private async getBookingProgressReply(customerId: string, message: string, history: { role: 'user' | 'assistant'; content: string }[], decisionJustSaved = false, force = false): Promise<string | null> {
     return bookingProgressReply.call(this, customerId, message, history, decisionJustSaved, force);
   }
@@ -2481,7 +2494,7 @@ ${contextString}`;
     history: { role: 'user' | 'assistant', content: string }[]
   ): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
-    const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good)(?:\s+(?:thanks|thank you))?$/.test(normalized);
+    const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good|noted|noted\s+thanks|noted\s+thank\s+you|asante|asante\s+sana)(?:\s+(?:thanks|thank you))?$/.test(normalized);
     if (!isAcknowledgement) return false;
 
     const awaitingConfirmation = this.previousMessageRequestsConfirmation(history);

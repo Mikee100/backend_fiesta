@@ -58,7 +58,8 @@ export class ConversationFlowMatcher {
     if ((editionQuestion.test(text) && !this.isPackageAdviceRequest(message)) || requestedDetail || choosesFromOverview) return true;
     const explicitCatalogRequest = /(what\s+packages|which\s+packages|package\s+list|list\s+of\s+services|services\s+do\s+you\s+offer|what\s+services\s+do\s+you\s+offer|show\s+me\s+packages|tell\s+me\s+about\s+(the\s+)?(packages|services)|packages?\s+(or|and)\s+services|what\s+does\s+each\s+(package|edition)\s+(include|come\s+with))/i.test(text);
     const shareCatalogRequest = /\bshare\s+(?:the\s+)?packages\b|\bwhat\s+do\s+you\s+offer\b|\byour\s+editions\b/i.test(text);
-    if (explicitCatalogRequest || shareCatalogRequest || this.isPackageInclusionFollowUp(message, history)) return true;
+    const rateCardRequest = /\b(?:rate\s*cards?|price\s*list|pricing\s*list)\b/i.test(text);
+    if (explicitCatalogRequest || shareCatalogRequest || rateCardRequest || this.isPackageInclusionFollowUp(message, history)) return true;
 
     const contextualFollowUp = /^(?:tell\s+me\s+about\s+(?:them|those)|what\s+about\s+(?:them|those)|can\s+you\s+tell\s+me\s+about\s+(?:them|those))\s*[?.!]*$/.test(text);
     if (!contextualFollowUp) return false;

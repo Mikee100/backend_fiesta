@@ -9,7 +9,8 @@ import {
   classifyProviderRateLimit,
   shouldNotifyOutage,
 } from './resilience.service';
-import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
+import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY, BUDGET_HANDOFF_REPLY } from './constants';
+import { resolveVerifiedFact } from './verified-facts';
 import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { isCustomerNameQuestion, needsUnchangedReassurance } from './reply-voice';
@@ -155,9 +156,15 @@ export function createMessageRoutes(
     {
       name: 'postActionAcknowledgement',
       when: () => this.isPostActionAcknowledgement(userMessage, history),
-      handle: () => this.previousMessageRequestsConfirmation(history)
-        ? 'No rush. Let me know when you are ready to go ahead.'
-        : 'You are welcome. I am here if you need anything else.',
+      handle: () => {
+        const lastAssistant = [...history].reverse().find(m => m.role === 'assistant')?.content || '';
+        if (lastAssistant.includes(BUDGET_HANDOFF_REPLY) || /passed your question to the studio team|team will pick this up|team will confirm/i.test(lastAssistant)) {
+          return 'You are welcome. 🤍 A member of our team will be in touch with you shortly.';
+        }
+        return this.previousMessageRequestsConfirmation(history)
+          ? 'No rush. Let me know when you are ready to go ahead.'
+          : 'You are welcome. I am here if you need anything else.';
+      },
     },
     {
       name: 'cancellationDeclined',
@@ -364,6 +371,15 @@ export function createMessageRoutes(
       handle: () => this.getCatalogDisplayReply(customerId, platform, 'addons', userMessage, history),
     },
     {
+      name: 'verifiedFacts',
+      replyMode: 'deterministic',
+      when: () => !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history) && Boolean(resolveVerifiedFact(userMessage, history)),
+      handle: async () => {
+        const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+        return resolveVerifiedFact(userMessage, history, { draftService: draft?.service });
+      },
+    },
+    {
       name: 'personalOutfit',
       replyMode: 'deterministic',
       when: () => isPersonalOutfitQuestion(userMessage),
@@ -547,7 +563,21 @@ export function createMessageRoutes(
             const type = emojiReplyType(progress);
             return type !== 'other' ? this.decorateTemplateEmoji(customerId, platform, progress, type, userMessage, history) : progress;
           }
-          console.log('[AGENT_FLOW] No deterministic early exit matched; invoking runAgent()');
+          console.log('[AGENT_FLOW] No deterministic early exit matched; checking token budget before model call');
+          const withinBudget = await this.checkTokenBudget(customerId);
+          if (!withinBudget) {
+            console.log('[AGENT_FLOW] Daily token budget exceeded; returning fallback reply.', {
+              customerId,
+              dailyTokenCap: DAILY_TOKEN_CAP,
+              platform,
+            });
+            await this.escalateQuotaHandoff(customerId, userMessage, platform);
+            return {
+              reply: BUDGET_HANDOFF_REPLY,
+              outcome: { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' },
+            };
+          }
+          console.log('[AGENT_FLOW] Invoking runAgent()');
           const { content, tokensUsed, failureType } = await this.runAgent(customerId, userMessage, history, platform);
           console.log('[AGENT_FLOW] runAgent() completed successfully:', JSON.stringify({
             customerId,
