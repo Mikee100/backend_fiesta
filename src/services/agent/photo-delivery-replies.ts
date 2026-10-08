@@ -4,7 +4,7 @@ import { inBusinessTimezone } from '../../utils/time';
 
 export function isEarliestImageDeliveryRequest(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
-  return /(when\s+(can|will)\s+i\s+get\s+(the\s+)?(images|photos)|earliest\s+i\s+can\s+get\s+(the\s+)?(images|photos)|how\s+soon\s+can\s+i\s+get\s+(the\s+)?(images|photos)|when\s+are\s+(the\s+)?(images|photos)\s+ready|when\s+should\s+i\s+expect\s+(the\s+)?(?:edited\s+)?(?:images|photos)|delivery\s+date\s+for\s+(images|photos)|how\s+long\b.{0,70}\b(?:images|photos)\b.{0,50}\b(?:edit|edited|editing|ready)|how\s+long\b.{0,70}\b(?:edit|edited|editing)\b.{0,50}\b(?:images|photos))/.test(text);
+  return /(when\s+(can|will)\s+i\s+get\s+(the\s+)?(images|photos)|earliest\s+i\s+can\s+get\s+(the\s+)?(images|photos)|how\s+soon\s+can\s+i\s+get\s+(the\s+)?(images|photos)|when\s+are\s+(the\s+)?(images|photos)\s+ready|when\s+should\s+i\s+expect\s+(the\s+)?(?:edited\s+)?(?:images|photos)|delivery\s+date\s+for\s+(images|photos)|how\s+long\b.{0,70}\b(?:images|photos)\b.{0,50}\b(?:edit|edited|editing|ready|take|get|receive)|how\s+long\b.{0,70}\b(?:take\s+to\s+get|to\s+get|to\s+receive|to\s+take)\b.{0,50}\b(?:images|photos|pictures)|how\s+long\b.{0,70}\b(?:edit|edited|editing)\b.{0,50}\b(?:images|photos))/.test(text);
 }
 
 export function isExpressDeliveryFeeRequest(userMessage: string): boolean {

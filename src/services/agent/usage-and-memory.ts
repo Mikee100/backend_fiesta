@@ -30,10 +30,22 @@ export async function escalate(customerId: string, escalationType: string, descr
     await prisma.escalation.create({
       data: { customerId, escalationType, description, status: 'OPEN', sentimentScore }
     });
+    let alertTitle = `Customer ${customerId} needs attention`;
+    let alertMessage = description;
+    try {
+      const parsed = JSON.parse(description);
+      if (parsed.event === 'quota_handoff_requested') {
+        const who = parsed.customerName || parsed.customerPhone || customerId;
+        alertTitle = `Customer Handoff: ${who} (Token Cap)`;
+        alertMessage = parsed.note || `Customer reached daily token cap. Booking state: ${parsed.bookingSummary || 'none'}.`;
+      }
+    } catch {
+      // plain text description
+    }
     await notifyAdmin(
       'escalation',
-      `Customer ${customerId} needs attention`,
-      description,
+      alertTitle,
+      alertMessage,
       { customerId, escalationType, sentimentScore }
     );
   } catch (err) {

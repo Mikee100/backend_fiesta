@@ -65,15 +65,20 @@ export function extractStatedSlots(message: string, history: Message[] = []): Sl
     if (selected) slots.service = selected;
   }
 
-  if (!question || /^\s*(?:how|what)\s+about\s+/i.test(message)) {
-    const date = resolveCalendarDate(message);
-    if (date) slots.date = date;
-    const time = message.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
+  const isScheduleQuery = /\b(?:schedule|available|availability|free|open|book|slots?)\b/i.test(message);
+  if (!question || /^\s*(?:how|what)\s+about\s+/i.test(message) || isScheduleQuery || /\b(?:at|on|for|from)\b/i.test(message)) {
+    try {
+      const date = resolveCalendarDate(message);
+      if (date) slots.date = date;
+    } catch {
+      // invalid date string handled elsewhere
+    }
+    const time = message.match(/(?:@\s*|\bat\s+)?\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i);
     if (time) {
       const hour = time[4] ? Number(time[4]) : Number(time[1]);
       const minute = Number(time[5] || time[2] || 0);
       if (minute < 60 && (time[4] ? hour < 24 : hour >= 1 && hour <= 12)) {
-        const normalizedHour = time[4] ? hour : hour % 12 + (time[3].toLowerCase() === 'pm' ? 12 : 0);
+        const normalizedHour = time[4] ? hour : hour % 12 + (time[3]?.toLowerCase() === 'pm' ? 12 : 0);
         slots.time = `${String(normalizedHour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
       }
     }

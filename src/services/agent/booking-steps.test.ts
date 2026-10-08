@@ -59,7 +59,9 @@ function harness(context: any, draft: Record<string, unknown> | null, customerNa
   stub(bookingService, 'getAvailableSlots', async () => { state.slotQueries++; return state.slots; });
   stub(require('./catalog-policy'), 'claimCatalogLink', async () => true);
   const agent = new AgentService() as any;
+  agent.naturalAssistantMode = false;
   Object.assign(agent, {
+    decorateTemplateEmoji: async (_c: any, _p: any, reply: string) => reply,
     checkTokenBudget: async () => true,
     trackSentiment: async () => {},
     logAiJobMetric: async () => {},
