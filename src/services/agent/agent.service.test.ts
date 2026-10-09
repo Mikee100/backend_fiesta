@@ -204,6 +204,21 @@ test('falls through all providers when each account exhausts its quota', async (
   }
 });
 
+test('a request too large for one account (413) falls over to the next provider', async () => {
+  const originalCreate = prisma.aiModelUsage.create;
+  (prisma.aiModelUsage.create as any) = async () => ({});
+  const clients = {
+    groq: { chat: { completions: { create: async () => { throw Object.assign(new Error('Request too large'), { status: 413 }); } } } },
+    gemini: { chat: { completions: { create: async () => ({ choices: [{ message: { content: 'Ready' } }] }) } } },
+  } as any;
+  try {
+    const result = await createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients);
+    assert.equal(result.provider, 'gemini');
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
 test('keeps hard policy identifiers while replacing redundant voice rules and omitting unrelated price tables', async () => {
   const originalPackageFindMany = prisma.package.findMany;
   (prisma.package.findMany as any) = async () => [
