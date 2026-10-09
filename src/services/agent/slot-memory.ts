@@ -13,6 +13,13 @@ export function closedDateReply(facts: { date: string; isMonday: boolean; isPast
 }
 
 export const SLOT_MEMORY_WINDOW_MS = BOOKING_SLOT_RETENTION_MS;
+/** An unpaid payment step this old has lapsed: its prompt limit no longer applies and new details may replace it. */
+export const PAYMENT_LAPSE_MS = 60 * 60_000;
+
+export function paymentLapsed(draft: { step?: string | null; updatedAt?: Date | string | null } | null, now = Date.now()): boolean {
+  const updated = draft?.updatedAt ? new Date(draft.updatedAt).getTime() : NaN;
+  return draft?.step === 'payment_pending' && Number.isFinite(updated) && now - updated >= PAYMENT_LAPSE_MS;
+}
 /** A collecting draft untouched for longer than this is confirmed with the customer before it is used. */
 export const CARRY_OVER_FRESH_MS = 2 * 60 * 60 * 1000;
 export const EARLY_SLOT_STEP = 'collecting_slots';
@@ -132,6 +139,14 @@ export async function rememberBookingSlots(customerId: string, message: string, 
   const stated = extractStatedSlots(message, history);
   if (!Object.keys(stated).length) return null;
   let draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  if (draft && paymentLapsed(draft) && (stated.service || stated.date || stated.time)
+    && !await prisma.payment.findFirst({ where: { bookingDraftId: draft.id, status: 'success' }, select: { id: true } })) {
+    const released = await prisma.bookingDraft.updateMany({
+      where: { id: draft.id, step: 'payment_pending', updatedAt: draft.updatedAt },
+      data: { step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 },
+    });
+    if (released.count) draft = { ...draft, step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 };
+  }
   if (draft && (PROTECTED_STEPS.includes(draft.step) || draft.isForSomeoneElse)) return null;
   if (draft && draft.step !== EARLY_SLOT_STEP && draft.step !== 'service') return null;
   if (draft && earlySlotsExpired(draft)) {

@@ -2,10 +2,12 @@ import prisma from '../../config/prisma';
 import { bookingService } from '../booking/booking.service';
 import { mpesaService } from '../payment/mpesa.service';
 import { SERVICE_DURATIONS } from '../../config/constants';
-import { businessDay, inBusinessTimezone } from '../../utils/time';
+import { bookingDateFacts, businessDay, inBusinessTimezone } from '../../utils/time';
 import { buildBookingProposalConfirmation, formatCustomerTime } from './replies';
 import { editionInText } from './reply-voice';
 import { PAYMENT_PROMPT_UNRECORDED_REPLY } from './constants';
+
+import { paymentLapsed } from './slot-memory';
 
 export const MAX_PAYMENT_ATTEMPTS = 3;
 export const PAYMENT_PROMPT_TIMEOUT_MS = 2 * 60_000;
@@ -24,6 +26,8 @@ export type PaymentSituation = {
   draft: DraftLike | null;
   payment: PaymentLike | null;
   attempts: number;
+  /** Unpaid for over PAYMENT_LAPSE_MS: the prompt limit belonged to that attempt and starts again. */
+  lapsed?: boolean;
   holdEndsAt: Date | null;
   promptAgeMs: number | null;
   paidBooking: { service: string; dateTime: Date } | null;
@@ -67,7 +71,8 @@ export async function getPaymentSituation(customerId: string, now = Date.now(), 
 
   const payment = await prisma.payment.findFirst({ where: { bookingDraftId: draft.id } }) as PaymentLike | null;
   const hold = holdEndsAt(draft);
-  const situation = { ...base, payment, attempts: paymentAttempts(draft, payment), holdEndsAt: hold };
+  const lapsed = paymentLapsed(draft, now) && payment?.status !== 'success';
+  const situation = { ...base, payment, attempts: lapsed ? 0 : paymentAttempts(draft, payment), lapsed, holdEndsAt: hold };
   if (payment?.status === 'success') return { ...situation, kind: 'paid' };
   if (hold && now > hold.getTime()) return { ...situation, kind: 'hold_expired' };
 
@@ -184,7 +189,13 @@ async function escalateAttemptsExhausted(this: any, customerId: string, s: Payme
 async function recheckExpiredHold(this: any, customerId: string, s: PaymentSituation): Promise<string> {
   if (s.attempts >= MAX_PAYMENT_ATTEMPTS) return escalateAttemptsExhausted.call(this, customerId, s);
   const draft = s.draft!;
+  const resetAttempts = s.lapsed ? { version: 1 } : {};
   const serviceKey = Object.keys(SERVICE_DURATIONS).find((key) => draft.service?.toLowerCase().includes(key));
+  if (draft.date && bookingDateFacts(draft.date).isPast) {
+    await prisma.bookingDraft.update({ where: { id: draft.id, step: 'payment_pending' },
+      data: { step: 'collecting_slots', date: null, time: null, dateTimeIso: null, ...resetAttempts } });
+    return `Your earlier request for ${editionInText(draft.service || '')} on ${slotText(draft)} has lapsed, and no payment was taken. Which date would you like now?`;
+  }
   if (!serviceKey || !draft.date || !draft.time) {
     return `Your 15-minute hold has ended. The studio team will help you rebook on ${STUDIO_CONTACT}.`;
   }
@@ -192,10 +203,10 @@ async function recheckExpiredHold(this: any, customerId: string, s: PaymentSitua
   const available: string[] = Array.isArray(slots) ? slots : [];
   if (available.includes(draft.time)) {
     const deposit = this.getDepositForPackage(await this.getPackageForDeposit(draft.service || ''));
-    await prisma.bookingDraft.update({ where: { id: draft.id, step: 'payment_pending' }, data: { step: 'awaiting_confirmation' } });
+    await prisma.bookingDraft.update({ where: { id: draft.id, step: 'payment_pending' }, data: { step: 'awaiting_confirmation', ...resetAttempts } });
     return `Your 15-minute hold ended, but ${slotText(draft)} is still free. ${buildBookingProposalConfirmation(draft.service || '', draft.date, draft.time, deposit)}`;
   }
-  await prisma.bookingDraft.update({ where: { id: draft.id, step: 'payment_pending' }, data: { step: 'collecting_slots', time: null, dateTimeIso: null } });
+  await prisma.bookingDraft.update({ where: { id: draft.id, step: 'payment_pending' }, data: { step: 'collecting_slots', time: null, dateTimeIso: null, ...resetAttempts } });
   const alternatives = available.slice(0, 3).map(formatCustomerTime);
   const next = alternatives.length
     ? `Available times that day are ${alternatives.join(', ')}. Which would you prefer?`
