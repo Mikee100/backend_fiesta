@@ -2798,24 +2798,51 @@ test('a cancellation proposal expires after one hour and a later yes cannot canc
 test('cancellation proposals preserve collected slots and payment drafts', async () => {
   const originalFindUnique = prisma.bookingDraft.findUnique;
   const originalUpsert = prisma.bookingDraft.upsert;
+  const originalCount = prisma.booking.count;
   let activeDraft: any;
   let upserts = 0;
   (prisma.bookingDraft.findUnique as any) = async () => activeDraft;
   (prisma.bookingDraft.upsert as any) = async () => { upserts++; };
+  // A confirmed session also exists, so "cancel" may mean it and the open request is left alone.
+  (prisma.booking.count as any) = async () => 1;
 
   try {
     for (const step of ['collecting_slots', 'awaiting_confirmation', 'payment_pending']) {
       activeDraft = { id: 'active-draft', step, service: 'THE ICON', updatedAt: new Date() };
       const result = await agent.proposeCancellation('customer-1', 'cancel', []);
       assert.equal(result.proposed, false);
-      assert.match(result.reply, step === 'payment_pending' ? /M-Pesa payment prompt is already pending/ : step === 'collecting_slots' ? /booking is already being prepared/ : /booking proposal is already awaiting your confirmation/);
+      assert.match(result.reply, step === 'payment_pending' ? /No payment has been taken.*do not enter your M-Pesa PIN/ : step === 'collecting_slots' ? /booking is already being prepared/ : /booking proposal is already awaiting your confirmation/);
       assert.equal(activeDraft.step, step);
     }
     assert.equal(upserts, 0);
   } finally {
     prisma.bookingDraft.findUnique = originalFindUnique;
     prisma.bookingDraft.upsert = originalUpsert;
+    prisma.booking.count = originalCount;
   }
+});
+
+test('"cancel that, I don\'t want it" withdraws a lapsed unpaid request when no session is booked', async (context) => {
+  const originals = { draft: prisma.bookingDraft.findUnique, del: prisma.bookingDraft.deleteMany, count: prisma.booking.count,
+    pay: prisma.payment.findFirst, payMany: prisma.payment.updateMany };
+  context.after(() => {
+    prisma.bookingDraft.findUnique = originals.draft; prisma.bookingDraft.deleteMany = originals.del; prisma.booking.count = originals.count;
+    prisma.payment.findFirst = originals.pay; prisma.payment.updateMany = originals.payMany;
+  });
+  let draft: any = { id: 'old-request', step: 'payment_pending', service: 'THE BLOOM', bookingId: null, updatedAt: new Date(Date.now() - 2 * 24 * 3_600_000) };
+  const paymentUpdates: any[] = [];
+  const escalations: string[] = [];
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.deleteMany as any) = async () => { draft = null; return { count: 1 }; };
+  (prisma.booking.count as any) = async () => 0;
+  (prisma.payment.findFirst as any) = async () => null;
+  (prisma.payment.updateMany as any) = async (args: any) => { paymentUpdates.push(args); return { count: 1 }; };
+  const instance = withQuietAgent({ escalate: async (_c: string, _t: string, text: string) => { escalations.push(text); } });
+  const result = await instance.proposeCancellation('customer-1', 'Lets cancel that...i dont want it no more i am disappointed on the syste,', []);
+  assert.match(result.reply, /^Done, I've cancelled that booking request\. Nothing was booked and no payment was taken\. I'm sorry/);
+  assert.equal(draft, null);
+  assert.equal(paymentUpdates[0].data.status, 'cancelled');
+  assert.equal(escalations.length, 1);
 });
 
 test('reschedule proposals cannot overwrite collected slots or another pending flow', async (context) => {

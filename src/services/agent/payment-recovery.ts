@@ -160,7 +160,9 @@ function situationReply(s: PaymentSituation, customerId: string): string {
     case 'prompt_stale': return `The M-Pesa prompt${s.payment ? ` for Ksh ${s.payment.amount.toLocaleString()}` : ''} may have timed out without being completed, and I can't see a payment yet.${holdLine(s.holdEndsAt)} ${resendOffer(s.attempts)}`;
     case 'cancelled': return `That M-Pesa prompt was cancelled, so no payment was taken.${holdLine(s.holdEndsAt)} ${resendOffer(s.attempts)}`;
     case 'failed': return `The last M-Pesa prompt did not go through, so no payment was taken.${holdLine(s.holdEndsAt)} ${resendOffer(s.attempts)}`;
-    case 'hold_expired': return s.attempts >= MAX_PAYMENT_ATTEMPTS ? exhaustedText() : "Your 15-minute hold on this slot has ended and I can't see a payment. Reply yes and I'll check the slot is still free.";
+    case 'hold_expired': return s.attempts >= MAX_PAYMENT_ATTEMPTS ? exhaustedText()
+      : s.lapsed && s.draft?.service ? `Your earlier request for ${editionInText(s.draft.service)} on ${slotText(s.draft)} was not paid, so nothing is booked yet. Reply yes and I'll check the slot is still free, or tell me what you'd like instead.`
+      : "Your 15-minute hold on this slot has ended and I can't see a payment. Reply yes and I'll check the slot is still free.";
     case 'unrecorded': return PAYMENT_PROMPT_UNRECORDED_REPLY;
     default: return paidReply(s);
   }

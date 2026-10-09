@@ -26,7 +26,7 @@ import {
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN, normalizeQuotes } from './regex';
-import { rememberBookingSlots as storeEarlySlots, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
+import { rememberBookingSlots as storeEarlySlots, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, paymentLapsed, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
 import { addonDetail, addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
@@ -499,6 +499,10 @@ export class AgentService {
 
   private async getGreetingReply(customerId: string): Promise<string | null> {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (draft?.step === 'payment_pending') {
+      const status = await this.getPaymentRecoveryReply(customerId, 'hello', 'status_check');
+      if (status) return `Welcome back. ${status}`;
+    }
     // A profile name alone is not booking progress.
     if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) return null;
     try {
@@ -2619,12 +2623,35 @@ ${contextString}`;
       && this.hasCancellationBookingSelector(userMessage));
   }
 
+  /** "Cancel that" while only an unpaid new-booking request is open: withdraw it, since nothing was booked or charged. */
+  private async withdrawUnpaidBookingRequest(customerId: string, draft: any, userMessage: string): Promise<string | null> {
+    if (!draft || draft.bookingId || !['collecting_slots', 'awaiting_confirmation', 'payment_pending'].includes(draft.step)) return null;
+    if (draft.step === 'payment_pending' && !paymentLapsed(draft)) {
+      return 'No payment has been taken. If you would rather not continue, just do not enter your M-Pesa PIN; the prompt expires on its own and nothing is charged. The studio team can also help on 0720 111928.';
+    }
+    // With a confirmed session as well, "cancel" may mean that session, so the existing two-step flow decides.
+    if (await prisma.booking.count({ where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } } })) return null;
+    if (await prisma.payment.findFirst({ where: { bookingDraftId: draft.id, status: 'success' }, select: { id: true } })) return null;
+    await prisma.payment.updateMany({ where: { bookingDraftId: draft.id, status: { not: 'success' } }, data: { status: 'cancelled' } });
+    const removed = await prisma.bookingDraft.deleteMany({ where: { id: draft.id, step: draft.step } });
+    if (!removed.count) return null;
+    const unhappy = /\b(?:disappoint\w*|frustrat\w*|upset|angry|annoy\w*|terrible|useless|not happy|unhappy)\b/i.test(userMessage);
+    if (unhappy) {
+      await this.escalate(customerId, 'booking', `Customer withdrew an unpaid booking request and is unhappy: "${userMessage.slice(0, 300)}". Nothing was booked or charged. Please follow up personally.`);
+    }
+    return `Done, I've cancelled that booking request. Nothing was booked and no payment was taken.${unhappy
+      ? " I'm sorry it has been frustrating. A member of our team will reach out to you."
+      : ' If you change your mind, just message us here.'}`;
+  }
+
   private async proposeCancellation(
     customerId: string,
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
   ): Promise<{ reply: string; proposed: boolean }> {
     const existingDraft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    const withdrawn = await this.withdrawUnpaidBookingRequest(customerId, existingDraft, userMessage);
+    if (withdrawn) return { reply: withdrawn, proposed: false };
     if (existingDraft?.step === RESCHEDULE_COLLECTING_STEP) {
       await prisma.bookingDraft.deleteMany({ where: { id: existingDraft.id, step: RESCHEDULE_COLLECTING_STEP } });
     } else if (existingDraft?.step && existingDraft.step !== 'cancel_confirm') {
