@@ -28,7 +28,17 @@ const geminiBackup2 = process.env.GEMINI_BACKUP2 ? new OpenAI({
 }) : null;
 export type ChatProvider = 'groq' | 'groq2' | 'gemini' | 'gemini2';
 const providerCooldownUntil = new WeakMap<Pick<OpenAI, 'chat'>, number>();
-const providerOrder: ChatProvider[] = ['groq', 'groq2', 'gemini', 'gemini2'];
+
+/** AI_PRIMARY_PROVIDER=gemini puts Gemini first and keeps Groq as the fallback; the default is Groq first. */
+export function primaryProvider(env: NodeJS.ProcessEnv = process.env): ChatProvider {
+  // Tests pin the order explicitly so a local .env cannot change their expectations.
+  if (env.NODE_TEST_CONTEXT) return 'groq';
+  return String(env.AI_PRIMARY_PROVIDER || '').trim().toLowerCase() === 'gemini' ? 'gemini' : 'groq';
+}
+
+function providerOrderFor(primary: ChatProvider): ChatProvider[] {
+  return primary === 'gemini' ? ['gemini', 'gemini2', 'groq', 'groq2'] : ['groq', 'groq2', 'gemini', 'gemini2'];
+}
 
 export function getGroqCooldownUntil(client: Pick<OpenAI, 'chat'> = openai): string | null {
   const until = providerCooldownUntil.get(client) || 0;
@@ -87,16 +97,20 @@ function isAuthenticationError(error: any): boolean {
 
 export async function createChatCompletion(
   params: any,
-  preferredProvider: ChatProvider = 'groq',
+  preferredProvider?: ChatProvider,
   clients: {
     groq: Pick<OpenAI, 'chat'>;
     groq2?: Pick<OpenAI, 'chat'> | null;
     gemini?: Pick<OpenAI, 'chat'> | null;
     gemini2?: Pick<OpenAI, 'chat'> | null;
-  } = { groq: openai, groq2, gemini, gemini2: geminiBackup2 }
+  } = { groq: openai, groq2, gemini, gemini2: geminiBackup2 },
+  primary: ChatProvider = primaryProvider()
 ): Promise<{ response: any; provider: ChatProvider; completionCalls: number }> {
-  const preferredIndex = providerOrder.indexOf(preferredProvider);
-  const providers = providerOrder.slice(Math.max(0, preferredIndex));
+  const order = providerOrderFor(primary);
+  const start = preferredProvider ?? primary;
+  const startIndex = Math.max(0, order.indexOf(start));
+  // Follow-up rounds start where the previous round succeeded, then wrap around to the rest.
+  const providers = [...order.slice(startIndex), ...order.slice(0, startIndex)];
   const models: Record<ChatProvider, string> = {
     groq: params.model,
     groq2: GROQ_2_CHAT_MODEL,
@@ -115,11 +129,11 @@ export async function createChatCompletion(
     try {
       completionCalls++;
       const response = await client.chat.completions.create({ ...params, model });
-      await recordModelUsage(provider, model, response, undefined, provider !== 'groq');
+      await recordModelUsage(provider, model, response, undefined, provider !== primary);
       return { response, provider, completionCalls };
     } catch (error: any) {
       lastError = error;
-      await recordModelUsage(provider, model, undefined, error, provider !== 'groq');
+      await recordModelUsage(provider, model, undefined, error, provider !== primary);
       const shouldFailOver = isFailoverError(error) || isAuthenticationError(error);
       if (shouldFailOver) noteProviderCooldown(error, client);
       if (!shouldFailOver) throw error;
@@ -132,6 +146,6 @@ export async function createChatCompletion(
   }
 
   if (lastError) throw lastError;
-  if (preferredProvider === 'gemini' && !clients.gemini) throw new Error('Gemini fallback is not configured');
+  if (start === 'gemini' && !clients.gemini) throw new Error('Gemini fallback is not configured');
   throw new Error('No configured chat provider is available');
 }

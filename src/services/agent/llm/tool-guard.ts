@@ -1,5 +1,5 @@
 import type OpenAI from 'openai';
-import { createChatCompletion, type ChatProvider } from './provider';
+import { createChatCompletion, primaryProvider, type ChatProvider } from './provider';
 import { isProviderRateLimitError } from '../resilience.service';
 
 export function normalizeToolName(rawName: string): string {
@@ -29,9 +29,9 @@ export async function createCompletionWithToolNameGuard(
   params: any,
   allowedToolNames: string[],
   fallbackTools?: OpenAI.Chat.Completions.ChatCompletionTool[],
-  preferredProvider: ChatProvider = 'groq'
+  preferredProvider?: ChatProvider
 ): Promise<{ response: any; completionCalls: number; provider: ChatProvider }> {
-  let provider = preferredProvider;
+  let provider: ChatProvider = preferredProvider ?? primaryProvider();
   let completionCalls = 0;
   const request = async (requestParams: any) => {
     const result = await createChatCompletion(requestParams, provider);

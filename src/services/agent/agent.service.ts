@@ -282,7 +282,7 @@ export class AgentService {
     params: any,
     allowedToolNames: string[],
     fallbackTools?: OpenAI.Chat.Completions.ChatCompletionTool[],
-    preferredProvider: ChatProvider = 'groq'
+    preferredProvider?: ChatProvider
   ): Promise<{ response: any; completionCalls: number; provider: ChatProvider }> {
     return guardToolCompletion(params, allowedToolNames, fallbackTools, preferredProvider);
   }
