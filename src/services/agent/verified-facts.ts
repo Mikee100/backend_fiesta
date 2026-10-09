@@ -6,6 +6,10 @@ export interface VerifiedFactResult {
   category: string;
 }
 
+export const POWER_SUIT_DESCRIPTION = 'A bold, sophisticated maternity look designed for the mother who wants to make a statement. The Power Suit combines tailored elegance with maternity glamour \u2014 think structured blazer, stylish trousers or coordinated pieces, statement accessories, and confident poses. It creates a strong, modern, editorial feel while celebrating the beauty of pregnancy. The vibe: Powerful \u2022 Elegant \u2022 Modern \u2022 Confident \u2022 Editorial. Perfect for mums who want something different from the traditional flowing maternity gown.';
+
+const POWER_SUIT_REPLY = `The Fiesta House Power Suit: ${POWER_SUIT_DESCRIPTION}\nIt is available as an add-on for Ksh 10,000, and is included with The Empress and The Goddess editions.`;
+
 /**
  * Verified Facts Table
  * Provides deterministic, approved answers for common questions about:
@@ -76,10 +80,11 @@ export function resolveVerifiedFact(
     return 'Our studio wardrobe is primarily tailored for the expecting mother. Your partner and children are very welcome to join the session, and the studio team will confirm styling recommendations for them.';
   }
 
-  // 8. Power Suit: "what is the power suit", "how much is the power suit"
-  const powerSuitQuery = /\b(?:what\s+is\s+(?:the\s+)?power\s+suit|tell\s+me\s+about\s+(?:the\s+)?power\s+suit|power\s+suit\s+details|how\s+much\s+is\s+(?:the\s+)?power\s+suit)\b/i;
-  if (powerSuitQuery.test(text)) {
-    return 'The Fiesta House Power Suit is an iconic, tailored maternity statement suit. It is available as an add-on for Ksh 10,000, and is included with The Empress and The Goddess editions.';
+  // 8. Power Suit: "what is the power suit", "what does the power suit look like", "how much is the power suit"
+  if (/\bpower\s*suit\b/i.test(text)
+    && /\b(?:what|tell\s+me|about|describe|explain|details?|looks?\s+like|vibe|style|feel|how\s+much|price|cost)\b/i.test(text)
+    && !/\b(?:add|added|save|saved|want|book)\b/i.test(text)) {
+    return POWER_SUIT_REPLY;
   }
 
   // 9. Preparation: wording from the studio FAQ rows "What should I bring to the session?" and "What do I need to bring?"

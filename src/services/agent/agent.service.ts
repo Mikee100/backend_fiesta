@@ -27,7 +27,7 @@ import {
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN, normalizeQuotes } from './regex';
 import { rememberBookingSlots as storeEarlySlots, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
-import { addonQuantity, selectedAddons } from './addon-capture';
+import { addonDetail, addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
@@ -92,6 +92,7 @@ import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, bookingDateFacts, formatCustomerDate, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
 import { ConversationFlowMatcher, isDeferral, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
+import { POWER_SUIT_DESCRIPTION } from './verified-facts';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
@@ -801,7 +802,8 @@ export class AgentService {
     const quoted = ADDON_CATALOG.filter((item) => item.unitPrice === 0)
       .map((item) => item.name)
       .join(', ');
-    return `${priced}. Quoted by package tier (no fixed price): ${quoted}.`;
+    const details = ADDON_CATALOG.map((item) => `[${item.group}] ${item.name}: ${addonDetail(item)}`).join(' | ');
+    return `${priced}. Quoted by package tier (no fixed price): ${quoted}. ADD-ON DETAILS: ${details} ADD-ON RULES: separate INCLUDED edition items from paid add-ons and never charge an add-on the customer's edition already includes; never invent a price for quoted items, the team confirms them; never invent availability, inclusions, equipment or production techniques; for one add-on answer only that add-on; for "what add-ons do you have" give a short list grouped by Image & delivery, Styling & wardrobe and Creative production.`;
   }
 
   private shouldUsePreviousAddonReply(
@@ -1546,7 +1548,7 @@ B5. SESSION NOTES - USE JUDGEMENT ON WHAT'S WORTH SAVING: use 'add_session_note'
 [C] BUSINESS KNOWLEDGE (answer from this, then tool results, then escalate)
 C1. INFORMATION PRIORITY ORDER: answer customer questions using, in this order: (1) the Business Context provided above, (2) the customer's own Upcoming/Past Booking or payment context provided above, (3) results actually returned by a tool call this turn. If none of these answer the question, follow C2. Never invent facts, prices, or policies that aren't present in one of these three sources.
 C2. If none of the above answers their question, do not guess. Say: "${UNKNOWN_ANSWER_REPLY}"
-C3. RATE CARD 2026 & ACTIVE OFFERINGS: ${packagePricing} Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked about current offerings, describe THE EDITIONS; additions include extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture Set, and Reels; Bespoke Experiences; or Concierge Services for Travelling Mothers. Never present legacy names as current packages or use "standard" generically for the lineup.
+C3. RATE CARD 2026 & ACTIVE OFFERINGS: ${packagePricing} Legacy names like Standard, Economy, Executive, Gold, Platinum, VIP, VVIP are retired/deprecated. If asked about current offerings, describe THE EDITIONS; additions include extra photos, extra makeup, Power Suit, wig hire, Suspending Concept, Sculpture Set, and Reels; Bespoke Experiences; or Concierge Services for Travelling Mothers. Never present legacy names as current packages or use "standard" generically for the lineup. POWER SUIT (use this description when asked what it is or looks like): ${POWER_SUIT_DESCRIPTION}
 C3b. ADD-ON PRICES: These are the only exact prices to quote: ${addonPricing} When asked what add-ons are available, list their prices accurately; never invent a price or say a fixed-price item "varies". Add-ons are settled with the balance, not the deposit.
 C4. POST-APPOINTMENT: Never offer to reschedule or cancel an appointment whose date/time has already passed. Acknowledge that it has passed, ask whether the session took place or was missed, and offer to make a new booking if appropriate.
 C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio phone and no one answered, or they cannot reach anyone by phone, respond with warmth and genuine empathy - the team is very likely mid-shoot and cannot answer. Acknowledge the inconvenience, reassure them the team is available right now via WhatsApp, and offer to answer any questions or complete a booking on the spot. Say something like: "I'm sorry about that - the team is most likely in the middle of a session and can't step away to answer. You're through to me right now and I can answer any questions or lock in a date for you straight away. What would you like to do?"

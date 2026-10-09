@@ -7,7 +7,7 @@ import { knowledgeRetrieval } from '../knowledge/retrieval.service';
 import { AgentService } from './agent.service';
 import { ADDON_DECISION_QUESTION, nextStep, sampleSlots, STEP_QUESTIONS, type BookingSlots, type BookingStep } from './booking-progress';
 import { ADDON_LINK_REPLY, ADDON_MAKEUP_CLARIFICATION, EDITION_LINK_REPLY, OFFICIAL_WEBSITE_URLS } from './constants';
-import { isAddonListRequest, selectedAddons } from './addon-capture';
+import { addonInquiryReply, isAddonListRequest, selectedAddons } from './addon-capture';
 import { verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { normalizeQuotes } from './regex';
 import { buildAdditionsReply } from './replies';
@@ -345,4 +345,20 @@ test('stated names are sanitised and title-cased only when typed in one case', (
   assert.equal(extractStatedSlots('My name is McDonald').name, 'McDonald');
   assert.equal(tidyName(`  jane\n\nwanjiku${' x'.repeat(60)}`).length <= 60, true);
   assert.equal(tidyName('jane\nwanjiku'), 'Jane Wanjiku');
+});
+
+test('single add-on questions explain the item, inclusion, quote and advance-booking rules', () => {
+  assert.match(addonInquiryReply('How much is styled wig hire?') || '', /^Styled wig hire: Ksh 4,000 each\. .*booked in advance\.\nWould you like/);
+  assert.match(addonInquiryReply('Do you do a professional reel?') || '', /quoted by package tier\. .*included with The Goddess.*team will confirm it\. It needs to be booked in advance\./);
+  assert.match(addonInquiryReply('How much is the goddess sculpture set?') || '', /Ksh 15,000\. .*not charged again.*production requirements and availability/);
+  assert.match(addonInquiryReply('What is a digital art edit?') || '', /Ksh 3,000 each\. A more creative/);
+  assert.doesNotMatch(addonInquiryReply('How much is wig styling?') || '', /4,000/);
+});
+
+test('an add-on the edition already includes is not charged', async (context) => {
+  const { state, agent, say } = harness(context, { service: 'THE GODDESS', date: '2026-10-09', time: '14:00', name: 'Maryanne' });
+  agent.executeAddNoteTool = (AgentService.prototype as any).executeAddNoteTool;
+  const reply = await say('I want the power suit');
+  assert.equal(reply, 'Fiesta House Power Suit is already included with the Goddess edition, so there is no extra charge.');
+  assert.deepEqual(state.notes, []);
 });

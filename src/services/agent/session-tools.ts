@@ -3,7 +3,7 @@ import prisma from '../../config/prisma';
 import { ADDON_CATALOG } from '../../config/constants';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { notifyAdmin } from '../notifications/notification.service';
-import { addonQuantity, addonRecipient, isAdditionalAddonRequest, isAddonInquiry, isExplicitSelfMakeupAnswer, selectedAddons } from './addon-capture';
+import { addonIncludedInEdition, addonQuantity, addonRecipient, isAdditionalAddonRequest, isAddonInquiry, isExplicitSelfMakeupAnswer, selectedAddons } from './addon-capture';
 
 export function extractSessionNoteMetadata(note: string, type?: string, category?: string, priority?: string): {
   normalizedType: string;
@@ -122,7 +122,7 @@ export async function executeAddNoteTool(
   sourceMessage?: string,
   platform?: string,
   approvedAddonSkus?: readonly string[]
-): Promise<{ created: boolean; reason?: string; type?: string }> {
+): Promise<{ created: boolean; reason?: string; type?: string; edition?: string }> {
   const rawNote = (note || '').trim();
   if (!rawNote) {
     return { created: false, reason: 'empty_note' };
@@ -207,6 +207,10 @@ export async function executeAddNoteTool(
     where: { customerId, ...(addonDraft?.bookingId ? { id: addonDraft.bookingId } : {}), status: { not: 'cancelled' }, dateTime: { gte: new Date() } },
     orderBy: { dateTime: 'asc' }
   });
+  const edition: string | null = (pendingNewSession ? addonDraft?.service : booking?.service) || null;
+  if (noteAddons.some((item) => addonIncludedInEdition(item, edition))) {
+    return { created: false, reason: 'addon_included_in_edition', type: normalizedType, edition: edition! };
+  }
 
   const createdNote = await prisma.customerSessionNote.create({
     data: {
