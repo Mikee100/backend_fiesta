@@ -16,8 +16,8 @@ import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from '
 import { isCustomerNameQuestion, needsUnchangedReassurance, editionInText } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
 import { DEFERRAL_REPLY, buildBookingPolicyReply, buildHairWigClarificationReply, buildOpeningHoursReply, buildPersonalOutfitReply, buildWalkInReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
-import { extractStatedSlots, EARLY_SLOT_STEP } from './slot-memory';
-import { CARRY_OVER_PREFIX, STEP_QUESTIONS } from './booking-progress';
+import { alternativeDates, extractStatedSlots, EARLY_SLOT_STEP } from './slot-memory';
+import { CARRY_OVER_PREFIX, STEP_QUESTIONS, alternativeDatesReply } from './booking-progress';
 
 const CARRY_OVER_CONTINUE = /^(?:yes+|yeah|yep|sure|ok(?:ay)?|continue|same|that one|yes,? (?:please|continue|let'?s continue)|let'?s continue|please continue|continue with (?:that|it))[.! ]*$/i;
 const CARRY_OVER_CHANGE = /^(?:no|nope|no,? (?:a |something )?different(?: one)?|(?:a |something )?different(?: one)?|another one|change it|choose (?:a )?different(?: one)?)[.! ]*$/i;
@@ -113,6 +113,13 @@ export function createMessageRoutes(
       beforeSlotCapture: true,
       when: () => isOpeningHoursQuestion(userMessage),
       handle: () => buildOpeningHoursReply(),
+    },
+    {
+      name: 'dateAlternatives',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => (platform === 'whatsapp' || platform === 'web') && alternativeDates(userMessage, history).length > 1,
+      handle: () => alternativeDatesReply.call(this, customerId, userMessage, history),
     },
     {
       name: 'rescheduleEntry',

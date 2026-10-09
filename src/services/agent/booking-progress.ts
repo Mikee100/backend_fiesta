@@ -2,7 +2,7 @@ import prisma from '../../config/prisma';
 import { ADDON_CATALOG, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
 import { bookingService } from '../booking/booking.service';
 import { bookingDateFacts, formatCustomerDate } from '../../utils/time';
-import { EARLY_SLOT_STEP, closedDateReply, earlySlotsExpired, extractStatedSlots, isUsableName } from './slot-memory';
+import { EARLY_SLOT_STEP, alternativeDates, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, isUsableName } from './slot-memory';
 import { buildBookingProposalConfirmation, formatCustomerTime } from './replies';
 import { editionInText } from './reply-voice';
 
@@ -117,6 +117,31 @@ export function carryOverQuestion(draft: { service?: string | null; date?: strin
 export async function bookingProgressReply(this: any, customerId: string, message: string, history: Message[], decisionJustSaved = false, force = false): Promise<string | null> {
   const reply = await progressReply.call(this, customerId, message, history, decisionJustSaved, force);
   return reply ? `${welcomePrefix(message, history)}${reply}` : reply;
+}
+
+/** The customer offered several dates and asked us to choose: take the first one that is open, in her order. */
+export async function alternativeDatesReply(this: any, customerId: string, message: string, history: Message[]): Promise<string | null> {
+  const dates = alternativeDates(message, history);
+  if (dates.length < 2) return null;
+  const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+  if (!draft || draft.step !== EARLY_SLOT_STEP || earlySlotsExpired(draft) || carriedOverStale(draft) || draft.isForSomeoneElse || !draft.service) return null;
+  const key = Object.keys(SERVICE_DURATIONS).find((value) => draft.service!.toLowerCase().includes(value));
+  if (!key) return null;
+  const time = extractStatedSlots(message, history).time || draft.time;
+  for (const date of dates) {
+    const facts = bookingDateFacts(date);
+    if (facts.isMonday || facts.isPast) continue;
+    const slots = await bookingService.getAvailableSlots(date, SERVICE_DURATIONS[key], undefined, draft.id);
+    const open: string[] = Array.isArray(slots) ? slots : [];
+    if (!open.length || (time && !open.includes(time))) continue;
+    await prisma.bookingDraft.updateMany({ where: { id: draft.id, step: EARLY_SLOT_STEP }, data: { date, ...(time ? { time } : {}), dateTimeIso: null } });
+    const lead = date === dates[0] ? `I'll go with ${formatCustomerDate(date)}.`
+      : `${formatCustomerDate(dates[0])} is not available${time ? ` at ${formatCustomerTime(time)}` : ''}, so I'll go with ${formatCustomerDate(date)}.`;
+    const next = await bookingProgressReply.call(this, customerId, `on ${date}`, history, false, true);
+    return next ? `${lead} ${next}` : lead;
+  }
+  const days = dates.map(formatCustomerDate);
+  return `${days.slice(0, -1).join(', ')} and ${days.at(-1)} are not available${time ? ` at ${formatCustomerTime(time)}` : ''}. Which other date would work for you?`;
 }
 
 async function progressReply(this: any, customerId: string, message: string, history: Message[], decisionJustSaved: boolean, force: boolean): Promise<string | null> {

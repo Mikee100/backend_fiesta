@@ -11,7 +11,7 @@ import { addonInquiryReply, isAddonListRequest, selectedAddons } from './addon-c
 import { verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { normalizeQuotes } from './regex';
 import { buildAdditionsReply } from './replies';
-import { carriedOverStale, extractStatedSlots, knownSlotsLine, tidyName } from './slot-memory';
+import { alternativeDates, carriedOverStale, extractStatedSlots, knownSlotsLine, tidyName } from './slot-memory';
 
 const CUSTOMER = 'synthetic-maryanne';
 const NOW = new Date('2026-10-05T20:44:00Z').getTime();
@@ -361,4 +361,27 @@ test('an add-on the edition already includes is not charged', async (context) =>
   const reply = await say('I want the power suit');
   assert.equal(reply, 'Fiesta House Power Suit is already included with the Goddess edition, so there is no extra charge.');
   assert.deepEqual(state.notes, []);
+});
+
+test('alternative dates are read in order, and only a real choice counts', () => {
+  const history: Msg[] = [{ role: 'user', content: 'lets do it on 2026-10-14' }, { role: 'assistant', content: '2:00 PM on Wednesday, 14 October is available.' }];
+  assert.deepEqual(alternativeDates('lets do it on 2026-10-14\nor 2026-10-15 either is okay...choose one'), ['2026-10-14', '2026-10-15']);
+  assert.deepEqual(alternativeDates('or 2026-10-15 either is okay...choose one', history), ['2026-10-14', '2026-10-15']);
+  assert.deepEqual(alternativeDates('2026-10-14 or 2026-10-15'), ['2026-10-14', '2026-10-15']);
+  assert.deepEqual(alternativeDates('actually 2026-10-15', history), []);
+  assert.deepEqual(alternativeDates('the Bloom or Muse on 2026-10-14'), []);
+});
+
+test('"14th, or 15th either is okay...choose one" gets one choice and keeps the first open date', async (context) => {
+  const friday = new Date('2026-10-09T13:30:00Z').getTime();
+  for (const turns of [['lets do it on 14th\nor 15th either is okay...choose one'], ['lets do it on 14th', 'or 15th either is okay...choose one']]) {
+    const { state, say } = harness(context, { service: 'THE BLOOM', time: '14:00', name: 'Wanjiru', createdAt: new Date(friday - 20 * 60_000) }, 'Wanjiru', friday);
+    let reply = '';
+    for (const turn of turns) reply = await say(turn);
+    assert.match(reply, turns.length === 1 ? /^I'll go with Wednesday, 14 October\. 2:00 PM on Wednesday, 14 October is available for the Bloom edition\./ : /^I'll go with Wednesday, 14 October\./, turns.join(' | '));
+    assert.doesNotMatch(reply, /15 October/);
+    assert.equal(state.draft.date, '2026-10-14', 'the later alternative does not overwrite the chosen date');
+    assert.equal(state.modelCalls, 0);
+    context.mock.timers.reset();
+  }
 });

@@ -54,6 +54,23 @@ export function earlySlotsExpired(draft: Draft, now = Date.now()): boolean {
     && (!draft.createdAt || now - draft.createdAt.getTime() >= SLOT_MEMORY_WINDOW_MS);
 }
 
+/** "14th or 15th", "or 15th, either is okay": dates offered as a choice, in the order given. */
+export function alternativeDates(message: string, history: Message[] = []): string[] {
+  if (!/\bor\b|\beither\b|\bchoose\s+(?:one|any)\b|\bwhichever\b|\bany\s+of\s+(?:them|those|the\s+two)\b/i.test(message)) return [];
+  const resolve = (text: string) => { try { return resolveCalendarDate(text); } catch { return null; } };
+  const dates: string[] = [];
+  for (const part of message.split(/\bor\b|[,;\n]|\.{2,}/i)) {
+    const date = resolve(part);
+    if (date && !dates.includes(date)) dates.push(date);
+  }
+  if (dates.length === 1 && /^\s*or\b|\beither\b|\bchoose\s+(?:one|any)\b|\bwhichever\b/i.test(message)) {
+    const previous = [...history].reverse().find((entry) => entry.role === 'user');
+    const prior = previous ? resolve(previous.content) : null;
+    if (prior && prior !== dates[0]) dates.unshift(prior);
+  }
+  return dates.length > 1 ? dates : [];
+}
+
 export function extractStatedSlots(message: string, history: Message[] = []): Slots {
   history = stripAssistantEmojis(history);
   const slots: Slots = {};
