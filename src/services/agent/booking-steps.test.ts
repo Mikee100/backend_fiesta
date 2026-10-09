@@ -286,6 +286,16 @@ test('Koros run: stated time survives a date change, info turns are deterministi
   assert.equal(state.modelCalls, 0);
 });
 
+test('"tell me about the business" describes the studio; "is this Fiesta?" keeps the short welcome', async (context) => {
+  const { state, agent, say } = harness(context, null);
+  agent.naturalAssistantMode = true;
+  const about = await say('so tell me about the business and what you people do');
+  assert.match(about, /^Fiesta House Maternity is a luxury maternity photography studio in Parklands, Nairobi\./);
+  assert.match(about, /seven editions[\s\S]*session-packages|seven editions[\s\S]*https:\/\//);
+  assert.equal(await say('Is this fiesta maternity house'), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
+  assert.equal(state.modelCalls, 0);
+});
+
 test('verifier rejects slot-hold offers and drop-by invitations but not the payment hold wording', () => {
   const facts = { amounts: [], deposits: [], editions: [] };
   for (const reply of [

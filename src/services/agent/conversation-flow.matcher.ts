@@ -53,6 +53,10 @@ export function isDeferral(message: string): boolean {
     || /\b(?:get\s+back\s+to\s+you|let\s+you\s+know|call\s+(?:you\s+)?later|talk\s+later)\b/.test(text);
 }
 
+export function isBusinessIdentityQuestion(message: string): boolean {
+  return /\b(?:is\s+this|am\s+i\s+(?:talking|chatting|speaking)\s+(?:to|with)|are\s+you)\s+(?:the\s+)?fiesta\b/i.test(message);
+}
+
 export function isBookingPolicyQuestion(message: string): boolean {
   return /\b(?:reschedul\w*|cancell?\w*|refund\w*)\b/i.test(message)
     && /\b(?:polic(?:y|ies)|rules?|terms|conditions|notice|what happens if|how (?:far|long) (?:in advance|before))\b/i.test(message);
