@@ -45,6 +45,7 @@ import {
   buildBespokeReply,
   buildBookingForSomeoneElseReply,
   buildBusinessIntroductionReply,
+  buildAboutBusinessReply,
   buildContactDetailsReply,
   buildMultiPersonBookingReply,
   buildMixedIntentClarificationReply,
@@ -91,7 +92,7 @@ import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROV
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, bookingDateFacts, formatCustomerDate, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
-import { ConversationFlowMatcher, isDeferral, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
+import { ConversationFlowMatcher, isBusinessIdentityQuestion, isDeferral, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
@@ -493,8 +494,8 @@ export class AgentService {
     return `${date.format('MMMM D, YYYY')} is a ${date.format('dddd')}.`;
   }
 
-  private getBusinessIntroductionReply(): string {
-    return buildBusinessIntroductionReply();
+  private getBusinessIntroductionReply(userMessage = ''): string {
+    return isBusinessIdentityQuestion(userMessage) ? buildBusinessIntroductionReply() : buildAboutBusinessReply();
   }
 
   private async getGreetingReply(customerId: string): Promise<string | null> {

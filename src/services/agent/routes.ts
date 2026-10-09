@@ -343,7 +343,7 @@ export function createMessageRoutes(
       name: 'businessIntroduction',
       replyMode: 'deterministic',
       when: () => getInformationalFlow() === 'business_introduction',
-      handle: () => this.getBusinessIntroductionReply(),
+      handle: () => this.getBusinessIntroductionReply(userMessage),
     },
     {
       name: 'weekday',

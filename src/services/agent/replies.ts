@@ -173,6 +173,16 @@ export function buildBusinessIntroductionReply(): string {
   return 'Welcome to Fiesta House Maternity. What kind of session are you planning?';
 }
 
+export function buildAboutBusinessReply(): string {
+  return [
+    'Fiesta House Maternity is a luxury maternity photography studio in Parklands, Nairobi.',
+    'We photograph expecting mothers in our studio, and every edition includes professional makeup and styled outfits from our wardrobe.',
+    'You can choose from seven editions, add optional extras, or ask us for a bespoke experience. We also help mothers travelling from outside Nairobi.',
+    `You can see the editions here: ${OFFICIAL_WEBSITE_URLS.packages}`,
+    'What kind of session are you planning?',
+  ].join('\n');
+}
+
 export function isPostShootProcessRequest(userMessage: string): boolean {
   const text = userMessage.toLowerCase();
   return /(after\s+(?:(?:the|my|your)\s+)?(?:shoot|session)|post\s*(?:shoot|session)\s*process)/.test(text);
