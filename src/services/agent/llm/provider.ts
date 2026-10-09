@@ -75,7 +75,8 @@ async function recordModelUsage(
 
 function isFailoverError(error: any): boolean {
   const status = error?.status ?? error?.response?.status;
-  return status === 404 || status === 408 || status === 429 || status >= 500
+  // 413: the request exceeds this account's per-minute token cap; another provider can still take it.
+  return status === 404 || status === 408 || status === 413 || status === 429 || status >= 500
     || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED'].includes(error?.code);
 }
 
