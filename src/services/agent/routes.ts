@@ -13,7 +13,7 @@ import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY, BUDGET_HAND
 import { resolveVerifiedFact } from './verified-facts';
 import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
-import { isCustomerNameQuestion, needsUnchangedReassurance } from './reply-voice';
+import { isCustomerNameQuestion, needsUnchangedReassurance, editionInText } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
 import { DEFERRAL_REPLY, buildBookingPolicyReply, buildHairWigClarificationReply, buildOpeningHoursReply, buildPersonalOutfitReply, buildWalkInReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
 import { extractStatedSlots, EARLY_SLOT_STEP } from './slot-memory';
@@ -452,6 +452,8 @@ export function createMessageRoutes(
         const saved: string[] = [];
         const existing: string[] = [];
         const failed: string[] = [];
+        const included: string[] = [];
+        let edition = '';
         for (const addon of choices) {
           try {
             const quantity = this.getRequestedAddonQuantity(userMessage, addon);
@@ -461,11 +463,15 @@ export function createMessageRoutes(
               'special_request', 'addon', 'normal', userMessage, platform, choices.map((choice: { sku: string }) => choice.sku));
             if (noteResult.created) saved.push(label);
             else if (noteResult.reason === 'duplicate_pending_note') existing.push(label);
+            else if (noteResult.reason === 'addon_included_in_edition') { included.push(addon.name); edition = noteResult.edition || edition; }
             else failed.push(label);
           } catch {
             failed.push(addon.name);
           }
         }
+        const includedLine = included.length
+          ? `${included.join(' and ')} ${included.length > 1 ? 'are' : 'is'} already included with ${editionInText(edition)}, so there is no extra charge.` : '';
+        if (included.length && !saved.length && !existing.length && !failed.length) return includedLine;
         if (choices.length === 1 && saved.length === 1) {
           const acknowledgement = this.getAddonSelectionReply(choices[0], this.getRequestedAddonQuantity(userMessage, choices[0]), needsUnchangedReassurance(userMessage));
           const next = await this.getBookingProgressReply(customerId, userMessage, history, true);
@@ -474,6 +480,7 @@ export function createMessageRoutes(
         const acknowledgement = [saved.length ? `${ADDON_NOTED_PREFIX} ${saved.join('; ')}.` : '',
           existing.length ? `Already recorded: ${existing.join('; ')}. I have not added these twice.` : '',
           failed.length ? `Not saved: ${failed.join('; ')}. The team can help confirm these.` : '',
+          includedLine,
           `${ADDON_BALANCE_REPLY}${needsUnchangedReassurance(userMessage) ? ` ${ADDON_UNCHANGED_REPLY}` : ''}`].filter(Boolean).join('\n');
         const next = !failed.length && (saved.length || existing.length) ? await this.getBookingProgressReply(customerId, userMessage, history, true) : null;
         return next ? `${acknowledgement}\n${next}` : acknowledgement;

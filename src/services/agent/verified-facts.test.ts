@@ -75,6 +75,11 @@ test('verified-facts table answers Power Suit queries', () => {
   assert.ok(reply);
   assert.match(reply, /Ksh 10,000/);
   assert.match(reply, /The Empress and The Goddess/i);
+  for (const question of ['What does the power suit look like?', 'Tell me about the Power Suit', 'whats the vibe of the power suit']) {
+    assert.match(resolveVerifiedFact(question) || '', /structured blazer[\s\S]*Powerful \u2022 Elegant \u2022 Modern \u2022 Confident \u2022 Editorial/, question);
+  }
+  assert.equal(resolveVerifiedFact('Did you add the power suit?'), null);
+  assert.equal(resolveVerifiedFact('I want the power suit'), null);
 });
 
 test('verified-facts table acknowledges studio team handoff without repeating canned text', () => {

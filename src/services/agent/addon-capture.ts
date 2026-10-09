@@ -108,7 +108,25 @@ export function addonInquiryReply(message: string): string | null {
     return `Extra professional makeup is Ksh ${addons[0].unitPrice.toLocaleString()} per session and includes lashes. Professional makeup is included in all packages; this add-on can be noted for you or someone joining your session. Would you like to add it for yourself or someone else?`;
   }
   const details = addons.map((item) => `${item.name}: ${item.unitPrice > 0 ? `Ksh ${item.unitPrice.toLocaleString()}${item.quantityFromNote ? ' each' : ''}` : ADDON_QUOTED_PRICE_LABEL}.`).join('\n');
-  return `${details}\n${addons.length === 1 ? 'Would you like to add it to your session?' : 'Which of these would you like to add to your session?'}`;
+  if (addons.length === 1) return `${details} ${addonDetail(addons[0])}\nWould you like to add it to your session?`;
+  return `${details}\nWhich of these would you like to add to your session?`;
+}
+
+/** Description plus inclusion, quote and advance-booking notes for one add-on. */
+export function addonDetail(item: AddonCatalogItem): string {
+  const editions = item.includedIn?.map((name) => name.replace(/^THE (\w)(\w*)$/, (_, first: string, rest: string) => `The ${first}${rest.toLowerCase()}`));
+  return [
+    item.description,
+    editions?.length ? `It is already included with ${editions.join(' and ')}, so it is not charged again for ${editions.length > 1 ? 'those editions' : 'that edition'}.` : '',
+    item.unitPrice === 0 ? 'The price depends on your edition, and the team will confirm it.' : '',
+    item.bookInAdvance ? 'It needs to be booked in advance.' : '',
+    item.teamConfirms ? 'The team will confirm the production requirements and availability.' : '',
+  ].filter(Boolean).join(' ');
+}
+
+/** The edition already includes this add-on, so it must not be charged. */
+export function addonIncludedInEdition(item: AddonCatalogItem, edition?: string | null): boolean {
+  return Boolean(edition && item.includedIn?.includes(edition.trim().toUpperCase()));
 }
 
 export function isAdditionalAddonRequest(message: string, sku: string): boolean {

@@ -600,6 +600,26 @@
     "updatedAt": "2026-09-14 14:00:00.000"
   },
   {
+    "id": "power_suit_description",
+    "question": "What is the Power Suit? What does the Fiesta House Power Suit look like? What is the Power Suit vibe?",
+    "answer": "Power Suit: A bold, sophisticated maternity look designed for the mother who wants to make a statement. The Power Suit combines tailored elegance with maternity glamour — think structured blazer, stylish trousers or coordinated pieces, statement accessories, and confident poses. It creates a strong, modern, editorial feel while celebrating the beauty of pregnancy. The vibe: Powerful • Elegant • Modern • Confident • Editorial. Perfect for mums who want something different from the traditional flowing maternity gown. The Fiesta House Power Suit is available as an add-on for KSH 10,000 and is included with THE EMPRESS and THE GODDESS editions.",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-10-09 12:00:00.000",
+    "updatedAt": "2026-10-09 12:00:00.000"
+  },
+  {
+    "id": "addon_details",
+    "question": "What add-ons and extras do you offer? What does each add-on include, cost, and does it need booking in advance?",
+    "answer": "Add-ons are separate from the edition price unless your edition already includes them. They are added to the balance, not the deposit.\nIMAGE & DELIVERY\n- Extra edited photo: KSH 1,000 per photo. An additional individually edited photo beyond the number included in your edition (not a Digital Art Edit).\n- Extra digital art edit: KSH 3,000 per photo. A more creative, artistically produced image beyond standard editing.\n- Raw files: quoted by package tier. The team confirms the price.\nSTYLING & WARDROBE\n- Extra outfit beyond package: KSH 4,000 per outfit. An additional look beyond the outfits included in your edition.\n- Extra professional makeup: KSH 3,500 per session. An additional makeup service beyond the makeup your edition includes.\n- Fiesta House Power Suit: KSH 10,000 where not included. Bold, tailored, editorial maternity look. Included with THE EMPRESS and THE GODDESS.\n- Styled wig hire: KSH 4,000 per wig. Book in advance; a specific wig is confirmed by the team.\n- Wig styling only: KSH 3,000 per wig. Styling of a wig you already own. Book in advance.\nCREATIVE PRODUCTION\n- Suspending Concept: KSH 7,000. A specialised creative maternity concept; the team confirms production requirements and availability.\n- Goddess Sculpture Set: KSH 15,000 where not included. A premium goddess, sculptural styled set. Included with THE GODDESS.\n- Professional Reel: quoted by package tier. Book in advance. Included with THE GODDESS.",
+    "category": "Services",
+    "embedding": "[]",
+    "mediaUrls": "[]",
+    "createdAt": "2026-10-09 12:00:00.000",
+    "updatedAt": "2026-10-09 12:00:00.000"
+  },
+  {
     "id": "bespoke_custom",
     "question": "Do you offer bespoke or custom shoot experiences?",
     "answer": "Bespoke Experiences: For the mother whose vision does not fit inside a package, we design custom experiences by consultation. Reach out to our team to begin the conversation.",
