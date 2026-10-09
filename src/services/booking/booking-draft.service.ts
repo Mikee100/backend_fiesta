@@ -9,21 +9,27 @@ export class BookingDraftService {
     customerName: string;
   }) {
     const dateTime = inBusinessTimezone(input.dateTime);
+    const date = dateTime.format('YYYY-MM-DD');
+    const time = dateTime.format('HH:mm');
+    const existing = await prisma.bookingDraft.findUnique({ where: { customerId: input.customerId }, select: { service: true, date: true, time: true } });
+    // A different edition or slot is a new proposal, so the M-Pesa prompt count starts again.
+    const newProposal = !existing || existing.service !== input.service || existing.date !== date || existing.time !== time;
     return prisma.bookingDraft.upsert({
       where: { customerId: input.customerId },
       update: {
         service: input.service,
-        date: dateTime.format('YYYY-MM-DD'),
-        time: dateTime.format('HH:mm'),
+        date,
+        time,
         dateTimeIso: input.dateTime,
         name: input.customerName,
         step: 'awaiting_confirmation',
+        ...(newProposal ? { version: 1 } : {}),
       },
       create: {
         customerId: input.customerId,
         service: input.service,
-        date: dateTime.format('YYYY-MM-DD'),
-        time: dateTime.format('HH:mm'),
+        date,
+        time,
         dateTimeIso: input.dateTime,
         name: input.customerName,
         step: 'awaiting_confirmation',

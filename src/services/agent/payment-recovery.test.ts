@@ -17,6 +17,8 @@ import {
   MAX_PAYMENT_ATTEMPTS,
   paymentFailureMessage,
 } from './payment-recovery';
+import { rememberBookingSlots } from './slot-memory';
+import { bookingDraftService } from '../booking/booking-draft.service';
 
 const CUSTOMER = '254712345678';
 const MINUTE = 60_000;
@@ -84,6 +86,7 @@ function harness(context: any, overrides: { draft?: Record<string, unknown>; pay
     if (!state.payment) return null;
     if (where?.checkoutRequestId && where.checkoutRequestId !== state.payment.checkoutRequestId) return null;
     if (where?.bookingDraftId && where.bookingDraftId !== state.payment.bookingDraftId) return null;
+    if (typeof where?.status === 'string' && where.status !== state.payment.status) return null;
     if (where?.booking) return state.payment.status === 'success' && state.payment.booking ? { ...state.payment } : null;
     const draft = state.payment.bookingDraftId && state.draft ? { ...state.draft, customer: { id: CUSTOMER, name: 'Joan' } } : null;
     return { ...state.payment, bookingDraft: draft, booking: state.payment.booking ?? null };
@@ -243,6 +246,59 @@ test('three failed prompts stop with a team message and one escalation', async (
   assert.match(state.escalations[0], /3 M-Pesa prompts/);
 });
 
+test('the prompt limit lapses with the unpaid request: two days later a yes re-proposes instead of refusing forever', async (context) => {
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * MINUTE);
+  const { state, say } = harness(context, { draft: { date: '2027-10-08', version: MAX_PAYMENT_ATTEMPTS + 1, updatedAt: twoDaysAgo }, payment: { status: 'failed', updatedAt: twoDaysAgo } });
+  const reply = await say('yes');
+  assert.doesNotMatch(reply, /a few times/);
+  assert.match(reply, /still free.*deposit is Ksh 2,000.*Reply yes/s);
+  assert.equal(state.draft.step, 'awaiting_confirmation');
+  assert.equal(state.draft.version, 1, 'the new attempt starts with a fresh prompt count');
+  assert.equal(state.stkPushes, 0, 'a fresh explicit yes is still needed before any prompt');
+  assert.deepEqual(state.escalations, []);
+});
+
+test('a lapsed unpaid request for a date that has passed is released, not re-proposed', async (context) => {
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * MINUTE);
+  const { state, say } = harness(context, { draft: { date: '2026-10-01', version: MAX_PAYMENT_ATTEMPTS + 1, updatedAt: twoDaysAgo }, payment: { status: 'failed', updatedAt: twoDaysAgo } });
+  const reply = await say('yes');
+  assert.match(reply, /has lapsed, and no payment was taken\. Which date would you like now\?/);
+  assert.deepEqual([state.draft.step, state.draft.date, state.draft.time, state.draft.version], ['collecting_slots', null, null, 1]);
+  assert.equal(state.stkPushes, 0);
+});
+
+test('new booking details replace a lapsed unpaid payment step, but never a paid or recent one', async (context) => {
+  const { state } = harness(context, { draft: { version: MAX_PAYMENT_ATTEMPTS + 1, updatedAt: new Date(Date.now() - 2 * 24 * 60 * MINUTE) }, payment: { status: 'failed' } });
+  const original = { updateMany: prisma.bookingDraft.updateMany, customer: prisma.customer.findUnique };
+  context.after(() => { prisma.bookingDraft.updateMany = original.updateMany; prisma.customer.findUnique = original.customer; });
+  (prisma.bookingDraft.updateMany as any) = async ({ where, data }: any) => {
+    if (where.step && where.step !== state.draft.step) return { count: 0 };
+    Object.assign(state.draft, data, { updatedAt: new Date() }); return { count: 1 };
+  };
+  (prisma.customer.findUnique as any) = async () => ({ id: CUSTOMER, name: 'Joan' });
+  await rememberBookingSlots(CUSTOMER, 'lets do it on 2027-10-14', []);
+  assert.deepEqual([state.draft.step, state.draft.date, state.draft.version], ['collecting_slots', '2027-10-14', 1]);
+
+  for (const blocked of [{ status: 'success', updatedAt: new Date(Date.now() - 2 * 24 * 60 * MINUTE) }, { status: 'failed', updatedAt: new Date(Date.now() - 5 * MINUTE) }]) {
+    Object.assign(state.draft, { step: 'payment_pending', date: '2027-10-08', version: 4, updatedAt: blocked.updatedAt });
+    state.payment.status = blocked.status;
+    await rememberBookingSlots(CUSTOMER, 'lets do it on 2027-10-14', []);
+    assert.deepEqual([state.draft.step, state.draft.date], ['payment_pending', '2027-10-08'], JSON.stringify(blocked));
+  }
+});
+
+test('a proposal for a different edition or slot starts a fresh prompt count; re-proposing the same slot does not', async (context) => {
+  const original = { findUnique: prisma.bookingDraft.findUnique, upsert: prisma.bookingDraft.upsert };
+  context.after(() => { prisma.bookingDraft.findUnique = original.findUnique; prisma.bookingDraft.upsert = original.upsert; });
+  const updates: any[] = [];
+  (prisma.bookingDraft.findUnique as any) = async () => ({ service: 'THE ICON', date: '2027-10-08', time: '15:00' });
+  (prisma.bookingDraft.upsert as any) = async ({ update }: any) => { updates.push(update); return update; };
+  await bookingDraftService.saveBookingProposal({ customerId: CUSTOMER, service: 'THE BLOOM', dateTime: '2027-10-15T11:00:00.000Z', customerName: 'Joan' });
+  await bookingDraftService.saveBookingProposal({ customerId: CUSTOMER, service: 'THE ICON', dateTime: '2027-10-08T12:00:00.000Z', customerName: 'Joan' });
+  assert.equal(updates[0].version, 1);
+  assert.equal('version' in updates[1], false);
+});
+
 test('it has not arrived after 30 seconds answers from state without the model or a new push', async (context) => {
   const { state, say } = harness(context, { payment: { updatedAt: new Date(Date.now() - 30_000) } });
   const reply = await say('It has not arrived');
@@ -268,10 +324,10 @@ test('the reported prompt never came keeps payment pending and does not push or 
 });
 
 test('an expired 16 minute hold rechecks the slot before re-proposing, never pushing directly', async (context) => {
-  const { state, say } = harness(context, { draft: { updatedAt: new Date(Date.now() - 16 * MINUTE) }, payment: { status: 'failed' } });
+  const { state, say } = harness(context, { draft: { date: '2027-10-08', updatedAt: new Date(Date.now() - 16 * MINUTE) }, payment: { status: 'failed' } });
   let rechecked = 0;
   (bookingService.getAvailableSlots as any) = async (date: string, _duration: number, _booking: unknown, excludeDraftId: string) => {
-    rechecked++; assert.equal(date, '2026-10-08'); assert.equal(excludeDraftId, 'draft-joan'); return ['15:00'];
+    rechecked++; assert.equal(date, '2027-10-08'); assert.equal(excludeDraftId, 'draft-joan'); return ['15:00'];
   };
   const reply = await say('yes');
   assert.equal(rechecked, 1);
@@ -282,13 +338,13 @@ test('an expired 16 minute hold rechecks the slot before re-proposing, never pus
 });
 
 test('a slot taken during the expired hold offers alternatives and keeps the package', async (context) => {
-  const { state, say } = harness(context, { draft: { updatedAt: new Date(Date.now() - 16 * MINUTE) }, payment: { status: 'cancelled' } });
+  const { state, say } = harness(context, { draft: { date: '2027-10-08', updatedAt: new Date(Date.now() - 16 * MINUTE) }, payment: { status: 'cancelled' } });
   state.slots = ['10:00', '11:30'];
   const reply = await say('yes');
   assert.equal(state.stkPushes, 0);
   assert.equal(state.draft.step, 'collecting_slots');
   assert.equal(state.draft.service, 'THE ICON');
-  assert.equal(state.draft.date, '2026-10-08');
+  assert.equal(state.draft.date, '2027-10-08');
   assert.equal(state.draft.time, null);
   assert.match(reply, /Icon edition/);
   assert.match(reply, /10:00 AM.*11:30 AM/);
