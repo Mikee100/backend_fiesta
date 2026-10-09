@@ -232,6 +232,17 @@ export class WhatsAppController {
         isFallback: aiReply.includes("we're experiencing high demand") || aiReply.includes("we are experiencing high demand")
       }));
 
+      // She wrote again while this reply was being prepared: the next turn answers all her messages together.
+      // Payment, booking-change and invoice replies are always sent, because their action has already happened.
+      const newerInbound = await retryOnPrismaDisconnect(prisma, () => prisma.message.findFirst({
+        where: { customerId, platform: 'whatsapp', direction: 'inbound', handledBy: { not: 'system' }, createdAt: { gt: pendingInbound[pendingInbound.length - 1].createdAt } },
+        select: { id: true },
+      }));
+      if (newerInbound && !/m-?pesa|prompt|deposit|confirmed|cancel|reschedul|invoice|receipt/i.test(aiReply)) {
+        console.log(`[WHATSAPP_TURN] Reply superseded by a newer message for ${customerId}; answering the batch in the next turn.`);
+        return;
+      }
+
       await prisma.message.create({
         data: { content: aiReply, platform: 'whatsapp', direction: 'outbound', customerId, handledBy: 'ai' }
       });

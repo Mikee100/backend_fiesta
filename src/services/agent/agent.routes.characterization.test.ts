@@ -330,6 +330,7 @@ test('message route order remains unchanged', () => {
     'bookingPolicyInformation',
     'walkIn',
     'openingHours',
+    'dateAlternatives',
     'rescheduleEntry',
     'identityCorrection',
     'recipientName',
