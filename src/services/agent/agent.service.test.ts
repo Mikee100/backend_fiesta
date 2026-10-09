@@ -14,6 +14,7 @@ import { bookingService } from '../booking/booking.service';
 import { googleCalendarService } from '../calendar/calendar.service';
 import { invoiceService } from '../invoice/invoice.service';
 import { AgentService, BookingExtractor, createChatCompletion, getGroqCooldownUntil } from './agent.service';
+import { primaryProvider } from './llm/provider';
 import { ConversationFlowMatcher } from './conversation-flow.matcher';
 import {
   buildBespokeReply,
@@ -214,6 +215,31 @@ test('a request too large for one account (413) falls over to the next provider'
   try {
     const result = await createChatCompletion({ model: 'primary', messages: [] }, 'groq', clients);
     assert.equal(result.provider, 'gemini');
+  } finally {
+    prisma.aiModelUsage.create = originalCreate;
+  }
+});
+
+test('with Gemini primary, Gemini answers first and Groq is only the fallback', async () => {
+  const originalCreate = prisma.aiModelUsage.create;
+  const saved: any[] = [];
+  (prisma.aiModelUsage.create as any) = async ({ data }: any) => { saved.push(data); };
+  const calls: string[] = [];
+  const ok = (name: string) => ({ chat: { completions: { create: async () => { calls.push(name); return { choices: [{ message: { content: 'Ready' } }] }; } } } });
+  const failing = (name: string) => ({ chat: { completions: { create: async () => { calls.push(name); throw Object.assign(new Error('busy'), { status: 503 }); } } } });
+  try {
+    assert.equal(primaryProvider({ AI_PRIMARY_PROVIDER: 'gemini' } as any), 'gemini');
+    assert.equal(primaryProvider({} as any), 'groq');
+    const first = await createChatCompletion({ model: 'primary', messages: [] }, undefined, { groq: ok('groq'), gemini: ok('gemini') } as any, 'gemini');
+    assert.equal(first.provider, 'gemini');
+    const fallback = await createChatCompletion({ model: 'primary', messages: [] }, undefined,
+      { groq: ok('groq'), gemini: failing('gemini'), gemini2: failing('gemini2') } as any, 'gemini');
+    assert.equal(fallback.provider, 'groq');
+    assert.deepEqual(calls, ['gemini', 'gemini', 'gemini2', 'groq']);
+    assert.deepEqual(saved.map(({ provider, failover }) => ({ provider, failover })), [
+      { provider: 'gemini', failover: false }, { provider: 'gemini', failover: false },
+      { provider: 'gemini2', failover: true }, { provider: 'groq', failover: true },
+    ]);
   } finally {
     prisma.aiModelUsage.create = originalCreate;
   }
