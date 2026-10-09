@@ -286,8 +286,18 @@ export function buildWebsiteReply(): string {
 }
 
 export function buildContactDetailsReply(): string {
-  return 'We are at Diamond Plaza Annex, 2nd Floor, on 4th Avenue in Parklands, Nairobi. You can reach us on 0720 111928 or at info@fiestahouseattire.com. Our website is https://www.fiestahousematernity.com/.';
+  return 'We are at Diamond Plaza Annex, 2nd Floor, on 4th Avenue in Parklands, Nairobi. Visits are by appointment only. You can reach us on 0720 111928 or at info@fiestahouseattire.com. Our website is https://www.fiestahousematernity.com/.';
 }
+
+export function buildOpeningHoursReply(): string {
+  return 'We are open Tuesday to Sunday, 9:00 AM to 7:00 PM, and closed on Mondays. Sessions are by appointment only.';
+}
+
+export function buildWalkInReply(): string {
+  return 'We work strictly by appointment, so we do not take walk-ins. A deposit is required to secure your slot.';
+}
+
+export const DEFERRAL_REPLY = "Of course, we're here when you're ready.";
 
 export function buildPortfolioReply(): string {
   return `You can see our maternity, newborn and family sessions in the portfolio here: ${OFFICIAL_WEBSITE_URLS.home}. Have a look and tell me which style feels most like you.`;

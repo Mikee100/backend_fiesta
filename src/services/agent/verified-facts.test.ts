@@ -132,6 +132,6 @@ test('deterministic routes succeed with zero tokens even when daily token cap is
   assert.notEqual(replyCatalog, BUDGET_HANDOFF_REPLY);
 
   // 5. General open-ended query that requires LLM triggers the handoff cleanly
-  const replyHandoff = await agent.handleMessage('budget-customer-1', 'Can I walk in to the studio right now?', [], 'whatsapp');
+  const replyHandoff = await agent.handleMessage('budget-customer-1', 'Do you have parking at the studio?', [], 'whatsapp');
   assert.equal(replyHandoff, BUDGET_HANDOFF_REPLY);
 });

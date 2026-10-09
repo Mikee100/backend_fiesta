@@ -15,12 +15,17 @@ import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddon
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { isCustomerNameQuestion, needsUnchangedReassurance } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
-import { buildBookingPolicyReply, buildHairWigClarificationReply, buildPersonalOutfitReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
+import { DEFERRAL_REPLY, buildBookingPolicyReply, buildHairWigClarificationReply, buildOpeningHoursReply, buildPersonalOutfitReply, buildWalkInReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
+import { extractStatedSlots, EARLY_SLOT_STEP } from './slot-memory';
+import { CARRY_OVER_PREFIX, STEP_QUESTIONS } from './booking-progress';
+
+const CARRY_OVER_CONTINUE = /^(?:yes+|yeah|yep|sure|ok(?:ay)?|continue|same|that one|yes,? (?:please|continue|let'?s continue)|let'?s continue|please continue|continue with (?:that|it))[.! ]*$/i;
+const CARRY_OVER_CHANGE = /^(?:no|nope|no,? (?:a |something )?different(?: one)?|(?:a |something )?different(?: one)?|another one|change it|choose (?:a )?different(?: one)?)[.! ]*$/i;
 import { buildExpressDeliveryFeeReply, isExpressDeliveryFeeRequest } from './photo-delivery-replies';
 import { classifyPaymentMessage } from './payment-recovery';
 import { catalogLinkFollowUp } from './catalog-policy';
 import { OFFICIAL_WEBSITE_URLS } from './constants';
-import { isBookingPolicyQuestion, isPlainGreeting } from './conversation-flow.matcher';
+import { isBookingPolicyQuestion, isDeferral, isOpeningHoursQuestion, isPlainGreeting, isWalkInQuestion } from './conversation-flow.matcher';
 import { isConfirmedSessionFollowUp } from './appointment-replies';
 import { emojiReplyType, stripAssistantEmojis } from './emoji-policy';
 
@@ -96,6 +101,20 @@ export function createMessageRoutes(
       handle: () => buildBookingPolicyReply(),
     },
     {
+      name: 'walkIn',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => isWalkInQuestion(userMessage),
+      handle: () => buildWalkInReply(),
+    },
+    {
+      name: 'openingHours',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => isOpeningHoursQuestion(userMessage),
+      handle: () => buildOpeningHoursReply(),
+    },
+    {
       name: 'rescheduleEntry',
       replyMode: 'deterministic',
       beforeSlotCapture: true,
@@ -154,6 +173,21 @@ export function createMessageRoutes(
       handle: () => 'Yes. Your original session date and time are still booked, and your deposit remains held for it.',
     },
     {
+      name: 'carryOverAnswer',
+      replyMode: 'deterministic',
+      when: () => (platform === 'whatsapp' || platform === 'web')
+        && ([...history].reverse().find(entry => entry.role === 'assistant')?.content || '').includes(CARRY_OVER_PREFIX)
+        && (CARRY_OVER_CONTINUE.test(userMessage.trim()) || CARRY_OVER_CHANGE.test(userMessage.trim())),
+      handle: async () => {
+        if (CARRY_OVER_CONTINUE.test(userMessage.trim())) {
+          return await this.getBookingProgressReply(customerId, userMessage, history, false, true) || STEP_QUESTIONS.need_package;
+        }
+        await prisma.bookingDraft.updateMany({ where: { customerId, step: EARLY_SLOT_STEP },
+          data: { service: null, date: null, time: null, dateTimeIso: null } });
+        return `No problem. ${STEP_QUESTIONS.need_package}`;
+      },
+    },
+    {
       name: 'postActionAcknowledgement',
       when: () => this.isPostActionAcknowledgement(userMessage, history),
       handle: () => {
@@ -165,6 +199,12 @@ export function createMessageRoutes(
           ? 'No rush. Let me know when you are ready to go ahead.'
           : 'You are welcome. I am here if you need anything else.';
       },
+    },
+    {
+      name: 'deferral',
+      replyMode: 'deterministic',
+      when: () => isDeferral(userMessage) && !Object.keys(extractStatedSlots(userMessage, history)).length,
+      handle: () => DEFERRAL_REPLY,
     },
     {
       name: 'cancellationDeclined',
@@ -294,7 +334,7 @@ export function createMessageRoutes(
     },
     {
       name: 'businessIntroduction',
-      replyMode: 'natural',
+      replyMode: 'deterministic',
       when: () => getInformationalFlow() === 'business_introduction',
       handle: () => this.getBusinessIntroductionReply(),
     },
@@ -311,7 +351,7 @@ export function createMessageRoutes(
     },
     {
       name: 'contactDetails',
-      replyMode: 'natural',
+      replyMode: 'deterministic',
       when: () => getInformationalFlow() === 'contact_details',
       handle: () => this.getContactDetailsReply(),
     },

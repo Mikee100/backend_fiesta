@@ -95,7 +95,31 @@ async function addonsDecided(this: any, customerId: string, draft: { id: string;
   return Boolean(note);
 }
 
+export function welcomePrefix(message: string, history: Message[]): string {
+  const name = /\bmy name is\b/i.test(message) ? extractStatedSlots(message, history).name : undefined;
+  return name ? `Welcome, ${name.split(' ')[0]}. ` : '';
+}
+
+export const CARRY_OVER_PREFIX = 'Last time you were looking at';
+
+/** Names only the carried-over details the customer did not restate in this message. */
+export function carryOverQuestion(draft: { service?: string | null; date?: string | null; time?: string | null }, restated: BookingSlots): string | null {
+  const service = !restated.service ? draft.service : null;
+  const date = !restated.date ? draft.date : null;
+  const time = !restated.time ? draft.time : null;
+  if (!service && !date && !time) return null;
+  const when = `${date ? ` on ${formatCustomerDate(date)}` : ''}${time ? ` at ${formatCustomerTime(time)}` : ''}`;
+  return service
+    ? `${CARRY_OVER_PREFIX} ${editionInText(service)}${when}. Would you like to continue with that, or choose a different one?`
+    : `${CARRY_OVER_PREFIX} a session${when}. Would you like to keep that, or choose a different ${date ? 'date' : 'time'}?`;
+}
+
 export async function bookingProgressReply(this: any, customerId: string, message: string, history: Message[], decisionJustSaved = false, force = false): Promise<string | null> {
+  const reply = await progressReply.call(this, customerId, message, history, decisionJustSaved, force);
+  return reply ? `${welcomePrefix(message, history)}${reply}` : reply;
+}
+
+async function progressReply(this: any, customerId: string, message: string, history: Message[], decisionJustSaved: boolean, force: boolean): Promise<string | null> {
   const stated = extractStatedSlots(message, history);
   const dateTimeTurn = Boolean(stated.date || stated.time);
   const declinedNow = this.isDecliningOptionalAddons(message, history);

@@ -1,7 +1,7 @@
 import { PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { EDITION_CATALOG_HEADER, EDITION_TERM_PATTERN } from './constants';
 import { stripAssistantEmojis } from './emoji-policy';
-import { RESCHEDULE_KEYWORD_PATTERN } from './regex';
+import { RESCHEDULE_KEYWORD_PATTERN, normalizeQuotes } from './regex';
 
 export function rescheduleTargetText(message: string): string {
   const clauses = message.split(/\.{2,}|[;\n,]|\b(?:because|but)\b/i)
@@ -30,6 +30,27 @@ export function selectedEdition(message: string): string | null {
 
 export function isPlainGreeting(message: string): boolean {
   return /^\s*(?:hi+|hello+|hey+|hiya|helo|good\s+(?:morning|afternoon|evening|day)|habari(?:\s+yako)?|niaje|mambo|greetings)(?:\s+(?:there|team|fiesta(?:\s+house)?))?[\s!.,]*$/i.test(message);
+}
+
+const SPECIFIC_DAY = /\b(?:today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend|\d{1,2}(?:st|nd|rd|th)?)\b/i;
+
+/** General hours questions only; "are you open today/Saturday" stays with the calendar availability flow. */
+export function isOpeningHoursQuestion(message: string): boolean {
+  if (SPECIFIC_DAY.test(message)) return false;
+  return /\b(?:opening|business|working|operating|studio)\s+(?:hours|days|times)\b|\bwhat\s+are\s+your\s+(?:hours|days)\b|\bwhat\s+(?:time|days?)\s+(?:do|are)\s+you\s+(?:open|close|operate|work)\b|\bwhen\s+(?:are|do)\s+you\s+(?:open|close)\b|\bwhat\s+time\s+does\s+the\s+studio\s+(?:open|close)\b/i.test(message);
+}
+
+export function isWalkInQuestion(message: string): boolean {
+  return /\bwalk[\s-]?ins?\b|\b(?:drop|pop|stop)\s+(?:by|in)\b|\bwithout\s+(?:an?\s+)?(?:appointment|booking)\b|\bdo\s+i\s+need\s+(?:an?\s+)?(?:appointment|booking)\b/i.test(message);
+}
+
+/** "I'll call later", "let me ask my partner": the customer is pausing, so the reply must not ask a booking question. */
+export function isDeferral(message: string): boolean {
+  const text = normalizeQuotes(message).toLowerCase();
+  if (/\?/.test(text)) return false;
+  if (/\b(?:pay|paid|payment|m-?pesa|deposit|prompt|stk|pin|cancel\w*|reschedul\w*|refund\w*|invoice|receipt)\b/.test(text)) return false;
+  return /\b(?:i(?:'ll|\s+will|\s+shall)|let\s+me|i(?:'m|\s+am)\s+going\s+to|i\s+(?:need|have)\s+to)\s+(?:first\s+)?(?:call|ring|get\s+back|come\s+back|check|confirm|ask|talk|speak|consult|discuss|think|reach\s+out|text|update\s+you|revert|decide)\b/.test(text)
+    || /\b(?:get\s+back\s+to\s+you|let\s+you\s+know|call\s+(?:you\s+)?later|talk\s+later)\b/.test(text);
 }
 
 export function isBookingPolicyQuestion(message: string): boolean {
@@ -159,7 +180,7 @@ export class ConversationFlowMatcher {
   }
 
   isBusinessIntroductionRequest(message: string): boolean {
-    return /(tell\s+me\s+about\s+(the\s+)?business|what\s+(is|does)\s+fiesta|about\s+fiesta\s+(house|attire)|who\s+are\s+you|what\s+(exactly\s+)?do\s+(you|you\s+people)\s+do|what\s+do\s+you\s+people\s+do)/.test(message.toLowerCase());
+    return /(tell\s+me\s+about\s+(the\s+)?business|what\s+(is|does)\s+fiesta|about\s+fiesta\s+(house|attire)|who\s+are\s+you|what\s+(exactly\s+)?do\s+(you|you\s+people)\s+do|what\s+do\s+you\s+people\s+do|(is\s+this|am\s+i\s+(talking|chatting|speaking)\s+(to|with)|are\s+you)\s+(the\s+)?fiesta)/.test(message.toLowerCase());
   }
 
   isWebsiteRequest(message: string): boolean {
@@ -167,7 +188,7 @@ export class ConversationFlowMatcher {
   }
 
   isContactDetailsRequest(message: string): boolean {
-    return /(contact\s+details|how\s+can\s+i\s+(contact|reach)\s+you|where\s+(are|is)\s+your\s+(studio|location)|your\s+(location|address)|address.*contact|contact.*(?:location|address))/.test(message.toLowerCase());
+    return /(contact\s+details|how\s+can\s+i\s+(contact|reach)\s+you|where\s+(are|is)\s+your\s+(studio|location|office)|your\s+(location|address)|address.*contact|contact.*(?:location|address)|where\s+(are\s+you|is\s+(the|fiesta)\s*(studio|house)?)\s*(located|based|situated|found)?\s*[?.!]*$|where\s+are\s+you\s+(located|based|situated)|how\s+do\s+i\s+(get|find)\s+(to\s+)?(you|the\s+studio)|directions\s+to)/.test(message.toLowerCase().trim());
   }
 
   isPortfolioRequest(message: string): boolean {

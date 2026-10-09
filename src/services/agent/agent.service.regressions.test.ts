@@ -1110,14 +1110,14 @@ test('budget cutoff requests a human handoff without exposing limits or invoking
     escalate: async (customerId: string, type: string, description: string) => { escalations.push({ customerId, type, payload: JSON.parse(description) }); },
     runAgent: async () => { assert.fail('budget cutoff must not invoke the model'); },
   });
-  const reply = await instance.handleMessage('budget-customer', 'Can I walk in?', [], 'whatsapp');
+  const reply = await instance.handleMessage('budget-customer', 'Do you have parking at the studio?', [], 'whatsapp');
   assert.equal(reply, BUDGET_HANDOFF_REPLY);
   assert.doesNotMatch(reply, /quota|token|limit|50,?000|tomorrow/i);
   assert.equal(reply, 'Thank you for your patience. A member of our team will pick this up with you shortly.');
   assert.equal(escalations.length, 1);
   assert.equal(escalations[0].customerId, 'budget-customer');
   assert.equal(escalations[0].type, 'quota');
-  assert.equal(escalations[0].payload.customerMessage, 'Can I walk in?');
+  assert.equal(escalations[0].payload.customerMessage, 'Do you have parking at the studio?');
   assert.equal(escalations[0].payload.requiresHumanReply, true);
   assert.equal(escalations[0].payload.assignedOwner, null);
   assert.equal(DAILY_TOKEN_CAP, capBefore);
@@ -2735,7 +2735,7 @@ test('an unrelated turn clears a pending cancellation before a later yes', async
   const instance = withQuietAgent({
     runAgent: async () => {
       runAgentCalls++;
-      return { content: 'I can help with studio hours.', tokensUsed: 0 };
+      return { content: 'I can help with parking.', tokensUsed: 0 };
     },
   });
   instance.naturalAssistantMode = true;
@@ -2744,15 +2744,15 @@ test('an unrelated turn clears a pending cancellation before a later yes', async
     assert.match(proposal, /If you want me to cancel this booking, reply yes to confirm/);
     assert.equal(draft.step, 'cancel_confirm');
 
-    const afterUnrelated = await instance.handleMessage('customer-1', 'what are the studio hours?', [
+    const afterUnrelated = await instance.handleMessage('customer-1', 'do you have parking at the studio?', [
       { role: 'user', content: 'cancel' },
       { role: 'assistant', content: proposal },
     ], 'whatsapp');
     assert.equal(draft, null);
-    assert.match(afterUnrelated, /studio hours/);
+    assert.match(afterUnrelated, /parking/);
 
     await instance.handleMessage('customer-1', 'yes', [
-      { role: 'user', content: 'what are the studio hours?' },
+      { role: 'user', content: 'do you have parking at the studio?' },
       { role: 'assistant', content: afterUnrelated },
     ], 'whatsapp');
     assert.equal(cancellations, 0);
