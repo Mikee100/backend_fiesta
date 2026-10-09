@@ -26,7 +26,7 @@ import {
   PAYMENT_PROMPT_UNRECORDED_REPLY,
 } from './constants';
 import { RESCHEDULE_KEYWORD_PATTERN, normalizeQuotes } from './regex';
-import { rememberBookingSlots as storeEarlySlots, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
+import { rememberBookingSlots as storeEarlySlots, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, knownSlotsLine, sanitizeSlotValue, EARLY_SLOT_STEP } from './slot-memory';
 import { addonQuantity, selectedAddons } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_UNCHANGED_REPLY, ADDON_QUOTED_PRICE_LABEL } from './constants';
 import { BUDGET_HANDOFF_REPLY } from './constants';
@@ -36,7 +36,7 @@ import { enforceSlogan } from './slogan-guard';
 import { applyEmojiPolicy, emojiReplyType, emojisIn, enforceEmojiPolicy, stripAssistantEmojis, templateEmojiReply, type EmojiReplyType } from './emoji-policy';
 import { claimCatalogLink, explicitCatalogListRequest, type CatalogKind } from './catalog-policy';
 import { ADDON_LINK_REPLY, EDITION_LINK_REPLY } from './constants';
-import { bookingProgressReply, addonPickQuestion, nextStep, openTimesReply, sampleSlots, STEP_QUESTIONS } from './booking-progress';
+import { bookingProgressReply, addonPickQuestion, carryOverQuestion, nextStep, openTimesReply, sampleSlots, STEP_QUESTIONS, welcomePrefix } from './booking-progress';
 import { createSchemaAlertLimiter, isMissingColumnError, safeSchemaDetails, SCHEMA_MAINTENANCE_REPLY } from '../../config/schema-readiness';
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
@@ -91,7 +91,7 @@ import { circuitBreaker, scoreSentiment, DAILY_TOKEN_CAP, FALLBACK_MESSAGE, PROV
 import { notifyAdmin } from '../notifications/notification.service';
 import { businessDay, bookingDateFacts, formatCustomerDate, nextWeekRange, inBusinessTimezone, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow } from '../../utils/booking-policy';
-import { ConversationFlowMatcher, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
+import { ConversationFlowMatcher, isDeferral, isPlainGreeting, rescheduleTargetText } from './conversation-flow.matcher';
 import { ConversationFlowHandler } from './conversation-flow.handler';
 import { customerReplyTemplates, formatCustomerReply } from '../messaging/customer-reply.templates';
 import { bookingAddonService } from '../booking/booking-addon.service';
@@ -1524,7 +1524,7 @@ A3. Never assume, guess, or invent a date or time for a booking, reschedule, or 
 A4. CANCELLATIONS MUST BE TWO STEPS AND REAL, NOT TEXT-ONLY: when a customer asks to cancel, identify the exact upcoming session and state its date, time, and refund eligibility, then stop and wait. Only cancel on a later customer message that clearly says yes, yeah, yep, ndio, or confirm, and only after checking that the pending cancellation proposal came from a prior turn and has not expired. "ok", "okay", and "sawa" are not cancellation consent. Never claim a cancellation succeeded unless the cancellation action returns success. If there are multiple upcoming sessions, ask which one and cancel nothing until they identify it. If they say no or keep it, clear the proposal and say the booking is unchanged. If they send an unrelated message, clear the pending cancellation proposal so a later yes cannot act on stale consent. Never replace an existing booking, reschedule, or payment draft to stage a cancellation; explain that the existing step is unchanged. State refund eligibility only; never promise an amount or say money was returned.
 A5. PAYMENT STATUS ACCURACY: Check the "Payment Status" in the Customer History above. Only say a deposit was received or paid when Payment Status explicitly says it succeeded/was paid. A confirmed booking status alone does not prove payment was received. If the booking is confirmed but payment status is missing or unclear, confirm only the booking and offer to have the team verify payment. Never state a deposit was forfeited unless a successful reschedule tool result or another verified source explicitly says it was forfeited. Keep payment received, booking confirmed, and deposit forfeited as distinct facts.
 A6. DO NOT RE-CONFIRM WHAT'S ALREADY DONE: once a booking, reschedule, or cancellation has already been confirmed and applied earlier in this conversation, never ask the customer to reconfirm it again (e.g. "just to confirm, you'd like to move it to X, right?"). If the customer replies with a simple acknowledgement like "okay", "thanks", or "got it" afterward, just accept it warmly (e.g. "You're welcome! Let me know if you need anything else.") - do not repeat, second-guess, or re-verify a change that is already done. This acknowledgement rule applies only after the action is complete; while a cancellation proposal is pending, only a clear yes/yeah/yep/ndio/confirm confirms it, and no/keep it or an unrelated message clears it.
-A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead.
+A7. MEDIA POLICY: Do NOT offer to send, share, or forward videos, photos, or any media files directly in this chat. If a customer asks to see photos, videos, or a studio tour, direct them to our Instagram (@fiestahousematernity), Facebook, or website instead. Never offer to hold or reserve slots; only a paid deposit secures one. Sessions are by appointment only, so never invite walk-ins, drop-ins or tours.
 A8. SCOPE: Only provide information about Fiesta House services, sessions, bookings, and studio policies. Do not provide sexual-health, fertility, medical, legal, financial, or other professional advice. For a question outside this scope, briefly say you can help with Fiesta House photo sessions and direct them to an appropriate qualified professional. This does not prohibit answering studio questions about nude or semi-nude maternity portraits, privacy, partners, or children joining a shoot.
 A9. VERIFIED WEBSITE LINKS: Use only these exact Fiesta House website URLs: ${Object.values(OFFICIAL_WEBSITE_URLS).join(', ')}. Never guess or construct a page path. The reviews page is /reviews; the Suspending Concept gallery is /gallery/suspending-concept. If no verified link fits, share the homepage or offer to check with the team.
 LINK-FIRST CATALOG: For editions, packages and optional add-ons share ${OFFICIAL_WEBSITE_URLS.packages}, not the whole catalog, including repeated generic requests. Keep all catalog knowledge for specific-item answers, comparisons and booking calculations. Answer one item or compare two briefly, then append the link. Only list the catalog when the customer explicitly asks for it in this chat or cannot open the link. A bare yes, show me, or reference to the studio is not a request for a full list in chat. Do not change prices, deposits or selected add-ons.
@@ -2444,7 +2444,31 @@ ${contextString}`;
     userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]
   ): Promise<string | null> {
-    return storeEarlySlots(customerId, userMessage, history);
+    return await this.getCarryOverConfirmation(customerId, userMessage, history)
+      ?? storeEarlySlots(customerId, userMessage, history);
+  }
+
+  /** On a booking turn, a draft untouched for over two hours is confirmed instead of being presented as current. */
+  private async getCarryOverConfirmation(customerId: string, userMessage: string,
+    history: { role: 'user' | 'assistant'; content: string }[]): Promise<string | null> {
+    const stated = extractStatedSlots(userMessage, history);
+    const bookingTurn = Object.keys(stated).length > 0 || isPlainGreeting(userMessage)
+      || /\b(?:book\w*|session|appointment|shoot|available|availability|free|open|slots?|yes+|ok(?:ay)?|continue|ready|go ahead)\b/i.test(userMessage);
+    if (!bookingTurn || isDeferral(userMessage) || this.previousMessageRequestsConfirmation(history)
+      || /\b(?:cancel\w*|reschedul\w*|invoice|receipt|pay\w*|deposit|m-?pesa|refund\w*)\b/i.test(userMessage)) return null;
+    const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+    if (!draft || draft.isForSomeoneElse || !carriedOverStale(draft)) return null;
+    const pastDate = Boolean(draft.date && bookingDateFacts(draft.date).isPast);
+    const question = carryOverQuestion(pastDate ? { ...draft, date: null, time: null } : draft, stated);
+    if (!question && !pastDate) return null;
+    // Marks the draft as touched (updatedAt), so the customer's answer next turn uses it.
+    await prisma.bookingDraft.updateMany({ where: { id: draft.id, step: EARLY_SLOT_STEP },
+      data: pastDate ? { date: null, time: null, dateTimeIso: null } : { step: EARLY_SLOT_STEP } });
+    if (!question) return null;
+    await storeEarlySlots(customerId, userMessage, history);
+    const statedFacts = stated.date ? bookingDateFacts(stated.date) : null;
+    const closed = statedFacts && (statedFacts.isMonday || statedFacts.isPast) ? closedDateReply(statedFacts) : null;
+    return `${welcomePrefix(userMessage, history)}${question}${closed ? `\n${closed}` : ''}`;
   }
 
   private isExplicitConfirmation(userMessage: string): boolean {
@@ -2493,7 +2517,7 @@ ${contextString}`;
     userMessage: string,
     history: { role: 'user' | 'assistant', content: string }[]
   ): boolean {
-    const normalized = userMessage.trim().toLowerCase().replace(/[!?.,]/g, '').replace(/\s+/g, ' ');
+    const normalized = userMessage.trim().toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, ' ').replace(/\s+/g, ' ').trim();
     const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good|noted|noted\s+thanks|noted\s+thank\s+you|asante|asante\s+sana)(?:\s+(?:thanks|thank you))?$/.test(normalized);
     if (!isAcknowledgement) return false;
 

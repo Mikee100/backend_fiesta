@@ -11,14 +11,15 @@ import { isAddonListRequest, selectedAddons } from './addon-capture';
 import { verifyModelReply, verifyWithOneRetry } from './output-verifier';
 import { normalizeQuotes } from './regex';
 import { buildAdditionsReply } from './replies';
+import { carriedOverStale, extractStatedSlots, knownSlotsLine, tidyName } from './slot-memory';
 
 const CUSTOMER = 'synthetic-maryanne';
 const NOW = new Date('2026-10-05T20:44:00Z').getTime();
 const DAY_SLOTS = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30', '13:00', '13:30', '14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00'];
 type Msg = { role: 'user' | 'assistant'; content: string };
 
-function harness(context: any, draft: Record<string, unknown> | null, customerName = 'WhatsApp User') {
-  context.mock.timers.enable({ apis: ['Date'], now: NOW });
+function harness(context: any, draft: Record<string, unknown> | null, customerName = 'WhatsApp User', now = NOW) {
+  context.mock.timers.enable({ apis: ['Date'], now });
   const restores: (() => void)[] = [];
   const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
     const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
@@ -42,7 +43,7 @@ function harness(context: any, draft: Record<string, unknown> | null, customerNa
   reset(draft);
   stub(prisma.bookingDraft, 'findUnique', async () => (state.draft ? { ...state.draft } : null));
   stub(prisma.bookingDraft, 'create', async ({ data }: any) => (state.draft = { id: 'muse-draft', createdAt: new Date(), ...data }));
-  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { Object.assign(state.draft, data); return { count: 1 }; });
+  stub(prisma.bookingDraft, 'updateMany', async ({ data }: any) => { Object.assign(state.draft, data, { updatedAt: new Date() }); return { count: 1 }; });
   stub(prisma.customer, 'findUnique', async () => state.customer);
   stub(prisma.customer, 'update', async ({ data }: any) => (state.customer = { ...state.customer, ...data }));
   stub(prisma.customerMemory, 'findUnique', async () => ({ keyInsights: [...state.insights], preferredPackages: [], relationshipStage: 'new', totalBookings: 0 }));
@@ -258,4 +259,90 @@ test('self makeup selection, name collection, then deposit proposal do not repea
   assert.equal(new Set(questions).size, questions.length, 'no question is asked twice');
   assert.ok(replies.every((reply) => !/I.ve added|full name/i.test(reply)));
   assert.equal(state.modelCalls, 0);
+});
+
+test('Koros run: stated time survives a date change, info turns are deterministic and pauses get no booking question', async (context) => {
+  // Friday 9 October 2026, 08:00 Nairobi. A Legend draft from 20 minutes earlier in the same session.
+  const { state, agent, say } = harness(context, { service: 'THE LEGEND', createdAt: new Date('2026-10-09T04:40:00Z') }, 'WhatsApp User', new Date('2026-10-09T05:00:00Z').getTime());
+  agent.naturalAssistantMode = true;
+  assert.equal(await say('Good morning\nIs this fiesta maternity house'), 'Welcome to Fiesta House Maternity. What kind of session are you planning?');
+  assert.match(await say('My name is koros, are you open today?'), /^Welcome, Koros\. Friday, 9 October is open for/);
+  assert.match(await say('I think 4: 00pm is perfect for me'), /^4:00 PM on Friday, 9 October is available/);
+  assert.equal(state.draft.time, '16:00');
+  assert.match(await say('Is Saturday free'), /^4:00 PM on Saturday, 10 October is available/);
+  assert.deepEqual([state.draft.date, state.draft.time], ['2026-10-10', '16:00']);
+  const bring = await say("That's perfect...is there anything I should bring?");
+  assert.match(bring, /black bra and panties/);
+  assert.doesNotMatch(bring, /\?/);
+  assert.equal(await say('Noted.... thanks \u{1F60A}'), 'You are welcome. I am here if you need anything else.');
+  const location = await say('Where are you located?');
+  assert.match(location, /Diamond Plaza Annex[\s\S]*by appointment only/);
+  assert.doesNotMatch(location, /drop by|tour/i);
+  assert.equal(await say('I will \u{1F60A}\nI will call later to confirm my appointment'), "Of course, we're here when you're ready.");
+  assert.equal(await say('Let me confirm with my partner and let you know'), "Of course, we're here when you're ready.");
+  assert.equal(await say('Can I walk in?'), 'We work strictly by appointment, so we do not take walk-ins. A deposit is required to secure your slot.');
+  assert.match(await say('What are your opening hours?'), /^We are open Tuesday to Sunday, 9:00 AM to 7:00 PM/);
+  assert.deepEqual([state.draft.date, state.draft.time], ['2026-10-10', '16:00'], 'pauses and info turns keep the saved slots');
+  assert.equal(state.modelCalls, 0);
+});
+
+test('verifier rejects slot-hold offers and drop-by invitations but not the payment hold wording', () => {
+  const facts = { amounts: [], deposits: [], editions: [] };
+  for (const reply of [
+    'While you chat with your partner, would you like me to hold a few of the Saturday slots for you?',
+    'I can reserve 4:00 PM for you until tomorrow.',
+    'Shall I hold that time?',
+  ]) assert.ok(verifyModelReply(reply, facts).reasons.includes('unsupported_hold_offer'), reply);
+  assert.ok(verifyModelReply('Feel free to drop by or let me know if you would like a quick tour!', facts).reasons.includes('walk_in_or_tour_offer'));
+  assert.deepEqual(verifyModelReply('Your slot is held for 15 minutes while the M-Pesa prompt is open.', facts).reasons, []);
+});
+
+const FRIDAY_8AM = new Date('2026-10-09T05:00:00Z').getTime();
+const staleDraft = (fields: Record<string, unknown>) => ({ createdAt: new Date(FRIDAY_8AM - 10 * 86_400_000), updatedAt: new Date(FRIDAY_8AM - 10 * 86_400_000), ...fields });
+
+test('a draft untouched for over two hours is confirmed, not presented as current', async (context) => {
+  const { state, say } = harness(context, staleDraft({ service: 'THE LEGEND' }), 'WhatsApp User', FRIDAY_8AM);
+  assert.equal(await say('My name is koros, are you open today?'),
+    'Welcome, Koros. Last time you were looking at the Legend edition. Would you like to continue with that, or choose a different one?');
+  assert.equal(state.draft.date, '2026-10-09', 'the date she just stated is saved');
+  assert.equal(state.draft.name, 'Koros');
+  assert.equal(state.customer.name, 'Koros');
+  assert.match(await say('Yes'), /^Friday, 9 October is open for the Legend edition\./, 'confirmed draft is used');
+  assert.equal(state.modelCalls, 0);
+});
+
+test('a stale edition, date and time are all named, and declining clears them', async (context) => {
+  const { state, say } = harness(context, staleDraft({ service: 'THE LEGEND', date: '2026-10-10', time: '16:00' }), 'WhatsApp User', FRIDAY_8AM);
+  assert.equal(await say('Hi'), 'Last time you were looking at the Legend edition on Saturday, 10 October at 4:00 PM. Would you like to continue with that, or choose a different one?');
+  assert.equal(await say('No, a different one'), 'No problem. Which edition would you like?');
+  assert.deepEqual([state.draft.service, state.draft.date, state.draft.time], [null, null, null]);
+  assert.equal(state.modelCalls, 0);
+});
+
+test('a stale past date is dropped and info questions are not interrupted', async (context) => {
+  const { state, say } = harness(context, staleDraft({ service: 'THE MUSE', date: '2026-09-29', time: '10:00' }), 'WhatsApp User', FRIDAY_8AM);
+  assert.match(await say('Where are you located?'), /Diamond Plaza Annex/);
+  assert.equal(await say('I want to book'), 'Last time you were looking at the Muse edition. Would you like to continue with that, or choose a different one?');
+  assert.deepEqual([state.draft.date, state.draft.time], [null, null]);
+});
+
+test('a fresh draft is used silently and the model is told when details are carried over', (context) => {
+  const now = FRIDAY_8AM;
+  context.mock.timers.enable({ apis: ['Date'], now });
+  const fresh = { step: 'collecting_slots', service: 'THE LEGEND', createdAt: new Date(now - 86_400_000), updatedAt: new Date(now - 60 * 60_000) };
+  const stale = { ...fresh, updatedAt: new Date(now - 3 * 60 * 60_000) };
+  assert.equal(carriedOverStale(fresh, now), false);
+  assert.equal(carriedOverStale(stale, now), true);
+  assert.equal(carriedOverStale({ ...stale, service: null }, now), false, 'a name alone is not carried over');
+  assert.match(knownSlotsLine(stale), /earlier conversation: do not use them until the customer confirms/);
+  assert.doesNotMatch(knownSlotsLine(fresh), /earlier conversation/);
+});
+
+test('stated names are sanitised and title-cased only when typed in one case', () => {
+  assert.equal(extractStatedSlots('My name is koros, are you open today?').name, 'Koros');
+  assert.equal(extractStatedSlots('my name is MARY ANNE').name, 'Mary Anne');
+  assert.equal(extractStatedSlots("My name is o'brien").name, "O'Brien");
+  assert.equal(extractStatedSlots('My name is McDonald').name, 'McDonald');
+  assert.equal(tidyName(`  jane\n\nwanjiku${' x'.repeat(60)}`).length <= 60, true);
+  assert.equal(tidyName('jane\nwanjiku'), 'Jane Wanjiku');
 });

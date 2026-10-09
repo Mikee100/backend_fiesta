@@ -124,6 +124,9 @@ function routeOf(reply: string): string {
   if (/^Which add-on would you like to add/.test(reply)) return 'clarifyNewAddon';
   if (/^Understood! We will keep your original/.test(reply)) return 'rescheduleWithdrawal';
   if (/set the session up for Jane Wanjiku/.test(reply)) return 'recipientName';
+  if (/^We work strictly by appointment, so we do not take walk-ins/.test(reply)) return 'walkIn';
+  if (/^We are open Tuesday to Sunday/.test(reply)) return 'openingHours';
+  if (reply === "Of course, we're here when you're ready.") return 'deferral';
   return `UNCLASSIFIED: ${reply}`;
 }
 
@@ -151,7 +154,7 @@ type Case = {
 
 // Routes that only fire when natural assistant mode is off (allowDeterministicInfoReplies).
 const NATURAL_GATED_ROUTES = new Set([
-  'businessIntroduction', 'website', 'contactDetails', 'portfolio',
+  'website', 'portfolio',
   'socialMedia', 'bespoke', 'travellingMothers', 'packageAdvice',
 ]);
 
@@ -213,6 +216,11 @@ const CASES: Case[] = [
   { message: 'What day is the 14th?', expected: 'weekday' },
   { message: "What's your website?", expected: 'website' },
   { message: 'Where is your studio location?', expected: 'contactDetails' },
+  { message: 'Where are you located?', expected: 'contactDetails' },
+  { message: 'Is this fiesta maternity house', expected: 'businessIntroduction' },
+  { message: 'Can I walk in?', expected: 'walkIn' },
+  { message: 'What are your opening hours?', expected: 'openingHours' },
+  { message: 'Let me confirm with my partner and let you know', expected: 'deferral' },
   { message: 'Can I see your portfolio?', expected: 'portfolio' },
   { message: "What's your instagram?", expected: 'socialMedia' },
   { message: 'Can I get raw files?', expected: 'rawFiles' },
@@ -320,13 +328,17 @@ test('message route order remains unchanged', () => {
     'scopeBoundary',
     'customerName',
     'bookingPolicyInformation',
+    'walkIn',
+    'openingHours',
     'rescheduleEntry',
     'identityCorrection',
     'recipientName',
     'ambiguousDeposit',
     'paymentRecovery',
     'rescheduleWithdrawalConfirmation',
+    'carryOverAnswer',
     'postActionAcknowledgement',
+    'deferral',
     'cancellationDeclined',
     'staleCancellationProposal',
     'cancellationProposal',
@@ -359,6 +371,7 @@ test('message route order remains unchanged', () => {
     'clarifyNewAddon',
     'addonRequest',
     'addonListFollowUp',
+    'verifiedFacts',
     'personalOutfit',
     'hairWigClarification',
     'addonInquiry',
