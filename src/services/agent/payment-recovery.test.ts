@@ -299,6 +299,14 @@ test('a proposal for a different edition or slot starts a fresh prompt count; re
   assert.equal('version' in updates[1], false);
 });
 
+test('"hello" with a lapsed unpaid request gets its status, not the model', async (context) => {
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * MINUTE);
+  const { say } = harness(context, { draft: { service: 'THE BLOOM', date: '2027-10-15', time: '14:00', version: MAX_PAYMENT_ATTEMPTS + 1, updatedAt: twoDaysAgo }, payment: { status: 'failed', updatedAt: twoDaysAgo } });
+  const reply = await say('hello');
+  assert.match(reply, /^Welcome back\. Your earlier request for the Bloom edition on .*15 October at 2:00 PM was not paid, so nothing is booked yet\. Reply yes/);
+  assert.doesNotMatch(reply, /a few times|can.t confirm a new booking/);
+});
+
 test('it has not arrived after 30 seconds answers from state without the model or a new push', async (context) => {
   const { state, say } = harness(context, { payment: { updatedAt: new Date(Date.now() - 30_000) } });
   const reply = await say('It has not arrived');
