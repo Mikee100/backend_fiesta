@@ -377,6 +377,21 @@ test('family styling questions are deterministic team-confirm topics, not invent
   assert.deepEqual(verifyModelReply(FAMILY_STYLING_TEAM_REPLY, facts).reasons, []);
 });
 
+test('family edited-photo count questions use a deterministic answer without assuming package policy', async (context) => {
+  const originalFindDraft = prisma.bookingDraft.findUnique;
+  context.after(() => { prisma.bookingDraft.findUnique = originalFindDraft; });
+  (prisma.bookingDraft.findUnique as any) = async () => null;
+  const instance = withQuietAgent({ runAgent: async () => assert.fail('family photo-count questions must not reach the model') });
+  const expected = 'I understand you are asking whether family portraits count toward the edited photos. The package details do not specify that; the studio team can confirm for you.';
+
+  for (const question of [
+    'Do the 15 edited photos include my family photos?',
+    'I am asking about the 15 edited photos, do they include the photos taken with family?',
+  ]) {
+    assert.equal(await instance.handleMessage('synthetic-family-photo-count', question, [], 'whatsapp'), expected);
+  }
+});
+
 test('Faith information turns do not save extras or invent express pricing', async () => {
   const notes: string[] = [];
   const instance = withQuietAgent({ naturalAssistantMode: true,

@@ -69,6 +69,16 @@ test('verified-facts table answers partner styling follow-up', () => {
   assert.match(reply, /partner and children are very welcome/i);
 });
 
+test('verified-facts table distinguishes family participation from the edited-photo package count', () => {
+  for (const question of [
+    'Do the 15 edited photos include my family photos?',
+    'I am asking about the 15 edited photos, do they include the photos taken with family?',
+  ]) {
+    assert.equal(resolveVerifiedFact(question), 'I understand you are asking whether family portraits count toward the edited photos. The package details do not specify that; the studio team can confirm for you.');
+  }
+  assert.equal(resolveVerifiedFact('Can my family join the session?'), null);
+});
+
 test('verified-facts table answers Power Suit queries', () => {
   const q = 'What is the Power Suit?';
   const reply = resolveVerifiedFact(q);
