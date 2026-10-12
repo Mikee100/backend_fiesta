@@ -10,6 +10,13 @@ export const POWER_SUIT_DESCRIPTION = 'A bold, sophisticated maternity look desi
 
 const POWER_SUIT_REPLY = `The Fiesta House Power Suit: ${POWER_SUIT_DESCRIPTION}\nIt is available as an add-on for Ksh 10,000, and is included with The Empress and The Goddess editions.`;
 
+export function isFamilyPhotoCountQuestion(userMessage: string): boolean {
+  const text = userMessage.trim().toLowerCase();
+  return /\b(?:family|partner|husband|wife|children|kids|sons?|daughters?)\b/i.test(text)
+    && /\bphotos?|images?\b/i.test(text)
+    && /\b(?:include|included|count|part\s+of|within|taken\s+with|in\s+the)\b/i.test(text);
+}
+
 /**
  * Verified Facts Table
  * Provides deterministic, approved answers for common questions about:
@@ -34,6 +41,10 @@ export function resolveVerifiedFact(
   const recentTeamHandoff = /passed your question to the studio team|member of our team will pick this up|team will confirm/i.test(lastAssistant);
   if (isWaitingStatement || (recentTeamHandoff && /^(?:okay|ok|alright|noted|waiting)[.!]?$/i.test(text))) {
     return "I've passed that on, and the studio team will reply here shortly.";
+  }
+
+  if (isFamilyPhotoCountQuestion(userMessage)) {
+    return 'I understand you are asking whether family portraits count toward the edited photos. The package details do not specify that; the studio team can confirm for you.';
   }
 
   // 2. Makeup questions: "is makeup for one person", "is makeup included for partner"

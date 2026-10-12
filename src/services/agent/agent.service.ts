@@ -41,6 +41,7 @@ import { createSchemaAlertLimiter, isMissingColumnError, safeSchemaDetails, SCHE
 import { createVerifierEscalationLimiter, currencyAmounts, depositAmounts, verifierCorrectionMessage, verifyWithOneRetry, type VerifierFacts } from './output-verifier';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { EDITIONS_PENDING_OWNER_CONFIRMATION } from '../../config/constants';
+import { isFamilyPhotoCountQuestion } from './verified-facts';
 import {
   buildBespokeReply,
   buildBookingForSomeoneElseReply,
@@ -915,6 +916,8 @@ export class AgentService {
 
   private getStudioPolicyReply(userMessage: string): string | null {
     const text = userMessage.toLowerCase();
+
+    if (isFamilyPhotoCountQuestion(userMessage)) return null;
 
     if (/\b(nude|semi[-\s]?nude)\b/.test(text) && /\b(session|shoot|maternity|portrait|photo)\b/.test(text)) {
       return 'Yes, nude and semi-nude maternity portraits are available. We handle them with professionalism and privacy so you can feel comfortable throughout the session.';
