@@ -302,25 +302,38 @@ export class PaymentController {
             console.log(`Booking ${targetBooking.id} confirmed after successful payment.`);
 
             // Best-effort: keep CustomerMemory current with this confirmed booking.
+            // P0 Fix #3: Use atomic Prisma operations for preferredPackages and totalBookings
+            // so concurrent M-Pesa callbacks (Daraja retries) cannot stomp each other.
             try {
-              const existingMemory = await prisma.customerMemory.findUnique({ where: { customerId: targetBooking.customerId } });
-              const newTotal = (existingMemory?.totalBookings || 0) + 1;
-              const preferredPackages = existingMemory?.preferredPackages || [];
-              if (!preferredPackages.includes(targetBooking.service)) preferredPackages.push(targetBooking.service);
-
+              // Step 1: Atomically add the service to preferredPackages only if not already present.
               await prisma.customerMemory.upsert({
                 where: { customerId: targetBooking.customerId },
-                update: {
-                  totalBookings: { increment: 1 },
-                  relationshipStage: newTotal > 1 ? 'returning' : 'booked',
-                  preferredPackages
-                },
+                update: {},  // noop if record exists — real updates follow
                 create: {
                   customerId: targetBooking.customerId,
-                  totalBookings: 1,
-                  relationshipStage: 'booked',
-                  preferredPackages: [targetBooking.service]
-                }
+                  totalBookings: 0,
+                  relationshipStage: 'new',
+                  preferredPackages: [],
+                },
+              });
+              await prisma.customerMemory.updateMany({
+                where: {
+                  customerId: targetBooking.customerId,
+                  NOT: { preferredPackages: { has: targetBooking.service } },
+                },
+                data: { preferredPackages: { push: targetBooking.service } },
+              });
+
+              // Step 2: Atomically increment totalBookings and derive the new stage from
+              // the incremented value so we never read a stale pre-increment snapshot.
+              const updated = await prisma.customerMemory.update({
+                where: { customerId: targetBooking.customerId },
+                data: { totalBookings: { increment: 1 } },
+                select: { totalBookings: true },
+              });
+              await prisma.customerMemory.update({
+                where: { customerId: targetBooking.customerId },
+                data: { relationshipStage: updated.totalBookings > 1 ? 'returning' : 'booked' },
               });
             } catch (memErr) {
               console.error('Failed to update customer memory after booking:', memErr);
