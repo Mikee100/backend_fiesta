@@ -39,7 +39,8 @@ export function resolveVerifiedFact(
   // 1. Acknowledging previous handoff / "waiting for response" (avoids repeating "I'd rather not guess")
   const isWaitingStatement = /^(?:(?:i\s+will|i'll)\s+(?:be\s+)?wait(?:ing)?(?:\s+for\s+(?:your\s+)?(?:response|reply))?|wait(?:ing)?(?:\s+for\s+(?:your\s+)?(?:response|reply))?|okay\s+i\s+(?:will|'ll)\s+wait|i\s+will\s+wait|i'll\s+wait)[.!]?$/i.test(text);
   const recentTeamHandoff = /passed your question to the studio team|member of our team will pick this up|team will confirm/i.test(lastAssistant);
-  if (isWaitingStatement || (recentTeamHandoff && /^(?:okay|ok|alright|noted|waiting)[.!]?$/i.test(text))) {
+  const isConfirmFollowUp = /^(?:(?:kindly|please)\s+)?confirm(?:\s+that)?(?:\s+for\s+me)?[.!]?$/i.test(text);
+  if (isWaitingStatement || (recentTeamHandoff && (/^(?:okay|ok|alright|noted|waiting)[.!]?$/i.test(text) || isConfirmFollowUp))) {
     return "I've passed that on, and the studio team will reply here shortly.";
   }
 
@@ -101,6 +102,15 @@ export function resolveVerifiedFact(
   // 9. Preparation: wording from the studio FAQ rows "What should I bring to the session?" and "What do I need to bring?"
   if (/\b(?:what|anything)\b[^?]{0,40}\b(?:should|do|must|need\s+to|have\s+to)\s+(?:i\s+)?(?:bring|carry|wear)\b|\bwhat\s+to\s+(?:bring|carry|wear)\b/i.test(text)) {
     return 'Just bring yourself and any personal items you would like to include, such as baby ultrasound photos, baby shoes and accessories like earrings. Please wear a black bra and panties. We will handle the rest, including outfits, props and styling.';
+  }
+
+  // 10. Discount and returning-client inquiries (pending studio owner confirmation)
+  const discountTerms = /\b(?:discounts?|special\s+rates?|loyalty\s+discounts?|returning\s+client\s+discounts?|repeat\s+client\s+discounts?)\b/i;
+  const returningDiscountQuery = /\b(?:returning|repeat)\s+(?:client|customer)\b.*\b(?:discount|offer|rate|deal)\b/i.test(text)
+    || /\b(?:do\s+i\s+get|is\s+there)\s+(?:a\s+)?discount\b/i.test(text)
+    || /\bdo\s+you\s+(?:offer|have|give)\s+(?:any\s+)?discounts?\b/i.test(text);
+  if (discountTerms.test(text) || returningDiscountQuery) {
+    return 'The team will confirm that for you.';
   }
 
   return null;

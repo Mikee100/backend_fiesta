@@ -2,15 +2,19 @@ import OpenAI from 'openai';
 import prisma from '../../../config/prisma';
 import { classifyProviderRateLimit } from '../resilience.service';
 
+const PROVIDER_TIMEOUT_MS = Number(process.env.AI_PROVIDER_TIMEOUT_MS) || 20_000;
+
 const openai = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: 'https://api.groq.com/openai/v1',
   maxRetries: 0,
+  timeout: PROVIDER_TIMEOUT_MS,
 });
 const groq2 = process.env.GROQ_2 ? new OpenAI({
   apiKey: process.env.GROQ_2,
   baseURL: 'https://api.groq.com/openai/v1',
   maxRetries: 0,
+  timeout: PROVIDER_TIMEOUT_MS,
 }) : null;
 
 export const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || process.env.OPENAI_CHAT_MODEL || 'llama-3.1-8b-instant';
@@ -20,11 +24,13 @@ const gemini = process.env.GEMINI_API_KEY ? new OpenAI({
   apiKey: process.env.GEMINI_API_KEY,
   baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
   maxRetries: 0,
+  timeout: PROVIDER_TIMEOUT_MS,
 }) : null;
 const geminiBackup2 = process.env.GEMINI_BACKUP2 ? new OpenAI({
   apiKey: process.env.GEMINI_BACKUP2,
   baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
   maxRetries: 0,
+  timeout: PROVIDER_TIMEOUT_MS,
 }) : null;
 export type ChatProvider = 'groq' | 'groq2' | 'gemini' | 'gemini2';
 const providerCooldownUntil = new WeakMap<Pick<OpenAI, 'chat'>, number>();
@@ -87,7 +93,8 @@ function isFailoverError(error: any): boolean {
   const status = error?.status ?? error?.response?.status;
   // 413: the request exceeds this account's per-minute token cap; another provider can still take it.
   return status === 404 || status === 408 || status === 413 || status === 429 || status >= 500
-    || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED'].includes(error?.code);
+    || ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED'].includes(error?.code)
+    || error?.name === 'APIConnectionTimeoutError';
 }
 
 function isAuthenticationError(error: any): boolean {

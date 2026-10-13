@@ -126,6 +126,7 @@ function routeOf(reply: string): string {
   if (/set the session up for Jane Wanjiku/.test(reply)) return 'recipientName';
   if (/^We work strictly by appointment, so we do not take walk-ins/.test(reply)) return 'walkIn';
   if (/^We are open Tuesday to Sunday/.test(reply)) return 'openingHours';
+  if (/^Extra outfits beyond your package are Ksh 4,000/.test(reply)) return 'verifiedFacts';
   if (reply === "Of course, we're here when you're ready.") return 'deferral';
   return `UNCLASSIFIED: ${reply}`;
 }
@@ -225,7 +226,7 @@ const CASES: Case[] = [
   { message: "What's your instagram?", expected: 'socialMedia' },
   { message: 'Can I get raw files?', expected: 'rawFiles' },
   { message: 'How much do I have to pay for photos within 3 working days?', expected: 'expressDeliveryFee' },
-  { message: 'Can I bring one extra outfit of my own?', expected: 'personalOutfit' },
+  { message: 'Can I bring one extra outfit of my own?', expected: 'verifiedFacts' },
   { message: 'What does professional hair mean, is it wig styling?', expected: 'hairWigClarification' },
 
   // Add-ons
@@ -330,6 +331,8 @@ test('message route order remains unchanged', () => {
     'bookingPolicyInformation',
     'walkIn',
     'openingHours',
+    'packageSwitchAnswer',
+    'packageChangeRequest',
     'dateAlternatives',
     'rescheduleEntry',
     'identityCorrection',
