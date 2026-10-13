@@ -28,6 +28,7 @@ import { OFFICIAL_WEBSITE_URLS } from './constants';
 import { isBookingPolicyQuestion, isDeferral, isOpeningHoursQuestion, isPlainGreeting, isWalkInQuestion } from './conversation-flow.matcher';
 import { isConfirmedSessionFollowUp } from './appointment-replies';
 import { emojiReplyType, stripAssistantEmojis } from './emoji-policy';
+import { getPackageChangeReply, getPackageSwitchAnswerReply, isPackageChangeRequest, isPackageSwitchAnswer } from './package-replies';
 
 export type RouteOutcome = {
   success?: boolean;
@@ -113,6 +114,27 @@ export function createMessageRoutes(
       beforeSlotCapture: true,
       when: () => isOpeningHoursQuestion(userMessage),
       handle: () => buildOpeningHoursReply(),
+    },
+    {
+      name: 'packageSwitchAnswer',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => (platform === 'whatsapp' || platform === 'web') && isPackageSwitchAnswer(userMessage, history),
+      handle: async () => getPackageSwitchAnswerReply(customerId, userMessage, history),
+    },
+    {
+      name: 'packageChangeRequest',
+      replyMode: 'deterministic',
+      beforeSlotCapture: true,
+      when: () => (platform === 'whatsapp' || platform === 'web') && isPackageChangeRequest(userMessage, history),
+      handle: async () => {
+        const result = await getPackageChangeReply(customerId, userMessage, history);
+        if (!result) return null;
+        if (result.escalateToTeam) {
+          await this.escalate(customerId, 'booking', result.escalationReason || 'Customer requested package change on confirmed booking.');
+        }
+        return result.reply;
+      },
     },
     {
       name: 'dateAlternatives',
@@ -422,7 +444,7 @@ export function createMessageRoutes(
       replyMode: 'deterministic',
       when: () => !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history) && Boolean(resolveVerifiedFact(userMessage, history)),
       handle: async () => {
-        const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
+        const draft = await prisma.bookingDraft.findUnique({ where: { customerId } }).catch(() => null);
         return resolveVerifiedFact(userMessage, history, { draftService: draft?.service });
       },
     },

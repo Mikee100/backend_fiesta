@@ -115,7 +115,7 @@ export function previousMessageRequestsConfirmation(
 ): boolean {
   history = stripAssistantEmojis(history);
   const previousAssistantMessage = [...history].reverse().find((message) => message.role === 'assistant')?.content.toLowerCase() || '';
-  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm|(?:could\s+you\s+please\s+)?confirm\s+(?:that\s+)?you(?:['’]d|\s+would)\s+like\s+to\s+(?:reschedule|move|change)\b[\s\S]{0,160}\bto\b)/.test(previousAssistantMessage);
+  return /(?:reply\s+["“”']?yes["“”']?|if\s+that\s+works\s+for\s+you.*reply\s+["“”']?yes["“”']?|would\s+you\s+like\s+me\s+to\s+confirm|confirm\s+that\s+change|confirm\s+the\s+change|shall\s+i\s+confirm|shall\s+i\s+(?:switch|set)\b|reply\W{0,3}yes\b|if\s+you\s+want\s+me\s+to\s+cancel\s+this\s+booking,?\s+reply\s+yes\s+to\s+confirm|(?:could\s+you\s+please\s+)?confirm\s+(?:that\s+)?you(?:['’]d|\s+would)\s+like\s+to\s+(?:reschedule|move|change)\b[\s\S]{0,160}\bto\b)/.test(previousAssistantMessage);
 }
 
 export function isPackageBudgetRequest(userMessage: string): boolean {

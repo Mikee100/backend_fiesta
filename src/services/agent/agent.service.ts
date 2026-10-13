@@ -171,6 +171,7 @@ type ReplyContext = {
   userMessage: string;
   platform: string;
   startedAt: number;
+  escalatedThisTurn?: boolean;
 };
 
 type ReplyOutcome = {
@@ -190,18 +191,33 @@ export class AgentService {
   private readonly conversationFlows = new ConversationFlowMatcher();
   private readonly conversationFlowHandler = new ConversationFlowHandler(this.conversationFlows);
   private readonly shouldEscalateVerifier = createVerifierEscalationLimiter();
+  private readonly shouldEscalateHandoff = createVerifierEscalationLimiter();
   private readonly shouldAlertSchemaMismatch = createSchemaAlertLimiter();
   /** Rate-limits frustration escalations to at most one per 5 minutes, matching the outage-alert pattern. */
   private readonly shouldEscalateFrustration = createSchemaAlertLimiter(5 * 60_000);
+  private activeTurnContext?: ReplyContext;
 
   private isNaturalAssistantModeEnabled(): boolean {
     return this.naturalAssistantMode;
+  }
+
+  private isTeamHandoffReply(reply: string): boolean {
+    return /passed your question to the studio team|passed that on, and the studio team will reply|forward(?:ed|ing)? (?:your|this) (?:request|question) to the team|member of our team will (?:pick this up|be in touch)|team will confirm|studio team will confirm/i.test(reply);
   }
 
   /** Records the turn's metric and learning rows in the background and returns the reply unchanged. */
   private respond(ctx: ReplyContext, reply: string, outcome: ReplyOutcome = {}): string {
     const { success = true, isFallback = false, ...failureDetails } = outcome;
     const latencyMs = Date.now() - ctx.startedAt;
+    if (!ctx.escalatedThisTurn && this.isTeamHandoffReply(reply) && this.shouldEscalateHandoff(ctx.customerId, ctx.userMessage)) {
+      ctx.escalatedThisTurn = true;
+      this.logInBackground('team handoff escalation', () => this.escalate(
+        ctx.customerId,
+        'team_handoff',
+        `Customer question handed off to team: "${ctx.userMessage.slice(0, 300)}" (Reply: "${reply.slice(0, 200)}")`
+      ));
+    }
+    this.activeTurnContext = undefined;
     this.logInBackground('AI job metric', () => this.logAiJobMetric({
       customerId: ctx.customerId,
       platform: ctx.platform,
@@ -2280,6 +2296,13 @@ ${contextString}`;
     const history = stripAssistantEmojis(rawHistory).map((entry) => ({ ...entry, content: normalizeQuotes(entry.content) }));
     const startedAt = Date.now();
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
+    this.activeTurnContext = ctx;
+    if (String(process.env.AI_AUTOMATION_ENABLED || 'true').trim().toLowerCase() === 'false') {
+      await this.escalate(customerId, 'automation_disabled', `Outbound AI automation is disabled (AI_AUTOMATION_ENABLED=false). Customer message: "${userMessage.slice(0, 300)}"`);
+      return this.respond(ctx, 'The studio team will help you shortly on 0720 111928.', {
+        success: false, isFallback: true, failureReason: 'automation_disabled',
+      });
+    }
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
     let cancellationDraftReply: string | null;
     try {
@@ -2530,11 +2553,11 @@ ${contextString}`;
     history: { role: 'user' | 'assistant', content: string }[]
   ): boolean {
     const normalized = userMessage.trim().toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, ' ').replace(/\s+/g, ' ').trim();
-    const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good|noted|noted\s+thanks|noted\s+thank\s+you|asante|asante\s+sana)(?:\s+(?:thanks|thank you))?$/.test(normalized);
+    const isAcknowledgement = /^(?:ok|okay|thanks|thank you(?: so much)?|got it|sawa|alright|perfect|great|all good|noted|noted\s+thanks|noted\s+thank\s+you|asante|asante\s+sana|(?:i\s+(?:will|would|'ll)\s+)?appreciate(?:\s+(?:it|that))?|much\s+appreciated|appreciated)(?:\s+(?:thanks|thank you))?$/.test(normalized);
     if (!isAcknowledgement) return false;
 
     const awaitingConfirmation = this.previousMessageRequestsConfirmation(history);
-    const includesThanks = /\b(thanks|thank you)\b/.test(normalized);
+    const includesThanks = /\b(thanks|thank you|appreciate|appreciated)\b/.test(normalized);
     if (awaitingConfirmation && !includesThanks && /^(?:ok|okay|alright|sawa)$/.test(normalized)) return false;
 
     return true;
@@ -2897,6 +2920,9 @@ ${contextString}`;
    * a failure here must never break the actual customer-facing reply.
    */
   private async escalate(customerId: string, escalationType: string, description: string, sentimentScore?: number): Promise<void> {
+    if (this.activeTurnContext && this.activeTurnContext.customerId === customerId) {
+      this.activeTurnContext.escalatedThisTurn = true;
+    }
     return createEscalation(customerId, escalationType, description, sentimentScore);
   }
 

@@ -65,6 +65,7 @@ export function isBookingPolicyQuestion(message: string): boolean {
 export class ConversationFlowMatcher {
   isInitialRescheduleRequest(message: string): boolean {
     if (isBookingPolicyQuestion(message)) return false;
+    if (/\b(?:package|edition)\b/i.test(message) && !/\b(?:date|day|time)\b/i.test(message)) return false;
     if (!RESCHEDULE_KEYWORD_PATTERN.test(message)) return false;
     if (/\b(?:not|don't|do not|never)\b[\s\S]{0,35}\b(?:reschedul\w*|change|move|postpone|push)\b/i.test(message)) return false;
     return /\breschedul\w*|\bpostpon\w*|\bpush\b/i.test(message)

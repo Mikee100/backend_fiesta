@@ -104,6 +104,28 @@ test('verified-facts table acknowledges studio team handoff without repeating ca
   }
 });
 
+test('verified-facts table answers returning-client discount inquiry and confirm follow-up', () => {
+  for (const q of [
+    'Since I am a returning client, do I get a discount?',
+    'Do you offer discounts?',
+    'Do returning clients get a discount?',
+    'Is there a special rate for returning clients?',
+  ]) {
+    const reply = resolveVerifiedFact(q);
+    assert.equal(reply, 'The team will confirm that for you.', `Failed for: ${q}`);
+  }
+
+  const history = [{ role: 'assistant' as const, content: 'The team will confirm that for you.' }];
+  for (const followUp of [
+    'Kindly confirm that for me',
+    'Please confirm that for me',
+    'confirm that for me',
+  ]) {
+    const reply = resolveVerifiedFact(followUp, history);
+    assert.equal(reply, "I've passed that on, and the studio team will reply here shortly.", `Failed for follow-up: ${followUp}`);
+  }
+});
+
 test('isEarliestImageDeliveryRequest matches "how long does it take to get the photos"', () => {
   assert.equal(isEarliestImageDeliveryRequest('how long does it take to get the photos'), true);
   assert.equal(isEarliestImageDeliveryRequest('how long to get the photos'), true);
