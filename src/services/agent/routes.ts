@@ -359,7 +359,7 @@ export function createMessageRoutes(
       name: 'greeting',
       replyMode: 'deterministic',
       when: () => isPlainGreeting(userMessage),
-      handle: async () => this.getGreetingReply(customerId),
+      handle: async () => this.getGreetingReply(customerId, history),
     },
     {
       name: 'businessIntroduction',

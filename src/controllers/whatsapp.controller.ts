@@ -219,7 +219,8 @@ export class WhatsAppController {
       }));
       const history = recentMessages.reverse().map(m => ({
         role: (m.direction === 'inbound' ? 'user' : 'assistant') as 'user' | 'assistant',
-        content: m.content
+        content: m.content,
+        createdAt: m.createdAt,
       }));
 
       // handleMessage never throws - on any internal failure (provider error,
