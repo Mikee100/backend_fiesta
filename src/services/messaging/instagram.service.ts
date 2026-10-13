@@ -1,16 +1,23 @@
 import axios from 'axios';
 import dotenv from 'dotenv';
+import {
+  getStoredAccessToken,
+  getStoredInstagramAccountId,
+} from '../integrations/instagram-oauth.service';
 
 dotenv.config();
 
 export class InstagramService {
-  private getAccessToken(): string | undefined {
+  private async resolveAccessToken(): Promise<string | undefined> {
+    // Prefer the OAuth-connected professional account token when present.
+    const stored = await getStoredAccessToken();
+    if (stored) return stored;
+
     // Refresh env vars in case they changed
     dotenv.config();
-    // IG Graph API requires the Facebook Page Access Token linked to the IG account (starts with EAA...)
-    // If the token starts with IGAA, it is an Instagram User Token which is invalid for messaging.
-    return process.env.INSTAGRAM_PAGE_ACCESS_TOKEN || 
-           process.env.FB_PAGE_ACCESS_TOKEN || 
+    // Fallback: env-configured Page / Instagram tokens (legacy setup)
+    return process.env.INSTAGRAM_PAGE_ACCESS_TOKEN ||
+           process.env.FB_PAGE_ACCESS_TOKEN ||
            process.env.INSTAGRAM_ACCESS_TOKEN;
   }
 
@@ -18,24 +25,27 @@ export class InstagramService {
     return process.env.WHATSAPP_API_VERSION || 'v20.0';
   }
 
-  private getIgUserId(): string {
+  private async resolveIgUserId(): Promise<string> {
+    const storedId = await getStoredInstagramAccountId();
+    if (storedId) return storedId;
     return process.env.INSTAGRAM_IG_USER_ID || process.env.INSTAGRAM_PAGE_ID || 'me';
   }
 
-  private buildApiUrl(endpoint: string, token: string): string {
-    // If the token starts with IGAA, it's the new Instagram-only API
-    if (token.startsWith('IGAA')) {
-      return `https://graph.instagram.com/${this.getApiVersion()}/me/${endpoint}?access_token=${token}`;
+  private async buildApiUrl(endpoint: string, token: string): Promise<string> {
+    // Classic Facebook Page tokens (EAA...) use graph.facebook.com.
+    // Instagram Login / OAuth tokens use graph.instagram.com.
+    if (token.startsWith('EAA')) {
+      const igUserId = await this.resolveIgUserId();
+      return `https://graph.facebook.com/${this.getApiVersion()}/${igUserId}/${endpoint}?access_token=${token}`;
     }
-    // Otherwise, it's the classic Facebook Graph API
-    return `https://graph.facebook.com/${this.getApiVersion()}/${this.getIgUserId()}/${endpoint}?access_token=${token}`;
+    return `https://graph.instagram.com/${this.getApiVersion()}/me/${endpoint}?access_token=${token}`;
   }
 
   /**
    * Helper to send a single payload
    */
   private async sendSingleMessage(recipientId: string, text: string, token: string) {
-    const url = this.buildApiUrl('messages', token);
+    const url = await this.buildApiUrl('messages', token);
     try {
       const response = await axios.post(
         url,
@@ -59,9 +69,9 @@ export class InstagramService {
    * Sends a text message to an Instagram recipient via Facebook/Instagram Graph API
    */
   async sendMessage(recipientId: string, text: string) {
-    const token = this.getAccessToken();
+    const token = await this.resolveAccessToken();
     if (!token) {
-      console.error('Instagram Access Token missing in .env');
+      console.error('Instagram Access Token missing (no OAuth connection and no env token)');
       return;
     }
 
@@ -96,10 +106,10 @@ export class InstagramService {
    * Marks a message as read (Optional/if supported for IG)
    */
   async markAsRead(recipientId: string) {
-    const token = this.getAccessToken();
+    const token = await this.resolveAccessToken();
     if (!token) return;
 
-    const url = this.buildApiUrl('messages', token);
+    const url = await this.buildApiUrl('messages', token);
 
     try {
       await axios.post(

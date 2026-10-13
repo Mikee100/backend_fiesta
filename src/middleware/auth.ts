@@ -63,6 +63,8 @@ export async function requireApiAuthentication(req: Request, res: Response, next
     '/api/whatsapp',
     '/api/instagram',
     '/api/mpesa/callback',
+    // Meta redirects the browser here without an admin JWT
+    '/api/integrations/instagram/callback',
   ]);
 
   if (publicPaths.has(path)) {
