@@ -120,6 +120,12 @@ function harness(context: any, overrides: { draft?: Record<string, unknown>; pay
   stub(invoiceService, 'createOrRefreshForBooking', async () => ({ invoiceNumber: 'INV-TEST-1', pdfData: null, balanceDue: 33000 }));
   stub(prisma.customerMemory, 'findUnique', async () => null);
   stub(prisma.customerMemory, 'upsert', async () => ({}));
+  stub(prisma.customerMemory, 'update', async () => ({ totalBookings: 1 }));
+  stub(prisma.customerMemory, 'updateMany', async () => ({ count: 1 }));
+  // Stub $transaction so rememberBookingSlots' atomic lapse-release runs through
+  // the existing individual stubs (payment.findFirst, bookingDraft.updateMany) rather
+  // than attempting a real DB transaction.
+  stub(prisma, '$transaction', async (fn: any) => fn(prisma));
 
   const agent = new AgentService() as any;
   Object.assign(agent, {
@@ -277,7 +283,9 @@ test('new booking details replace a lapsed unpaid payment step, but never a paid
   };
   (prisma.customer.findUnique as any) = async () => ({ id: CUSTOMER, name: 'Joan' });
   await rememberBookingSlots(CUSTOMER, 'lets do it on 2027-10-14', []);
-  assert.deepEqual([state.draft.step, state.draft.date, state.draft.version], ['collecting_slots', '2027-10-14', 1]);
+  // Version sequence: lapse-release resets to 1, then the slot update increments to 2
+  // in the same rememberBookingSlots call, so the final version is 2.
+  assert.deepEqual([state.draft.step, state.draft.date, state.draft.version], ['collecting_slots', '2027-10-14', 2]);
 
   for (const blocked of [{ status: 'success', updatedAt: new Date(Date.now() - 2 * 24 * 60 * MINUTE) }, { status: 'failed', updatedAt: new Date(Date.now() - 5 * MINUTE) }]) {
     Object.assign(state.draft, { step: 'payment_pending', date: '2027-10-08', version: 4, updatedAt: blocked.updatedAt });

@@ -139,14 +139,25 @@ export async function rememberBookingSlots(customerId: string, message: string, 
   const stated = extractStatedSlots(message, history);
   if (!Object.keys(stated).length) return null;
   let draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
-  if (draft && paymentLapsed(draft) && (stated.service || stated.date || stated.time)
-    && !await prisma.payment.findFirst({ where: { bookingDraftId: draft.id, status: 'success' }, select: { id: true } })) {
-    const released = await prisma.bookingDraft.updateMany({
-      where: { id: draft.id, step: 'payment_pending', updatedAt: draft.updatedAt },
-      data: { step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 },
+
+  // P0 Fix #2: Atomically check for a successful payment AND release the lapsed draft
+  // in a single transaction so an M-Pesa success callback cannot land between the two.
+  if (draft && paymentLapsed(draft) && (stated.service || stated.date || stated.time)) {
+    const released = await prisma.$transaction(async (tx) => {
+      const successPayment = await tx.payment.findFirst({
+        where: { bookingDraftId: draft!.id, status: 'success' },
+        select: { id: true },
+      });
+      if (successPayment) return 0;
+      const result = await tx.bookingDraft.updateMany({
+        where: { id: draft!.id, step: 'payment_pending', updatedAt: draft!.updatedAt },
+        data: { step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 },
+      });
+      return result.count;
     });
-    if (released.count) draft = { ...draft, step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 };
+    if (released) draft = { ...draft, step: EARLY_SLOT_STEP, dateTimeIso: null, version: 1 };
   }
+
   if (draft && (PROTECTED_STEPS.includes(draft.step) || draft.isForSomeoneElse)) return null;
   if (draft && draft.step !== EARLY_SLOT_STEP && draft.step !== 'service') return null;
   if (draft && earlySlotsExpired(draft)) {
@@ -167,8 +178,25 @@ export async function rememberBookingSlots(customerId: string, message: string, 
     ...((stated.date || stated.time) ? { dateTimeIso: null } : {}),
   };
   if (draft) {
-    const changed = await prisma.bookingDraft.updateMany({ where: { id: draft.id, step: draft.step }, data });
-    if (!changed.count) return null;
+    // P0 Fix #1: Include version in the where-clause so two concurrent messages
+    // (e.g., a WhatsApp webhook retry) cannot both pass and stomp each other.
+    // On a version mismatch (count === 0), refetch once and retry the merge.
+    // Use explicit arithmetic (draft.version + 1) rather than { increment: 1 } so
+    // test stubs that do simple Object.assign on data also work correctly.
+    let changed = await prisma.bookingDraft.updateMany({
+      where: { id: draft.id, step: draft.step, version: draft.version },
+      data: { ...data, version: draft.version + 1 },
+    });
+    if (!changed.count) {
+      // Refetch and retry once — the other concurrent write won; merge on top of it.
+      const refetched = await prisma.bookingDraft.findUnique({ where: { customerId } });
+      if (!refetched || PROTECTED_STEPS.includes(refetched.step) || refetched.step !== EARLY_SLOT_STEP) return null;
+      changed = await prisma.bookingDraft.updateMany({
+        where: { id: refetched.id, step: refetched.step, version: refetched.version },
+        data: { ...data, version: refetched.version + 1 },
+      });
+      if (!changed.count) return null;
+    }
   } else {
     try {
       await prisma.bookingDraft.create({ data: { customerId, ...data } });

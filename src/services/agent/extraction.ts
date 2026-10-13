@@ -206,7 +206,7 @@ export class BookingExtractor {
 
   async extract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const regex = BookingExtractor.regexExtract(message);
-    console.log('Regex result:', regex);
+    if (process.env.NODE_ENV !== 'production') console.log('Regex result:', regex);
     if (regex.name && regex.service && regex.date && regex.time) {
       return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
     }
@@ -215,7 +215,7 @@ export class BookingExtractor {
       return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
     }
     const { details: ai, usage } = await this.aiExtract(message);
-    console.log('AI result:', ai);
+    if (process.env.NODE_ENV !== 'production') console.log('AI result:', ai);
     return {
       details: {
         name: regex.name || ai.name,
