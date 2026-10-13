@@ -515,14 +515,48 @@ export class AgentService {
     return isBusinessIdentityQuestion(userMessage) ? buildBusinessIntroductionReply() : buildAboutBusinessReply();
   }
 
-  private async getGreetingReply(customerId: string): Promise<string | null> {
+  private async getGreetingReply(customerId: string, history: Array<{ role: string; content: string }> = []): Promise<string | null> {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (draft?.step === 'payment_pending') {
-      const status = await this.getPaymentRecoveryReply(customerId, 'hello', 'status_check');
-      if (status) return `Welcome back. ${status}`;
+      if (draft.date && bookingDateFacts(draft.date).isPast) {
+        await prisma.bookingDraft.deleteMany({ where: { id: draft.id, step: 'payment_pending' } });
+      } else {
+        const reminderCount = history.filter(
+          m => m.role === 'assistant' && (
+            /was not paid, so nothing is booked yet/i.test(m.content) ||
+            /is still waiting/i.test(m.content)
+          )
+        ).length;
+
+        if (reminderCount === 1) {
+          const editionTitle = draft.service
+            ? editionInText(draft.service).replace(/^the\s+/i, '').replace(/\s+edition$/i, '').trim()
+            : 'session';
+          const dayText = draft.date ? formatCustomerDate(draft.date) : 'your requested date';
+          return `Good to hear from you. Your ${editionTitle} request for ${dayText} is still waiting. Shall I check the slot?`;
+        }
+
+        if (reminderCount >= 2) {
+          const editionLabel = draft.service ? editionInText(draft.service) : 'your session';
+          const dayText = draft.date ? formatCustomerDate(draft.date) : 'your requested date';
+          return `Good to hear from you. Your earlier request for ${editionLabel} on ${dayText} is still waiting, but nothing was booked or paid. Would you like me to clear it and start fresh, or check that slot for you?`;
+        }
+
+        const status = await this.getPaymentRecoveryReply(customerId, 'hello', 'status_check');
+        if (status) return `Welcome back. ${status}`;
+      }
     }
     // A profile name alone is not booking progress.
-    if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) return null;
+    if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) {
+      if (draft.date && bookingDateFacts(draft.date).isPast) {
+        await prisma.bookingDraft.updateMany({
+          where: { id: draft.id, step: draft.step },
+          data: { date: null, time: null, dateTimeIso: null },
+        });
+      } else {
+        return null;
+      }
+    }
     try {
       const upcoming = await prisma.booking.findFirst({
         where: { customerId, status: 'confirmed', dateTime: { gte: new Date() } },
@@ -2247,9 +2281,12 @@ ${contextString}`;
     if (codeOwnedReply && calendarReply && !exactProposalReply && !cancellationReply) {
       safeModelContent = await this.decorateTemplateEmoji(customerId, platform, safeModelContent, 'slotAvailable', userMessage, history);
     }
+    const lastAssistant = [...history].reverse().find(message => message.role === 'assistant');
     if (!codeOwnedReply) safeModelContent = await enforceEmojiPolicy(customerId, platform, safeModelContent, {
       userMessage, replyType: emojiReplyType(safeModelContent), sentimentScore: scoreSentiment(userMessage).score,
-      forbidden: verifierBlocked, previousAssistant: [...history].reverse().find(message => message.role === 'assistant')?.content,
+      forbidden: verifierBlocked,
+      previousAssistant: lastAssistant?.content,
+      previousAssistantCreatedAt: (lastAssistant as any)?.createdAt,
     });
     console.info('[AGENT_USAGE]', JSON.stringify({
       customerRef: this.customerReference(customerId), model: CHAT_MODEL,
@@ -2412,9 +2449,15 @@ ${contextString}`;
   }
 
   private async decorateTemplateEmoji(customerId: string, platform: string, reply: string, replyType: EmojiReplyType,
-    userMessage: string, history: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
-    const context = { userMessage, replyType, sentimentScore: scoreSentiment(userMessage).score,
-      previousAssistant: [...history].reverse().find(message => message.role === 'assistant')?.content };
+    userMessage: string, history: { role: 'user' | 'assistant'; content: string; createdAt?: Date | string }[]): Promise<string> {
+    const lastAssistant = [...history].reverse().find(message => message.role === 'assistant');
+    const context = {
+      userMessage,
+      replyType,
+      sentimentScore: scoreSentiment(userMessage).score,
+      previousAssistant: lastAssistant?.content,
+      previousAssistantCreatedAt: lastAssistant?.createdAt,
+    };
     const decorated = templateEmojiReply(reply, replyType, context);
     if (decorated === reply) return reply;
     const result = await enforceEmojiPolicy(customerId, platform, decorated, context);
@@ -2642,10 +2685,15 @@ ${contextString}`;
     history: { role: 'user' | 'assistant'; content: string }[]
   ): boolean {
     const text = userMessage.toLowerCase();
+    const lastAssistant = [...history].reverse().find(m => m.role === 'assistant')?.content || '';
+    const resetPrompted = /clear it and start fresh/i.test(lastAssistant);
+    const clearOrReset = /^(?:(?:please\s+)?clear\s+(?:it|that|this|the\s+draft|the\s+request)|start\s+fresh|start\s+over|reset)[.!]?$/i.test(text.trim())
+      || (resetPrompted && /^(?:yes|clear\s+it|start\s+fresh|please|do\s+that)[.!]?$/i.test(text.trim()));
     const explicitRequest = /^(?:please\s+)?cancel(?:\s+please)?[!. ]*$/.test(text.trim())
       || /\b(?:please\s+)?cancel\s+(?:my|the|this|that|it|booking|appointment|session|shoot)\b/.test(text)
       || /\b(?:i want|i need|i'd like|i would like|can i|could i|may i) to? cancel\b/.test(text)
-      || /\b(?:can|could|would) you cancel\b/.test(text);
+      || /\b(?:can|could|would) you cancel\b/.test(text)
+      || clearOrReset;
     return explicitRequest || (this.hasPendingCancellationSelection(history)
       && this.hasCancellationBookingSelector(userMessage));
   }

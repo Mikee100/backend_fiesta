@@ -31,6 +31,7 @@ export const EMOJI_LEVEL_SETTINGS = {
 export const EMOJI_POLICY = { ...EMOJI_LEVEL_SETTINGS[EMOJI_LEVEL], maximumReplyLength: 4096 } as const;
 export const EMOJI_WHITELIST: readonly string[] = [...new Set([...Object.values(REPLY_EMOJI), '\u{1F389}', '\u{1F49B}'])];
 export const EMOJI_PROMPT_RULE = `Emojis are suggestions only; code enforces whitelist, placement, limits, context and repetition. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings. ${EMOJI_POLICY.modelSuggestions ? `Use warm emojis where appropriate, only from: ${EMOJI_WHITELIST.join(' ')}. Place at sentence ends or line starts in short lists.` : 'Prefer plain text and mirror customer tone.'} Never repeat an emoji from the immediately previous reply. Never decorate money, deposits, invoices, payment failures, cancellations, refunds, escalation, team-confirmation lines or replies to upset customers.`;
+export const EMOJI_REPEAT_WINDOW_MS = 2 * 60 * 60 * 1000;
 const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
 const emojiPattern = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Presentation}|\u20e3/u;
 
@@ -39,6 +40,7 @@ export type EmojiContext = {
   userMessage?: string;
   sentimentScore?: number;
   previousAssistant?: string;
+  previousAssistantCreatedAt?: Date | number | string | null;
   forbidden?: boolean;
   mode?: 'model' | 'template';
   log?: (reason: string) => void;
@@ -75,7 +77,9 @@ export function applyEmojiPolicy(reply: string, context: EmojiContext = {}): str
   const reasons = new Set<string>();
   const forbidden = emojiForbiddenReason(reply, context);
   const maximum = ['welcome', 'closing'].includes(context.replyType || '') ? EMOJI_POLICY.greetingClosingMaximum : EMOJI_POLICY.maximum;
-  const previous = new Set(emojisIn(context.previousAssistant || ''));
+  const isStale = Boolean(context.previousAssistantCreatedAt &&
+    Date.now() - new Date(context.previousAssistantCreatedAt).getTime() >= EMOJI_REPEAT_WINDOW_MS);
+  const previous = !isStale ? new Set(emojisIn(context.previousAssistant || '')) : new Set<string>();
   let kept = 0;
   const used = new Set<string>();
   const result = segments.map(value => {
@@ -144,9 +148,20 @@ export async function enforceEmojiPolicy(customerId: string, platform: string, r
     });
     const latest = await prisma.message.findFirst({
       where: { customerId, platform, direction: 'outbound', ...(session ? { createdAt: { gte: session.startedAt } } : {}) },
-      orderBy: { createdAt: 'desc' }, select: { id: true, content: true },
+      orderBy: { createdAt: 'desc' }, select: { id: true, content: true, createdAt: true },
     });
-    result = applyEmojiPolicy(result, { ...context, previousAssistant: latest?.content || context.previousAssistant });
+    const latestStale = Boolean(latest?.createdAt &&
+      Date.now() - new Date(latest.createdAt).getTime() >= EMOJI_REPEAT_WINDOW_MS);
+    const previousAssistantContent = !latestStale
+      ? (latest?.content || context.previousAssistant)
+      : undefined;
+    const previousAssistantCreatedAt = !latestStale ? (latest?.createdAt || context.previousAssistantCreatedAt) : undefined;
+
+    result = applyEmojiPolicy(result, {
+      ...context,
+      previousAssistant: previousAssistantContent,
+      previousAssistantCreatedAt,
+    });
     if (!emojisIn(result).length) return result;
     const prefix = `system:emoji-last:v1:${encodeURIComponent(session?.sessionId || `thread:${platform}`)}:`;
     await prisma.customerMemory.upsert({ where: { customerId }, update: {}, create: { customerId } });
@@ -155,13 +170,19 @@ export async function enforceEmojiPolicy(customerId: string, platform: string, r
       if (!memory) return suppress('state_unavailable');
       const prior = memory.keyInsights.find(value => value.startsWith(prefix));
       if (prior) {
-        const state = JSON.parse(prior.slice(prefix.length)) as { priorMessageId: string | null; emojis: string[] };
-        if (state.priorMessageId === (latest?.id || null)) {
-          result = applyEmojiPolicy(result, { ...context, previousAssistant: state.emojis.join(' ') });
+        const state = JSON.parse(prior.slice(prefix.length)) as { priorMessageId: string | null; emojis: string[]; timestamp?: number };
+        const stateStale = Boolean(state.timestamp &&
+          Date.now() - state.timestamp >= EMOJI_REPEAT_WINDOW_MS);
+        if (!stateStale && !latestStale && state.priorMessageId === (latest?.id || null)) {
+          result = applyEmojiPolicy(result, {
+            ...context,
+            previousAssistant: state.emojis.join(' '),
+            previousAssistantCreatedAt: latest?.createdAt,
+          });
           if (!emojisIn(result).length) return result;
         }
       }
-      const marker = prefix + JSON.stringify({ priorMessageId: latest?.id || null, emojis: emojisIn(result) });
+      const marker = prefix + JSON.stringify({ priorMessageId: latest?.id || null, emojis: emojisIn(result), timestamp: Date.now() });
       const claimed = await prisma.customerMemory.updateMany({
         where: { customerId, keyInsights: { equals: memory.keyInsights } },
         data: { keyInsights: { set: [...memory.keyInsights.filter(value => !value.startsWith(prefix)), marker] } },
