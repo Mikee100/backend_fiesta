@@ -950,4 +950,24 @@ model PackagePerformance {
   @@index([periodStart])
 }
 
+// ============================================
+// Instagram OAuth connection (Meta App Review + messaging)
+// Access tokens stay server-side; never return them to the frontend.
+// ============================================
+model InstagramConnection {
+  id                 String    @id @default(cuid())
+  instagramAccountId String    @unique
+  username           String
+  accountType        String?
+  accessToken        String
+  tokenExpiresAt     DateTime?
+  connectedAt        DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  isActive           Boolean   @default(true)
+  connectedByUserId  String?
+
+  @@map("instagram_connections")
+  @@index([isActive])
+}
+
 

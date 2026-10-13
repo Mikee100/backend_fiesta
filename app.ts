@@ -6,6 +6,7 @@ import chatRoutes from './src/routes/chat.routes';
 import authRoutes from './src/routes/auth.routes';
 import whatsappRoutes from './src/routes/whatsapp.routes';
 import instagramRoutes from './src/routes/instagram.routes';
+import instagramIntegrationRoutes from './src/routes/instagram-integration.routes';
 import bookingRoutes from './src/routes/booking.routes';
 import { calendarController } from './src/controllers/calendar.controller';
 import { customerController } from './src/controllers/customer.controller';
@@ -152,6 +153,7 @@ app.use('/webhooks/whatsapp', whatsappRoutes);
 app.use('/webhooks/instagram', instagramRoutes);
 app.use('/api/whatsapp', whatsappRoutes); 
 app.use('/api/instagram', instagramRoutes);
+app.use('/api/integrations/instagram', instagramIntegrationRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/conversations', conversationRoutes);
@@ -1050,7 +1052,11 @@ async function startBackend() {
     await checkDatabaseConnection();
   } catch (error) {
     const details = error instanceof DatabaseSchemaOutOfDateError ? error.details : safeSchemaDetails(error);
-    console.error('[STARTUP] FATAL: database readiness failed; listener and automation NOT started.', JSON.stringify(details));
+    const rawCode = error && typeof error === 'object'
+      ? (error as { errorCode?: unknown; code?: unknown }).errorCode ?? (error as { code?: unknown }).code
+      : null;
+    const prismaCode = typeof rawCode === 'string' && /^P\d{4}$/.test(rawCode) ? rawCode : null;
+    console.error('[STARTUP] FATAL: database readiness failed; listener and automation NOT started.', JSON.stringify({ ...details, prismaCode }));
     await prisma.$disconnect().catch(() => {});
     process.exitCode = 1;
     return;

@@ -141,6 +141,7 @@ test('actual startup functions refuse listener and cron before database readines
       assert.equal(calls.includes('embedder'), false);
       assert.equal(calls.includes('disconnect'), true);
       assert.doesNotMatch(log.join('\n'), /unsafe connection string/);
+      if (code === 'P1001') assert.match(log.join('\n'), /"prismaCode":"P1001"/);
     } else {
       assert.deepEqual(calls, ['connect', 'probe', 'listen', 'cron', 'embedder']);
     }
