@@ -198,6 +198,12 @@ test('scoreSentiment: enthusiastic punctuation on a positive message is not puni
   assert.notEqual(sentiment, 'very_negative');
 });
 
+test('scoreSentiment: Swahili frustration terms are flagged', () => {
+  assert.equal(scoreSentiment('Nimechoka kuwaita, hamjibu').sentiment, 'very_negative');
+  assert.equal(scoreSentiment('Mnadanganya, utapeli').sentiment, 'very_negative');
+  assert.equal(scoreSentiment('Sijajibiwa').sentiment, 'negative');
+});
+
 test('circuitBreaker: stays closed below the failure threshold', () => {
   circuitBreaker.recordSuccess(); // reset any state left over from other tests
   assert.equal(circuitBreaker.isOpen(), false);

@@ -35,7 +35,11 @@ export const circuitBreaker = {
   },
 };
 
-const STRONG_NEGATIVE_KEYWORDS = ['scam', 'worst', 'furious', 'unacceptable', 'rip off', 'rip-off', 'fraud'];
+// Swahili frustration terms: "nimechoka" (I'm tired of), "hamjibu/hamnijibu/sijajibiwa"
+// (you don't answer / I'm unanswered), "mnadanganya" (you're deceiving),
+// "utapeli/tapeli" (scam/swindler), "mnanichelewesha" (you're delaying me).
+const STRONG_NEGATIVE_KEYWORDS = ['scam', 'worst', 'furious', 'unacceptable', 'rip off', 'rip-off', 'fraud',
+  'nimechoka', 'hamjibu', 'hamnijibu', 'sijajibiwa', 'mnadanganya', 'utapeli', 'tapeli', 'mnanichelewesha'];
 const NEGATIVE_KEYWORDS = ['terrible', 'angry', 'frustrated', 'frustrating', 'ridiculous', 'refund', 'cancel my', 'never again', 'disappointed', 'horrible', 'waste of time', 'not happy', 'unhappy'];
 const POSITIVE_KEYWORDS = ['thank you', 'thanks', 'love', 'great', 'amazing', 'perfect', 'happy', 'appreciate', 'wonderful', 'excellent', 'awesome', 'beautiful', 'best'];
 

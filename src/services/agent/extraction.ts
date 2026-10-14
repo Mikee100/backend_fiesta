@@ -74,10 +74,29 @@ export function findExplicitDayOfMonth(message: string): number | null {
   return findExplicitDate(message)?.day ?? null;
 }
 
+/**
+ * A customer-named date that cannot exist on the calendar ("30th of February").
+ * Callers answer it with a clarification instead of treating it as a pipeline
+ * failure, so a typo can never count toward the circuit breaker.
+ */
+export class InvalidDateError extends Error {
+  constructor(message = 'That calendar date is invalid. Please choose a valid date.') {
+    super(message);
+    this.name = 'InvalidDateError';
+  }
+}
+
+/** Customer-facing clarification for an {@link InvalidDateError}. */
+export const INVALID_DATE_REPLY = "That date doesn't exist on the calendar. Which date would you like for your session?";
+
 export function resolveCalendarDate(message: string): string | null {
   const iso = message.match(ISO_DATE_PATTERN)?.[1];
   if (iso) {
-    bookingDateFacts(iso);
+    try {
+      bookingDateFacts(iso);
+    } catch {
+      throw new InvalidDateError();
+    }
     return iso;
   }
   const explicit = findExplicitDate(message);
@@ -92,7 +111,7 @@ export function resolveCalendarDate(message: string): string | null {
         : date.add(1, 'year');
     }
     if (date.date() !== explicit.day || (explicit.month !== null && date.month() !== month)) {
-      throw new Error('That calendar date is invalid. Please choose a valid date.');
+      throw new InvalidDateError();
     }
     const resolved = date.format('YYYY-MM-DD');
     bookingDateFacts(resolved);

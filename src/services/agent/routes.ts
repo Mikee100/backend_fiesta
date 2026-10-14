@@ -11,6 +11,7 @@ import {
 } from './resilience.service';
 import { PAYMENT_PROMPT_UNRECORDED, PAYMENT_PROMPT_UNRECORDED_REPLY, BUDGET_HANDOFF_REPLY } from './constants';
 import { resolveVerifiedFact } from './verified-facts';
+import { InvalidDateError, INVALID_DATE_REPLY } from './extraction';
 import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddonListRequest } from './addon-capture';
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { isCustomerNameQuestion, needsUnchangedReassurance, editionInText } from './reply-voice';
@@ -669,6 +670,13 @@ export function createMessageRoutes(
           return content;
         } catch (error: any) {
           if (isMissingColumnError(error)) return this.handleSchemaMismatch(customerId, userMessage, platform, error);
+          if (error instanceof InvalidDateError || error?.name === 'InvalidDateError') {
+            // Defensive: the handleMessage entry guard already answered this
+            // message, so an invalid date can only leak in via a derived
+            // substring. Never count it as a pipeline failure or trip the breaker.
+            console.log('[AGENT_FLOW] Invalid calendar date reached the pipeline; replying with a clarification.');
+            return { reply: INVALID_DATE_REPLY, outcome: { success: true } };
+          }
           console.error('[AGENT_FLOW] Agent reply pipeline failed:', error);
           const rateLimitType = classifyProviderRateLimit(error);
           console.log('[AGENT_FLOW] Failure classification:', JSON.stringify({

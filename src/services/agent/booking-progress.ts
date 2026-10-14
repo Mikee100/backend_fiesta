@@ -158,7 +158,7 @@ async function progressReply(this: any, customerId: string, message: string, his
     const facts = bookingDateFacts(draft.date);
     if (facts.isMonday || facts.isPast) return closedDateReply(facts);
     if (draft.date === nowInBusinessTimezone().format('YYYY-MM-DD') && nowInBusinessTimezone().hour() >= 19) {
-      return closedDateReply({ date: draft.date, isMonday: facts.isMonday, isPast: facts.isPast });
+      return 'The studio is closed for today. Which other date would work for you?';
     }
   }
   const key = Object.keys(SERVICE_DURATIONS).find((value) => draft.service!.toLowerCase().includes(value));
