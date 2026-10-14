@@ -1,0 +1,130 @@
+[
+  {
+    "id": "greeting-hello",
+    "category": "routing",
+    "message": "Hello",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "greeting",
+      "reachesLlm": false,
+      "contains": ["Welcome to Fiesta House"],
+      "notStrategies": ["noMatchingRoute", "circuitBreaker"]
+    }
+  },
+  {
+    "id": "opening-hours",
+    "category": "facts",
+    "message": "What are your opening hours?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "openingHours",
+      "reachesLlm": false,
+      "contains": ["Tuesday to Sunday", "closed on Mondays"]
+    }
+  },
+  {
+    "id": "personal-outfit-policy",
+    "category": "policy",
+    "message": "Can I bring my own outfit for the shoot?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategies": ["personalOutfit", "verifiedFacts"],
+      "reachesLlm": false,
+      "contains": ["outfit"],
+      "notContains": ["Standard package"]
+    }
+  },
+  {
+    "id": "walk-in-policy",
+    "category": "policy",
+    "message": "Do you accept walk ins?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "walkIn",
+      "reachesLlm": false
+    }
+  },
+  {
+    "id": "off-topic-redirect",
+    "category": "safety",
+    "message": "What is the capital of France?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "scopeBoundary",
+      "reachesLlm": false,
+      "contains": ["Fiesta House"]
+    }
+  },
+  {
+    "id": "legacy-package-standard",
+    "category": "policy",
+    "message": "Do you have a standard package?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "legacyPackageName",
+      "reachesLlm": false,
+      "notContains": ["Standard package includes"]
+    }
+  },
+  {
+    "id": "family-styling-team-confirm",
+    "category": "policy",
+    "message": "Do you dress my husband for the session?",
+    "platform": "whatsapp",
+    "expect": {
+      "strategy": "familyStyling",
+      "reachesLlm": false,
+      "contains": ["team will confirm"]
+    }
+  },
+  {
+    "id": "whatsapp-booking-intent",
+    "category": "routing",
+    "message": "I want to book a maternity photoshoot",
+    "platform": "whatsapp",
+    "expect": {
+      "reachesLlm": true
+    }
+  },
+  {
+    "id": "ig-booking-redirect",
+    "category": "channel-policy",
+    "message": "I want to book a session for next week",
+    "platform": "instagram",
+    "expect": {
+      "reachesLlm": true,
+      "notStrategies": ["slotCapture", "cancellationDraft"]
+    }
+  },
+  {
+    "id": "ig-booking-redirect-live",
+    "category": "channel-policy",
+    "message": "I want to book a session for next week",
+    "platform": "instagram",
+    "modes": ["live"],
+    "expect": {
+      "reachesLlm": true,
+      "forbidMatches": ["EVAL_OFFLINE_LLM_MARKER"]
+    }
+  },
+  {
+    "id": "swahli-booking-intent",
+    "category": "routing",
+    "message": "niko interested kubook session",
+    "platform": "whatsapp",
+    "expect": {
+      "reachesLlm": true
+    }
+  },
+  {
+    "id": "circuit-breaker-fallback",
+    "category": "resilience",
+    "message": "Hello",
+    "platform": "whatsapp",
+    "setup": "tripCircuitBreaker",
+    "expect": {
+      "strategy": "circuitBreaker",
+      "reachesLlm": false
+    }
+  }
+]

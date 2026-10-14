@@ -117,8 +117,10 @@ test('a successful deterministic reply records the same metric and learning fiel
   await settle();
 
   assert.equal(metrics.length, 1);
-  assert.deepEqual(Object.keys(metrics[0]).sort(), ['customerId', 'latencyMs', 'platform', 'success']);
+  assert.deepEqual(Object.keys(metrics[0]).sort(), ['customerId', 'latencyMs', 'platform', 'strategyUsed', 'success']);
   assert.equal(metrics[0].success, true);
+  assert.equal(typeof metrics[0].strategyUsed, 'string');
+  assert.ok(metrics[0].strategyUsed.length > 0, 'every reply must record the layer that produced it');
   assert.equal(typeof metrics[0].latencyMs, 'number');
   assert.deepEqual(
     { ...learnings[0], latencyMs: 0 },

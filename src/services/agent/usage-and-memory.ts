@@ -56,6 +56,7 @@ export async function escalate(customerId: string, escalationType: string, descr
 export async function logAiJobMetric(data: {
   customerId: string; platform: string; success: boolean; latencyMs: number;
   failureReason?: string; isFallback?: boolean; circuitBreakerTrip?: boolean; circuitBreakerReason?: string;
+  strategyUsed?: string;
 }): Promise<void> {
   try {
     await prisma.aiJobMetric.create({ data });

@@ -172,6 +172,8 @@ type ReplyContext = {
   platform: string;
   startedAt: number;
   escalatedThisTurn?: boolean;
+  /** Layer that produced the reply (route name or guard id); persisted as AiJobMetric.strategyUsed. */
+  strategyUsed?: string;
 };
 
 type ReplyOutcome = {
@@ -223,6 +225,7 @@ export class AgentService {
       platform: ctx.platform,
       success,
       latencyMs,
+      ...(ctx.strategyUsed ? { strategyUsed: ctx.strategyUsed } : {}),
       ...(isFallback ? { isFallback } : {}),
       ...failureDetails,
     }));
@@ -2335,6 +2338,7 @@ ${contextString}`;
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
     this.activeTurnContext = ctx;
     if (String(process.env.AI_AUTOMATION_ENABLED || 'true').trim().toLowerCase() === 'false') {
+      ctx.strategyUsed = 'automationDisabled';
       await this.escalate(customerId, 'automation_disabled', `Outbound AI automation is disabled (AI_AUTOMATION_ENABLED=false). Customer message: "${userMessage.slice(0, 300)}"`);
       return this.respond(ctx, 'The studio team will help you shortly on 0720 111928.', {
         success: false, isFallback: true, failureReason: 'automation_disabled',
@@ -2347,14 +2351,19 @@ ${contextString}`;
     } catch (error) {
       if (!isMissingColumnError(error)) throw error;
       const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+      ctx.strategyUsed = 'schemaMismatch';
       return this.respond(ctx, failure.reply, failure.outcome);
     }
-    if (cancellationDraftReply) return this.respond(ctx, cancellationDraftReply);
+    if (cancellationDraftReply) {
+      ctx.strategyUsed = 'cancellationDraft';
+      return this.respond(ctx, cancellationDraftReply);
+    }
     const routes = this.createMessageRoutes(customerId, userMessage, history, platform, startedAt);
     const scopeBoundaryRoute = routes.find(candidate => candidate.name === 'scopeBoundary');
     if (scopeBoundaryRoute?.when()) {
       console.log(`[AGENT_FLOW] route=${scopeBoundaryRoute.name}`);
       const scopeResult = await scopeBoundaryRoute.handle() as string;
+      ctx.strategyUsed = scopeBoundaryRoute.name;
       return this.respond(ctx, scopeResult);
     }
 
@@ -2369,6 +2378,7 @@ ${contextString}`;
 
     if (circuitBreaker.isOpen()) {
       console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
+      ctx.strategyUsed = 'circuitBreaker';
       if (shouldNotifyOutage()) {
         await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
       }
@@ -2390,13 +2400,21 @@ ${contextString}`;
       console.log(`[AGENT_FLOW] route=${route.name}`);
       try {
         const result = await route.handle();
-        if (typeof result === 'string') return this.respond(ctx, result);
-        if (result) return this.respond(ctx, result.reply, result.outcome);
+        if (typeof result === 'string') {
+          ctx.strategyUsed = route.name;
+          return this.respond(ctx, result);
+        }
+        if (result) {
+          ctx.strategyUsed = route.name;
+          return this.respond(ctx, result.reply, result.outcome);
+        }
       } catch (error) {
         if (isMissingColumnError(error)) {
           const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+          ctx.strategyUsed = 'schemaMismatch';
           return this.respond(ctx, failure.reply, failure.outcome);
         }
+        ctx.strategyUsed = route.name;
         return this.respond(ctx, 'I could not prepare that change, so your session is unchanged. The studio team can help on 0720 111928.',
           { success: false, isFallback: true, failureReason: 'reschedule_entry_failed' });
       }
@@ -2409,21 +2427,30 @@ ${contextString}`;
       && !this.shouldUsePreviousAddonReply(userMessage, history)) {
       try {
         const slotReply = await this.rememberBookingSlots(customerId, userMessage, history);
-        if (slotReply) return this.respond(ctx, slotReply);
+        if (slotReply) {
+          ctx.strategyUsed = 'slotCapture';
+          return this.respond(ctx, slotReply);
+        }
       } catch (error) {
         if (isMissingColumnError(error)) {
           const failure = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+          ctx.strategyUsed = 'schemaMismatch';
           return this.respond(ctx, failure.reply, failure.outcome);
         }
         console.warn('[AGENT_FLOW] Early booking slot persistence failed; requesting team assistance.');
         await this.escalate(customerId, 'booking', 'Early booking details could not be saved. Review the customer message before continuing.');
+        ctx.strategyUsed = 'slotCaptureError';
         return this.respond(ctx, 'The studio team will help save those details and continue your booking.', {
           success: false, isFallback: true, failureReason: 'slot_persistence_failed',
         });
       }
     }
 
-    for (const route of routes.slice(1)) {
+    // Evaluate routes by name, not array position: the scopeBoundary route is
+    // already handled above, and positional slicing silently drops whatever now
+    // sits at index 0 (familyStyling was there and never ran).
+    for (const route of routes) {
+      if (route.name === 'scopeBoundary') continue;
       if (route.beforeSlotCapture) continue;
       if (route.replyMode === 'natural' && naturalAssistantMode) continue;
       if (!route.when()) continue;
@@ -2434,8 +2461,10 @@ ${contextString}`;
       } catch (error) {
         if (!isMissingColumnError(error)) throw error;
         result = await this.handleSchemaMismatch(customerId, userMessage, platform, error);
+        ctx.strategyUsed = 'schemaMismatch';
       }
       if (result === null) continue;
+      if (ctx.strategyUsed !== 'schemaMismatch') ctx.strategyUsed = route.name;
       if (typeof result === 'string') {
         const types: Record<string, EmojiReplyType> = { greeting: 'welcome', packageSelection: 'packageChosen', postActionAcknowledgement: 'closing' };
         const type = types[route.name] || (route.name !== 'runAgent' ? emojiReplyType(result) : 'other');
@@ -2445,6 +2474,7 @@ ${contextString}`;
       return this.respond(ctx, result.reply, result.outcome);
     }
 
+    ctx.strategyUsed = 'noMatchingRoute';
     return this.respond(ctx, FALLBACK_MESSAGE, { success: false, isFallback: true, failureReason: 'no_matching_route' });
   }
 
@@ -3052,6 +3082,7 @@ ${contextString}`;
   private async logAiJobMetric(data: {
     customerId: string; platform: string; success: boolean; latencyMs: number;
     failureReason?: string; isFallback?: boolean; circuitBreakerTrip?: boolean; circuitBreakerReason?: string;
+    strategyUsed?: string;
   }): Promise<void> {
     return recordAiJobMetric(data);
   }
