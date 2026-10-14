@@ -518,10 +518,23 @@ export class AgentService {
     return isBusinessIdentityQuestion(userMessage) ? buildBusinessIntroductionReply() : buildAboutBusinessReply();
   }
 
+
+  /**
+   * True when the drafted slot has already started.
+   * Date-only drafts are treated as past only on earlier days.
+   */
+  private isDraftSlotPast(draft: { date?: string | null; time?: string | null }): boolean {
+    if (!draft.date) return false;
+    if (bookingDateFacts(draft.date).isPast) return true;
+    if (!draft.time) return false;
+    const now = nowInBusinessTimezone();
+    return draft.date === now.format('YYYY-MM-DD') && draft.time <= now.format('HH:mm');
+  }
+
   private async getGreetingReply(customerId: string, history: Array<{ role: string; content: string }> = []): Promise<string | null> {
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (draft?.step === 'payment_pending') {
-      if (draft.date && bookingDateFacts(draft.date).isPast) {
+      if (this.isDraftSlotPast(draft)) {
         await prisma.bookingDraft.deleteMany({ where: { id: draft.id, step: 'payment_pending' } });
       } else {
         const reminderCount = history.filter(
@@ -551,7 +564,7 @@ export class AgentService {
     }
     // A profile name alone is not booking progress.
     if (draft && !earlySlotsExpired(draft) && (draft.service || draft.date || draft.time)) {
-      if (draft.date && bookingDateFacts(draft.date).isPast) {
+      if (this.isDraftSlotPast(draft)) {
         await prisma.bookingDraft.updateMany({
           where: { id: draft.id, step: draft.step },
           data: { date: null, time: null, dateTimeIso: null },
@@ -2556,6 +2569,19 @@ ${contextString}`;
       ?? storeEarlySlots(customerId, userMessage, history);
   }
 
+
+  /**
+   * Carry-over only: a stale draft for today is lapsed unless its time is still ahead.
+   * Date-only drafts are treated as lapsed because the customer has already moved on.
+   */
+  private isLapsedCarryOver(draft: { date?: string | null; time?: string | null }): boolean {
+    if (!draft.date) return false;
+    if (bookingDateFacts(draft.date).isPast) return true;
+    const now = nowInBusinessTimezone();
+    if (draft.date !== now.format('YYYY-MM-DD')) return false;
+    return draft.time ? draft.time <= now.format('HH:mm') : true;
+  }
+
   /** On a booking turn, a draft untouched for over two hours is confirmed instead of being presented as current. */
   private async getCarryOverConfirmation(customerId: string, userMessage: string,
     history: { role: 'user' | 'assistant'; content: string }[]): Promise<string | null> {
@@ -2566,7 +2592,7 @@ ${contextString}`;
       || /\b(?:cancel\w*|reschedul\w*|invoice|receipt|pay\w*|deposit|m-?pesa|refund\w*)\b/i.test(userMessage)) return null;
     const draft = await prisma.bookingDraft.findUnique({ where: { customerId } });
     if (!draft || draft.isForSomeoneElse || !carriedOverStale(draft)) return null;
-    const pastDate = Boolean(draft.date && bookingDateFacts(draft.date).isPast);
+    const pastDate = this.isLapsedCarryOver(draft);
     const question = carryOverQuestion(pastDate ? { ...draft, date: null, time: null } : draft, stated);
     if (!question && !pastDate) return null;
     // Marks the draft as touched (updatedAt), so the customer's answer next turn uses it.

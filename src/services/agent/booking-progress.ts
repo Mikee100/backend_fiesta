@@ -1,7 +1,7 @@
 import prisma from '../../config/prisma';
 import { ADDON_CATALOG, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
 import { bookingService } from '../booking/booking.service';
-import { bookingDateFacts, formatCustomerDate } from '../../utils/time';
+import { bookingDateFacts, formatCustomerDate, nowInBusinessTimezone } from '../../utils/time';
 import { EARLY_SLOT_STEP, alternativeDates, carriedOverStale, closedDateReply, earlySlotsExpired, extractStatedSlots, isUsableName } from './slot-memory';
 import { buildBookingProposalConfirmation, formatCustomerTime } from './replies';
 import { editionInText } from './reply-voice';
@@ -157,6 +157,9 @@ async function progressReply(this: any, customerId: string, message: string, his
   if (draft.date) {
     const facts = bookingDateFacts(draft.date);
     if (facts.isMonday || facts.isPast) return closedDateReply(facts);
+    if (draft.date === nowInBusinessTimezone().format('YYYY-MM-DD') && nowInBusinessTimezone().hour() >= 19) {
+      return closedDateReply({ date: draft.date, isMonday: facts.isMonday, isPast: facts.isPast });
+    }
   }
   const key = Object.keys(SERVICE_DURATIONS).find((value) => draft.service!.toLowerCase().includes(value));
   if (!key) return 'The team will confirm that edition before we continue.';
