@@ -163,6 +163,142 @@ export class AnalyticsController {
   }
 
   /**
+   * AI observability rollup: latency percentiles, strategy mix, fallback and
+   * circuit-breaker usage, escalations by type, and a daily series.
+   * Backs the single "AI Observability" view proposed in
+   * docs/GAPS_AND_STRATEGIC_OPPORTUNITIES.md §1 (Tier 1 + strategy hit rates).
+   */
+  async getObservability(req: Request, res: Response) {
+    try {
+      const daysRaw = Number(req.query.days || 7);
+      const days = Number.isInteger(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 90) : 7;
+      // Inclusive window: (days - 1) days ago at midnight through today.
+      const since = dayjs().subtract(days - 1, 'day').startOf('day').toDate();
+
+      const [jobMetrics, escalationRows] = await Promise.all([
+        prisma.aiJobMetric.findMany({
+          where: { createdAt: { gte: since } },
+          select: {
+            createdAt: true, latencyMs: true, success: true, isFallback: true,
+            strategyUsed: true, circuitBreakerTrip: true, platform: true,
+          },
+        }),
+        prisma.escalation.findMany({
+          where: { createdAt: { gte: since } },
+          select: { escalationType: true, status: true },
+        }),
+      ]);
+
+      const latencies = jobMetrics
+        .map((row) => row.latencyMs)
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+        .sort((a, b) => a - b);
+      const percentile = (fraction: number): number =>
+        latencies.length > 0 ? latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * fraction))] : 0;
+      const average = latencies.length > 0
+        ? Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)
+        : 0;
+
+      const totalJobs = jobMetrics.length;
+      const failures = jobMetrics.filter((row) => !row.success).length;
+      const fallbacks = jobMetrics.filter((row) => row.isFallback).length;
+      const breakerTrips = jobMetrics.filter((row) => row.circuitBreakerTrip).length;
+      const percentage = (value: number): number =>
+        totalJobs > 0 ? Math.round((value / totalJobs) * 10000) / 100 : 0;
+
+      const strategyAccumulator = new Map<string, { count: number; failures: number; fallbacks: number }>();
+      const platformAccumulator = new Map<string, { count: number; fallbacks: number; latencyTotal: number; latencySamples: number }>();
+      const dailyAccumulator = new Map<string, { jobs: number; failures: number; fallbacks: number }>();
+      for (let index = 0; index < days; index++) {
+        dailyAccumulator.set(dayjs(since).add(index, 'day').format('YYYY-MM-DD'), { jobs: 0, failures: 0, fallbacks: 0 });
+      }
+
+      for (const row of jobMetrics) {
+        const strategy = row.strategyUsed || 'untracked';
+        const strategyRow = strategyAccumulator.get(strategy) || { count: 0, failures: 0, fallbacks: 0 };
+        strategyRow.count++;
+        if (!row.success) strategyRow.failures++;
+        if (row.isFallback) strategyRow.fallbacks++;
+        strategyAccumulator.set(strategy, strategyRow);
+
+        const platform = row.platform || 'unknown';
+        const platformRow = platformAccumulator.get(platform) || { count: 0, fallbacks: 0, latencyTotal: 0, latencySamples: 0 };
+        platformRow.count++;
+        if (row.isFallback) platformRow.fallbacks++;
+        if (typeof row.latencyMs === 'number' && Number.isFinite(row.latencyMs)) {
+          platformRow.latencyTotal += row.latencyMs;
+          platformRow.latencySamples++;
+        }
+        platformAccumulator.set(platform, platformRow);
+
+        const day = dailyAccumulator.get(dayjs(row.createdAt).format('YYYY-MM-DD'));
+        if (day) {
+          day.jobs++;
+          if (!row.success) day.failures++;
+          if (row.isFallback) day.fallbacks++;
+        }
+      }
+
+      const strategyMix = Array.from(strategyAccumulator.entries())
+        .map(([strategy, data]) => ({
+          strategy,
+          count: data.count,
+          sharePct: percentage(data.count),
+          failures: data.failures,
+          fallbacks: data.fallbacks,
+        }))
+        .sort((a, b) => b.count - a.count);
+
+      const byPlatform = Array.from(platformAccumulator.entries())
+        .map(([platform, data]) => ({
+          platform,
+          jobs: data.count,
+          fallbacks: data.fallbacks,
+          fallbackPct: data.count > 0 ? Math.round((data.fallbacks / data.count) * 10000) / 100 : 0,
+          avgLatencyMs: data.latencySamples > 0 ? Math.round(data.latencyTotal / data.latencySamples) : 0,
+        }))
+        .sort((a, b) => b.jobs - a.jobs);
+
+      const escalationAccumulator = new Map<string, number>();
+      for (const row of escalationRows) {
+        const type = row.escalationType || 'unknown';
+        escalationAccumulator.set(type, (escalationAccumulator.get(type) || 0) + 1);
+      }
+
+      return res.json({
+        window: { days, since: since.toISOString() },
+        jobs: {
+          total: totalJobs,
+          failures,
+          fallbacks,
+          breakerTrips,
+          successRatePct: percentage(totalJobs - failures),
+          fallbackRatePct: percentage(fallbacks),
+        },
+        latency: {
+          avgMs: average,
+          p50Ms: percentile(0.5),
+          p95Ms: percentile(0.95),
+          maxMs: latencies.length > 0 ? latencies[latencies.length - 1] : 0,
+          sampleSize: latencies.length,
+        },
+        strategyMix,
+        byPlatform,
+        escalations: {
+          total: escalationRows.length,
+          open: escalationRows.filter((row) => row.status === 'OPEN').length,
+          byType: Array.from(escalationAccumulator.entries())
+            .map(([type, count]) => ({ type, count }))
+            .sort((a, b) => b.count - a.count),
+        },
+        daily: Array.from(dailyAccumulator.entries()).map(([date, data]) => ({ date, ...data })),
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: 'Unable to load observability metrics' });
+    }
+  }
+
+  /**
    * Get personalization effectiveness metrics from learning data
    */
   async getPersonalizedResponses(req: Request, res: Response) {

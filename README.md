@@ -264,6 +264,8 @@ References:
 ### What is tracked
 - Per-turn AI execution metrics in `AiJobMetric`:
    - `success`, `isFallback`, `failureReason`, `latencyMs`, breaker signals.
+   - `strategyUsed` — the layer that produced the reply (route name, `runAgent`,
+     `circuitBreaker`, `slotCapture`, …), written at every `handleMessage` exit.
 - Heuristic sentiment per inbound turn in `SentimentScore`.
 - Customer profile/memory updates in `CustomerMemory`.
 
@@ -274,9 +276,16 @@ References:
    - success rate
    - fallback rate
    - intent-level rollups (from `ConversationLearning`)
+- Observability rollup endpoint `GET /api/statistics/observability?days=7`:
+   - totals, failure/fallback/breaker-trip counts and rates
+   - latency avg / p50 / p95 / max
+   - **strategy mix** (hit rates per route/layer), by-platform rollup
+   - escalations by type, daily series
 - Conversation learning inspector endpoint:
    - `GET /api/analytics/conversation-learning/recent?limit=50`
    - returns most recent learning rows for quick data-quality checks.
+
+Full reference: [docs/OBSERVABILITY_AND_EVALS.md](docs/OBSERVABILITY_AND_EVALS.md).
 
 Reference:
 - [backend 2.0/src/controllers/analytics.controller.ts](src/controllers/analytics.controller.ts)
@@ -652,7 +661,22 @@ It executes Node's built-in test runner with TypeScript support. Current coverag
 - time-only reschedule detection and time parsing;
 - prevention of stale past-appointment menus;
 - prevention of stale-draft confirmation after a question requesting more details;
-- Nairobi timezone conversion and business-day boundaries.
+- Nairobi timezone conversion and business-day boundaries;
+- observability rollups (latency percentiles, strategy mix, escalations);
+- golden-eval harness validation and offline end-to-end routing checks.
+
+### Golden evals (prompt/model/routing regression suite)
+
+```bash
+npm run evals          # offline: hermetic, free, exit code 1 on failure
+npm run evals:live     # real providers + RAG; requires GROQ_API_KEY
+```
+
+The golden set lives in `evals/golden-conversations.json`. Run the offline
+suite before and after any prompt, model, routing or catalog change, then
+`evals:live` before shipping. See
+[docs/OBSERVABILITY_AND_EVALS.md](docs/OBSERVABILITY_AND_EVALS.md) for the case
+format and workflow.
 
 When changing a conversation flow, add a regression test for the exact customer wording that exposed the issue. For database-mutating flows, add integration coverage using a disposable test database before making payment or calendar behavior changes.
 
