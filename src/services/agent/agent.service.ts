@@ -8,7 +8,7 @@ import {
   isToolNameValidationError as isMalformedToolNameError,
   normalizeToolName as normalizeGuardedToolName,
 } from './llm/tool-guard';
-import { addUsage, BookingExtractor, findExplicitDate, findExplicitDayOfMonth, resolveCalendarDate, usageFromCompletion, type TokenUsage } from './extraction';
+import { addUsage, BookingExtractor, findExplicitDate, findExplicitDayOfMonth, InvalidDateError, INVALID_DATE_REPLY, resolveCalendarDate, usageFromCompletion, type TokenUsage } from './extraction';
 export { BookingExtractor } from './extraction';
 import {
   CANCELLATION_PROPOSAL_TTL_MS,
@@ -2356,6 +2356,16 @@ ${contextString}`;
       return this.respond(ctx, 'The studio team will help you shortly on 0720 111928.', {
         success: false, isFallback: true, failureReason: 'automation_disabled',
       });
+    }
+    // A customer-named date that cannot exist ("30th of February") is a
+    // clarification, not a pipeline failure: answer it before any routing so no
+    // downstream resolveCalendarDate call can throw for this message.
+    try {
+      resolveCalendarDate(userMessage);
+    } catch (error) {
+      if (!(error instanceof InvalidDateError)) throw error;
+      ctx.strategyUsed = 'invalidDate';
+      return this.respond(ctx, INVALID_DATE_REPLY);
     }
     const naturalAssistantMode = this.isNaturalAssistantModeEnabled();
     let cancellationDraftReply: string | null;

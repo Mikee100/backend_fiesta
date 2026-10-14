@@ -12,7 +12,7 @@ import { mpesaService } from '../payment/mpesa.service';
 import { bookingDateFacts, nextWeekRange, nowInBusinessTimezone } from '../../utils/time';
 import { getBookingPolicyWindow, RESCHEDULE_FORFEITURE_WINDOW_HOURS } from '../../utils/booking-policy';
 import { AgentService, BookingExtractor } from './agent.service';
-import { resolveCalendarDate } from './extraction';
+import { InvalidDateError, INVALID_DATE_REPLY, resolveCalendarDate } from './extraction';
 import { EARLY_SLOT_STEP, SLOT_MEMORY_WINDOW_MS, earlySlotsExpired, extractStatedSlots, isUsableName, rememberBookingSlots, knownSlotsLine, sanitizeSlotValue } from './slot-memory';
 import { bookingAddonService } from '../booking/booking-addon.service';
 import { googleCalendarService } from '../calendar/calendar.service';
@@ -3145,222 +3145,136 @@ test('post-shoot questions are excluded from upcoming appointment details', () =
   assert.equal(agent.shouldUseUpcomingAppointmentDetailsReply('Tell me more about my upcoming session'), true);
 });
 
+test('progress reply after closing time says the studio is closed, not fully booked', async (context) => {
+  // 19:30 Nairobi on the draft's date: no slots remain because the studio is closed.
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T16:30:00Z').getTime() });
+  const originals = {
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    slots: bookingService.getAvailableSlots,
+  };
+  const draft: any = { id: 'closed-today-draft', step: 'collecting_slots', name: null, service: 'THE BLOOM',
+    date: '2026-10-14', time: '10:00', isForSomeoneElse: false,
+    createdAt: new Date(), updatedAt: new Date() };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (bookingService.getAvailableSlots as any) = async () => [];
+  try {
+    const instance = new AgentService() as any;
+    const reply = await instance.getBookingProgressReply('cust-closed-today', 'Yes', []);
+    assert.match(reply, /studio is closed for today/);
+    assert.doesNotMatch(reply, /fully booked/);
+  } finally {
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    bookingService.getAvailableSlots = originals.slots;
+  }
+});
+
+
+test('fresh same-day date-only draft carries over silently: no prompt, date kept', async (context) => {
+  // Pinned to 2026-10-14 14:38 Nairobi; the draft was touched 1h08m ago (under the 2h staleness window).
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T11:38:00Z').getTime() });
+  const originals = {
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    draftUpdateMany: prisma.bookingDraft.updateMany,
+    customerFindUnique: prisma.customer.findUnique,
+  };
+  const draft: any = { id: 'fresh-draft', step: 'collecting_slots', name: null, service: 'THE BLOOM',
+    date: '2026-10-14', time: null, version: 1,
+    createdAt: new Date('2026-10-14T10:30:00Z'), updatedAt: new Date('2026-10-14T10:30:00Z') };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.updateMany as any) = async ({ data }: any) => { Object.assign(draft, data); return { count: 1 }; };
+  (prisma.customer.findUnique as any) = async () => ({ id: 'cust-fresh', name: 'WhatsApp User' });
+  try {
+    const instance = withQuietAgent({ rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots });
+    const reply = await instance.handleMessage('cust-fresh', 'Hey', [], 'whatsapp');
+    assert.doesNotMatch(reply, /Last time you were looking at/, 'a fresh draft must not prompt carry-over confirmation');
+    assert.equal(draft.date, '2026-10-14', 'the date is kept');
+    assert.equal(draft.service, 'THE BLOOM', 'the edition is kept');
+  } finally {
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
+    prisma.customer.findUnique = originals.customerFindUnique;
+  }
+});
+
+
+test('stale draft for tomorrow still gets the carry-over prompt, date included', async (context) => {
+  // Pinned to 2026-10-14 14:38 Nairobi; the draft was last touched at 11:00 Nairobi (>2h ago).
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T11:38:00Z').getTime() });
+  const originals = {
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    draftUpdateMany: prisma.bookingDraft.updateMany,
+    customerFindUnique: prisma.customer.findUnique,
+    bookingFindFirst: prisma.booking.findFirst,
+  };
+  const draft: any = { id: 'tomorrow-draft', step: 'collecting_slots', name: null, service: null,
+    date: '2026-10-15', time: null, version: 1,
+    createdAt: new Date('2026-10-14T06:00:00Z'), updatedAt: new Date('2026-10-14T08:00:00Z') };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.updateMany as any) = async ({ data }: any) => { Object.assign(draft, data); return { count: 1 }; };
+  (prisma.customer.findUnique as any) = async () => null;
+  (prisma.booking.findFirst as any) = async () => null;
+  try {
+    const instance = withQuietAgent({ rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots });
+    const reply = await instance.handleMessage('cust-stale-tomorrow', 'Hey', [], 'whatsapp');
+    assert.match(reply, /Last time you were looking at/);
+    assert.match(reply, /15 October/);
+    assert.match(reply, /keep that/);
+    assert.equal(draft.date, '2026-10-15', 'a future date is not lapsed');
+  } finally {
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
+    prisma.customer.findUnique = originals.customerFindUnique;
+    prisma.booking.findFirst = originals.bookingFindFirst;
+  }
+});
+
+
+test('stale same-day date-only draft: no "keep that" prompt and the dead date is cleared', async (context) => {
+  // Pinned to 2026-10-14 14:38 Nairobi; the draft was last touched at 11:00 Nairobi (>2h ago).
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T11:38:00Z').getTime() });
+  const originals = {
+    draftFindUnique: prisma.bookingDraft.findUnique,
+    draftUpdateMany: prisma.bookingDraft.updateMany,
+    customerFindUnique: prisma.customer.findUnique,
+    bookingFindFirst: prisma.booking.findFirst,
+  };
+  const draft: any = { id: 'lapsed-draft', step: 'collecting_slots', name: null, service: null,
+    date: '2026-10-14', time: null, version: 1,
+    createdAt: new Date('2026-10-14T06:00:00Z'), updatedAt: new Date('2026-10-14T08:00:00Z') };
+  (prisma.bookingDraft.findUnique as any) = async () => draft;
+  (prisma.bookingDraft.updateMany as any) = async ({ data }: any) => { Object.assign(draft, data); return { count: 1 }; };
+  (prisma.customer.findUnique as any) = async () => null;
+  (prisma.booking.findFirst as any) = async () => null;
+  try {
+    const instance = withQuietAgent({ rememberBookingSlots: (AgentService.prototype as any).rememberBookingSlots });
+    const reply = await instance.handleMessage('cust-lapsed-today', 'Hey', [], 'whatsapp');
+    assert.doesNotMatch(reply, /keep that/i, 'a lapsed same-day slot must not be offered back');
+    assert.doesNotMatch(reply, /14 October/);
+    assert.equal(draft.date, null, 'the dead date is cleared');
+    assert.equal(draft.time, null, 'the dead time is cleared');
+  } finally {
+    prisma.bookingDraft.findUnique = originals.draftFindUnique;
+    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
+    prisma.customer.findUnique = originals.customerFindUnique;
+    prisma.booking.findFirst = originals.bookingFindFirst;
+  }
+});
+
+test('an impossible calendar date is answered, not thrown, and never counts as a failure', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-14T11:38:00Z').getTime() });
+  for (const message of ['Book me for the 30th of February', 'the 31st of February', 'for 2026-02-30']) {
+    assert.throws(() => resolveCalendarDate(message),
+      (error: any) => error instanceof InvalidDateError && error.name === 'InvalidDateError', message);
+  }
+  const instance = withQuietAgent({});
+  const reply = await instance.handleMessage('cust-impossible-date', 'Book me for the 30th of February', [], 'whatsapp');
+  assert.equal(reply, INVALID_DATE_REPLY);
+  assert.doesNotMatch(reply, /could not process/);
+});
+
 // Extra #4: accurate immediate-confirmation failure text
 test('a failed immediate confirmation gives a generic reply, not a reschedule-specific one', async () => {
   const instance = withQuietAgent({
-
-test('progress reply: closed-time today gives closed reply instead of fully booked', async (context) => {
-  // Freeze clock to 2026-10-14 19:30 Nairobi
-  const frozenNow = new Date('2026-10-14T16:30:00Z').getTime();
-  context.mock.timers.enable({ apis: ['Date'], now: frozenNow });
-
-  const originals = {
-    draftFindUnique: prisma.bookingDraft.findUnique,
-    draftUpdateMany: prisma.bookingDraft.updateMany,
-    serviceBookingFind: (prisma.bookingService as any),
-  };
-  let draft: any = {
-    id: 'closed-today-draft',
-    step: 'collecting_slots',
-    service: 'THE BLOOM',
-    date: '2026-10-14',
-    time: '10:00',
-    createdAt: new Date(),
-  };
-  (prisma.bookingDraft.findUnique as any) = async () => draft;
-  (prisma.bookingDraft.updateMany as any) = async () => ({ count: 1 });
-  const originalSlots = (prisma.bookingService as any).getAvailableSlots;
-  (prisma.bookingService as any).getAvailableSlots = async () => [];
-
-  const instance = new AgentService() as any;
-  const result = await instance.progressReply('cust-closed-today', 'Hey', [], false, false, false);
-
-  assert.match(result, /closed|14 October/);
-  assert.doesNotMatch(result, /fully booked/);
-
-  (prisma.bookingService as any).getAvailableSlots = originalSlots;
-  prisma.bookingDraft.findUnique = originals.draftFindUnique;
-  prisma.bookingDraft.updateMany = originals.draftUpdateMany;
-  prisma.bookingService = originals.serviceBookingFind;
-});
-
-
-test('lapsed carry-over: fresh date-only draft for today still carries over', async (context) => {
-  // Freeze clock to 2026-10-14 14:38 Nairobi
-  const frozenNow = new Date('2026-10-14T11:38:00Z').getTime();
-  context.mock.timers.enable({ apis: ['Date'], now: frozenNow });
-
-  const originals = {
-    draftFindUnique: prisma.bookingDraft.findUnique,
-    draftUpdateMany: prisma.bookingDraft.updateMany,
-    bookingFindFirst: prisma.booking.findFirst,
-    customerMemoryFindUnique: prisma.customerMemory.findUnique,
-    unifiedConvFindFirst: prisma.unifiedConversation.findFirst,
-    messageFindFirst: prisma.message.findFirst,
-  };
-  let updated = false;
-  let draft: any = {
-    id: 'fresh-draft',
-    customerId: 'cust-fresh',
-    service: 'THE BLOOM',
-    date: '2026-10-14',
-    time: null,
-    step: 'collecting_slots',
-    version: 1,
-    updatedAt: new Date('2026-10-14T13:00:00Z'),
-    createdAt: new Date('2026-10-14T12:00:00Z'),
-  };
-  (prisma.bookingDraft.findUnique as any) = async () => draft;
-  (prisma.bookingDraft.updateMany as any) = async ({ where, data }: any) => {
-    if (where.id === draft.id) { Object.assign(draft, data); updated = true; }
-    return { count: 1 };
-  };
-  (prisma.booking.findFirst as any) = async () => null;
-  (prisma.customerMemory.findUnique as any) = async () => null;
-  (prisma.unifiedConversation.findFirst as any) = async () => null;
-  (prisma.message.findFirst as any) = async () => null;
-
-  const agent = new AgentService() as any;
-  agent.trackSentiment = async () => {};
-  agent.logConversationLearning = async () => {};
-  agent.touchCustomerMemory = async () => {};
-
-  try {
-    const reply = await agent.handleMessage('cust-fresh', 'Hey', [], 'whatsapp');
-    assert.equal(updated, true, 'Draft should be marked as touched');
-    assert.doesNotMatch(reply, /keep that|continue with that/);
-    assert.match(reply, /What date would suit you\?/);
-  } finally {
-    prisma.bookingDraft.findUnique = originals.draftFindUnique;
-    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
-    prisma.booking.findFirst = originals.bookingFindFirst;
-    prisma.customerMemory.findUnique = originals.customerMemoryFindUnique;
-    prisma.unifiedConversation.findFirst = originals.unifiedConvFindFirst;
-    prisma.message.findFirst = originals.messageFindFirst;
-  }
-});
-
-
-test('lapsed carry-over: stale draft for tomorrow still prompts as carry-over', async (context) => {
-  // Freeze clock to 2026-10-14 14:38 Nairobi
-  const frozenNow = new Date('2026-10-14T11:38:00Z').getTime();
-  context.mock.timers.enable({ apis: ['Date'], now: frozenNow });
-
-  const originals = {
-    draftFindUnique: prisma.bookingDraft.findUnique,
-    draftUpdateMany: prisma.bookingDraft.updateMany,
-    bookingFindFirst: prisma.booking.findFirst,
-    customerMemoryFindUnique: prisma.customerMemory.findUnique,
-    unifiedConvFindFirst: prisma.unifiedConversation.findFirst,
-    messageFindFirst: prisma.message.findFirst,
-  };
-  let updated = false;
-  let draft: any = {
-    id: 'tomorrow-draft',
-    customerId: 'cust-tomorrow',
-    service: 'THE MUSE',
-    date: '2026-10-15',
-    time: '10:00',
-    step: 'collecting_slots',
-    version: 1,
-    updatedAt: new Date('2026-10-14T14:30:00Z'),
-    createdAt: new Date('2026-10-14T13:30:00Z'),
-  };
-  (prisma.bookingDraft.findUnique as any) = async () => draft;
-  (prisma.bookingDraft.updateMany as any) = async ({ where, data }: any) => {
-    if (where.id === draft.id) { Object.assign(draft, data); updated = true; }
-    return { count: 1 };
-  };
-  (prisma.booking.findFirst as any) = async () => null;
-  (prisma.customerMemory.findUnique as any) = async () => null;
-  (prisma.unifiedConversation.findFirst as any) = async () => null;
-  (prisma.message.findFirst as any) = async () => null;
-
-  const agent = new AgentService() as any;
-  agent.trackSentiment = async () => {};
-  agent.logConversationLearning = async () => {};
-  agent.touchCustomerMemory = async () => {};
-
-  try {
-    const reply = await agent.handleMessage('cust-tomorrow', 'Hey', [], 'whatsapp');
-    assert.equal(updated, true, 'Draft should be marked as touched');
-    assert.doesNotMatch(reply, /keep that|continue with that/);
-    assert.match(reply, /What kind of session are you planning\?/);
-  } finally {
-    prisma.bookingDraft.findUnique = originals.draftFindUnique;
-    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
-    prisma.booking.findFirst = originals.bookingFindFirst;
-    prisma.customerMemory.findUnique = originals.customerMemoryFindUnique;
-    prisma.unifiedConversation.findFirst = originals.unifiedConvFindFirst;
-    prisma.message.findFirst = originals.messageFindFirst;
-  }
-});
-
-
-test('lapsed carry-over: stale date-only draft for today is cleared instead of kept', async (context) => {
-  // Freeze clock to 2026-10-14 14:38 Nairobi (11:38 UTC)
-  const frozenNow = new Date('2026-10-14T11:38:00Z').getTime();
-  context.mock.timers.enable({ apis: ['Date'], now: frozenNow });
-
-  const originals = {
-    draftFindUnique: prisma.bookingDraft.findUnique,
-    draftDeleteMany: prisma.bookingDraft.deleteMany,
-    draftUpdateMany: prisma.bookingDraft.updateMany,
-    bookingFindFirst: prisma.booking.findFirst,
-    customerMemoryFindUnique: prisma.customerMemory.findUnique,
-    unifiedConvFindFirst: prisma.unifiedConversation.findFirst,
-    messageFindFirst: prisma.message.findFirst,
-  };
-  let deleted = false;
-  let updated = false;
-  let draft: any = {
-    id: 'lapsed-draft',
-    customerId: 'cust-lapsed-draft',
-    service: 'THE BLOOM',
-    date: '2026-10-14',
-    time: '10:00',
-    step: 'collecting_slots',
-    version: 1,
-    updatedAt: new Date('2026-10-14T14:30:00Z'),
-    createdAt: new Date('2026-10-14T13:30:00Z'),
-  };
-  (prisma.bookingDraft.findUnique as any) = async () => draft;
-  (prisma.bookingDraft.deleteMany as any) = async ({ where }: any) => {
-    if (where.id === draft.id && where.step === 'payment_pending') { deleted = true; draft = null; }
-    return { count: 1 };
-  };
-  (prisma.bookingDraft.updateMany as any) = async ({ where, data }: any) => {
-    if (where.id === draft.id) { Object.assign(draft, data); updated = true; }
-    return { count: 1 };
-  };
-  (prisma.booking.findFirst as any) = async () => null;
-  (prisma.customerMemory.findUnique as any) = async () => null;
-  (prisma.unifiedConversation.findFirst as any) = async () => null;
-  (prisma.message.findFirst as any) = async () => null;
-
-  const agent = new AgentService() as any;
-  agent.trackSentiment = async () => {};
-  agent.logConversationLearning = async () => {};
-  agent.touchCustomerMemory = async () => {};
-
-  try {
-    const reply = await agent.handleMessage('cust-lapsed-draft', 'Hey', [], 'whatsapp');
-    assert.equal(deleted, true, 'Stale date-only draft for today must be deleted');
-    assert.equal(updated, true, 'Draft date/time must be cleared');
-    assert.doesNotMatch(reply, /keep that|continue with that/);
-    assert.doesNotMatch(reply, /14 October/);
-    assert.match(reply, /What kind of session are you planning\?/);
-  } finally {
-    prisma.bookingDraft.findUnique = originals.draftFindUnique;
-    prisma.bookingDraft.deleteMany = originals.draftDeleteMany;
-    prisma.bookingDraft.updateMany = originals.draftUpdateMany;
-    prisma.booking.findFirst = originals.bookingFindFirst;
-    prisma.customerMemory.findUnique = originals.customerMemoryFindUnique;
-    prisma.unifiedConversation.findFirst = originals.unifiedConvFindFirst;
-    prisma.message.findFirst = originals.messageFindFirst;
-  }
-});
-
     tryImmediateConfirmation: async () => { throw new Error('db down'); },
     getBookingStatusReply: async () => null,
   });
