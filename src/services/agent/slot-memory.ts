@@ -1,7 +1,7 @@
 import prisma from '../../config/prisma';
-import { BOOKING_SLOT_RETENTION_MS, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
+import { BOOKING_SLOT_RETENTION_MS, PACKAGE_NAMES_FOR_EXTRACTION, SERVICE_DURATIONS } from '../../config/constants';
 import { resolveCalendarDate } from './extraction';
-import { bookingDateFacts, formatCustomerDate } from '../../utils/time';
+import { bookingDateFacts, businessDay, formatCustomerDate, nowInBusinessTimezone } from '../../utils/time';
 import { selectedEdition } from './conversation-flow.matcher';
 import { stripAssistantEmojis } from './emoji-policy';
 
@@ -10,6 +10,45 @@ export function closedDateReply(facts: { date: string; isMonday: boolean; isPast
   return facts.isPast
     ? `${day} has already passed. Which other date would work for you?`
     : `We are closed on Mondays, so ${day} is not available. Which other date would work for you?`;
+}
+
+/**
+ * Latest start today that still fits the shortest bookable session. Once now
+ * passes it, no session can fit before the 19:00 close and the day is over.
+ * Computed from SERVICE_DURATIONS so a catalogue change moves the cutoff.
+ */
+export function todayBookingCutoff(): { cutoff: string; now: string } {
+  const shortest = Math.min(...Object.values(SERVICE_DURATIONS));
+  const close = nowInBusinessTimezone().hour(19).minute(0).second(0).millisecond(0);
+  const last = close.subtract(shortest, 'minute');
+  // Sessions start on the 30-minute grid, so round a ragged cutoff down.
+  const cutoff = last.minute() < 30 ? last.minute(0) : last.minute(30);
+  return { cutoff: cutoff.format('HH:mm'), now: nowInBusinessTimezone().format('HH:mm') };
+}
+
+/**
+ * Same-day capture check: only fires once nothing can still fit today, in
+ * which case the dead date/time must not enter the draft. The named time
+ * decides the wording: a passed time gets the "already passed" message, a
+ * missing or still-later time gets the "done for today" message.
+ */
+export function sameDayClosedReply(draft: { date?: string | null; time?: string | null }): string | null {
+  if (!draft.date || draft.date !== nowInBusinessTimezone().format('YYYY-MM-DD')) return null;
+  if (bookingDateFacts(draft.date).isPast || bookingDateFacts(draft.date).isMonday) return null;
+  const { cutoff, now } = todayBookingCutoff();
+  if (now < cutoff) return null;
+  if (draft.time && draft.time <= now) return `${formatSlotTime(draft.time)} has already passed today. Which other time or date would suit you?`;
+  return "We're done with sessions for today. Which other date would suit you? Sessions run 9 AM to 7 PM, Tuesday to Sunday.";
+}
+
+/** Local "10:00" -> "10:00 AM" formatter (kept here so slot-memory never imports replies). */
+function formatSlotTime(time: string): string {
+  const match = time.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return time;
+  const hour = Number(match[1]);
+  const suffix = hour < 12 ? 'AM' : 'PM';
+  const twelve = hour % 12 === 0 ? 12 : hour % 12;
+  return `${twelve}:${match[2]} ${suffix}`;
 }
 
 export const SLOT_MEMORY_WINDOW_MS = BOOKING_SLOT_RETENTION_MS;
