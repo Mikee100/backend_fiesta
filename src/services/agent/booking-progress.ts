@@ -166,7 +166,13 @@ async function progressReply(this: any, customerId: string, message: string, his
   if (!draft.date) return STEP_QUESTIONS.need_date;
   const slots = await bookingService.getAvailableSlots(draft.date, SERVICE_DURATIONS[key], undefined, draft.id);
   const open: string[] = Array.isArray(slots) ? slots : [];
-  if (!open.length) return `${formatCustomerDate(draft.date)} is fully booked for ${editionInText(draft.service)}. Which other date would work for you?`;
+  if (!open.length) {
+    const today = nowInBusinessTimezone().format('YYYY-MM-DD');
+    if (draft.date === today) {
+      return `There are no more sessions available today for ${editionInText(draft.service)}. Which other date would work for you?`;
+    }
+    return `${formatCustomerDate(draft.date)} is fully booked for ${editionInText(draft.service)}. Which other date would work for you?`;
+  }
   if (!draft.time) return openTimesReply(draft.date, draft.service, open);
   if (!open.includes(draft.time)) return unavailableTimeReply(draft.date, draft.time, open);
   const lead = dateTimeTurn ? `${formatCustomerTime(draft.time)} on ${formatCustomerDate(draft.date)} is available for ${editionInText(draft.service)}. ` : '';
