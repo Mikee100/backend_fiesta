@@ -1052,20 +1052,54 @@ export class AgentService {
   }
 
   private getScopeBoundaryReply(
-    userMessage: string,
-    history: { role: 'user' | 'assistant'; content: string }[] = []
-  ): string | null {
-    const studioPolicyReply = this.getStudioPolicyReply(userMessage);
-    if (studioPolicyReply) return studioPolicyReply;
+  userMessage: string,
+  history: { role: 'user' | 'assistant'; content: string }[] = []
+): string | null {
+  const studioPolicyReply = this.getStudioPolicyReply(userMessage);
+  if (studioPolicyReply) return studioPolicyReply;
 
-    const outOfScopeReply = this.getOutOfScopeReply(userMessage);
-    if (outOfScopeReply) return outOfScopeReply;
+  const outOfScopeReply = this.getOutOfScopeReply(userMessage);
+  if (outOfScopeReply) return outOfScopeReply;
 
-    if (!this.isClearlyUnrelatedRequest(userMessage)) return null;
+  /*
+   * Some questions can look unrelated when taken literally, but are
+   * completely normal follow-ups to a maternity session.
+   *
+   * Examples:
+   * - "Can I come with my husband?"
+   * - "Can my partner come?"
+   * - "Can I bring my children?"
+   * - "Can my mum come?"
+   *
+   * Do not let the generic scope checker reject these.
+   */
+  const familySessionSignal =
+    /\b(husband|wife|partner|spouse|baby|babies|child|children|family|mum|mom|mother|dad|father)\b/i.test(userMessage)
+    && (
+      /\b(come|bring|join|accompany|with|include|together)\b/i.test(userMessage)
+      || /\b(session|shoot|booking|appointment|visit|studio)\b/i.test(userMessage)
+      || /\b(that time|when the time comes|when i come|when we come)\b/i.test(userMessage)
+    );
 
-    return 'I’m your Fiesta House studio assistant, so I stick to shoots and bookings. If you need help with a session, I’m happy to help.';
+  if (familySessionSignal) {
+    return null;
   }
 
+  /*
+   * Do the same for ordinary session-related questions that may not contain
+   * the exact business vocabulary used by the scope classifier.
+   */
+  const sessionContext =
+    /\b(session|shoot|booking|appointment|studio|photos|pictures|photo|maternity|pregnan|outfit|pose|poses|husband|wife|partner|baby|babies|children|family)\b/i.test(userMessage);
+
+  if (sessionContext) {
+    return null;
+  }
+
+  if (!this.isClearlyUnrelatedRequest(userMessage)) return null;
+
+  return 'I’m your Fiesta House studio assistant, so I stick to shoots and bookings. If you need help with a session, I’m happy to help.';
+}
   private shouldClarifyBookingForSomeoneElse(userMessage: string): boolean {
     return isBookingForSomeoneElseRequest(userMessage);
   }

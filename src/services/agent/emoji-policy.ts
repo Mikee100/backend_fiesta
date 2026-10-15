@@ -72,20 +72,64 @@ export const EMOJI_POLICY = {
 export const EMOJI_WHITELIST: readonly string[] = [
   ...new Set([
     ...Object.values(REPLY_EMOJI),
-    '\u{1F389}', // 🎉
+
+    // Warmth / appreciation
+    '\u{1F90D}', // 🤍
     '\u{1F49B}', // 💛
-    '\u{2728}',  // ✨
-    '\u{1F337}', // 🌷
+    '\u{1F49C}', // 💜
+    '\u{1F499}', // 💙
+    '\u{1F9E1}', // 🧡
+    '\u{1F60A}', // 😊
+    '\u{1F970}', // 🥰
+    '\u{1F642}', // 🙂
+    '\u{1F917}', // 🤗
     '\u{1FAF6}', // 🫶
+
+    // Celebration / excitement
+    '\u{2728}',  // ✨
+    '\u{1F389}', // 🎉
+    '\u{1F38A}', // 🎊
+    '\u{1F31F}', // 🌟
+
+    // Maternity / beauty / styling
+    '\u{1F337}', // 🌷
+    '\u{1F338}', // 🌸
+    '\u{1F33A}', // 🌺
+    '\u{1F490}', // 💐
     '\u{1F457}', // 👗
+    '\u{1F484}', // 💄
+    '\u{1F476}', // 👶
+    '\u{1F380}', // 🎀
+
+    // Photography / studio
+    '\u{1F4F8}', // 📸
+    '\u{1F4F7}', // 📷
+
+    // Calendar / location / confirmation
+    '\u{1F4C5}', // 📅
+    '\u{1F4CD}', // 📍
+    '\u2705',    // ✅
+
+    // Friendly conversational reactions
+    '\u{1F44F}', // 👏
+    '\u{1F44D}', // 👍
+    '\u{1F64C}', // 🙌
+    '\u{1F602}', // 😂
   ]),
 ];
 
-export const EMOJI_PROMPT_RULE = `Emojis should make the conversation feel warm and natural, never automated or decorated. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings. ${
-  EMOJI_POLICY.modelSuggestions
-    ? `Choose relevant emojis from this whitelist: ${EMOJI_WHITELIST.join(' ')}. Use them when they genuinely fit the customer's emotion or topic, such as excitement, compliments, outfits, appreciation or a warm greeting. Do not force emojis into every reply. Place them naturally at sentence endings or at the start of short list items.`
-    : 'Prefer plain text and mirror customer tone.'
-} Never repeat an emoji from the immediately previous reply. Never decorate money, deposits, invoices, payment failures, cancellations, refunds, escalation, team-confirmation lines or replies to upset customers.`;
+export const EMOJI_PROMPT_RULE = `Emojis should make the conversation feel warm and natural, never automated or decorated. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings.
+
+${EMOJI_POLICY.modelSuggestions
+  ? `You may use emojis, but only choose from this approved whitelist:
+${EMOJI_WHITELIST.join(' ')}
+
+Use an emoji only when it genuinely adds warmth, emotion or context. Good examples include 🤍 for warmth or reassurance, ✨ for excitement, 🌷 or 🌸 for a warm maternity/beauty context, 👗 for outfits, 📸 for photography, 🫶 for appreciation, 😊 for a friendly response, and 🎉 for genuine celebration.
+
+Do not force an emoji into every reply. Most replies can contain no emoji. Never invent or use an emoji outside the approved whitelist.`
+  : 'Prefer plain text and mirror customer tone.'}
+
+Never repeat an emoji from the immediately previous reply. Never decorate money, deposits, invoices, payment failures, cancellations, refunds, escalation, team-confirmation lines or replies to upset customers.`;
 
 export const EMOJI_REPEAT_WINDOW_MS = 2 * 60 * 60 * 1000;
 
@@ -288,9 +332,16 @@ export function applyEmojiPolicy(
       }
 
       if (reason) {
-        reasons.add(reason);
-        return '';
-      }
+  reasons.add(reason);
+
+  if (reason === 'not_whitelisted') {
+    console.info(
+      `[AGENT_FLOW] emoji=stripped reason=not_whitelisted emoji=${value.segment}`,
+    );
+  }
+
+  return '';
+}
 
       used.add(value.segment);
       kept++;
