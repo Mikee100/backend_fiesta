@@ -135,114 +135,346 @@ export class BookingExtractor {
       .toLowerCase();
   }
 
+  /**
+   * Words that commonly follow "I am" but are not names.
+   *
+   * This protects casual conversation such as:
+   * - "I am still early"
+   * - "I am pregnant"
+   * - "I am looking for..."
+   * - "I am interested..."
+   */
+  private static readonly NON_NAME_WORDS = new Set([
+    'still',
+    'early',
+    'late',
+    'pregnant',
+    'looking',
+    'interested',
+    'wondering',
+    'thinking',
+    'trying',
+    'planning',
+    'ready',
+    'not',
+    'just',
+    'already',
+    'currently',
+    'actually',
+    'really',
+    'very',
+    'happy',
+    'excited',
+    'curious',
+    'unsure',
+    'sure',
+    'confused',
+    'tired',
+    'busy',
+    'available',
+    'married',
+    'single',
+  ]);
+
+  private static isLikelyName(value: string | null | undefined): boolean {
+    if (!value) return false;
+
+    const normalized = value.trim().toLowerCase();
+
+    if (!/^[a-z]{2,}$/i.test(normalized)) return false;
+
+    if (BookingExtractor.NON_NAME_WORDS.has(normalized)) return false;
+
+    return true;
+  }
+
   /** Public so callers can use BookingExtractor.regexExtract(text) without a cast. */
   public static regexExtract(text: string): BookingDetails {
     const cleanText = BookingExtractor.cleanText(text);
 
-    if (cleanText.length < 10) return { name: null, service: null, date: null, time: null };
+    if (cleanText.length < 10) {
+      return {
+        name: null,
+        service: null,
+        date: null,
+        time: null,
+      };
+    }
 
-    const nameMatch = cleanText.match(/my name is ([a-z]{2,})/i)
-      || cleanText.match(/this is ([a-z]{2,})/i)
-      || cleanText.match(/i am ([a-z]{2,})/i);
+    const explicitNameMatch =
+      cleanText.match(/\bmy name is ([a-z]{2,})\b/i)
+      || cleanText.match(/\bthis is ([a-z]{2,})\b/i)
+      || cleanText.match(/\bcall me ([a-z]{2,})\b/i);
+
+    /*
+     * "I am X" is intentionally handled more carefully.
+     *
+     * We only accept it when X is not a common descriptive/conversational
+     * word. This prevents:
+     *
+     *   "I am still early..."
+     *
+     * from becoming:
+     *
+     *   name = "still"
+     */
+    const iAmMatch = cleanText.match(/\bi am ([a-z]{2,})\b/i);
+
+    const nameCandidate =
+      explicitNameMatch?.[1]
+      || (iAmMatch?.[1] && BookingExtractor.isLikelyName(iAmMatch[1])
+        ? iAmMatch[1]
+        : null);
+
+    const name =
+      BookingExtractor.isLikelyName(nameCandidate)
+        ? nameCandidate
+        : null;
 
     const serviceMatch = cleanText.match(
-      new RegExp(`(?:the\\s+)?(${PACKAGE_NAME_PATTERN})(?:\\s+(?:package|edition))?`, 'i')
+      new RegExp(
+        `(?:the\\s+)?(${PACKAGE_NAME_PATTERN})(?:\\s+(?:package|edition))?`,
+        'i'
+      )
     );
+
     const isoDate = text.match(ISO_DATE_PATTERN)?.[1];
     const explicitDate = isoDate ? null : findExplicitDate(text);
-    const timeMatch = cleanText.match(/(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i);
 
-    let date;
-    let time = null;
+    const timeMatch = cleanText.match(
+      /(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i
+    );
+
+    let date: string | undefined;
+    let time: string | null = null;
 
     if (timeMatch) {
-      time = timeMatch[0].toLowerCase().replace(/\s/g, '');
+      time = timeMatch[0]
+        .toLowerCase()
+        .replace(/\s/g, '');
     }
+
     if (isoDate && dayjs(isoDate).isValid()) {
       date = isoDate;
     } else if (explicitDate && explicitDate.month !== null) {
       const now = nowInBusinessTimezone();
-      let parsed = now.month(explicitDate.month).date(explicitDate.day);
-      if (parsed.isBefore(now, 'day')) parsed = parsed.add(1, 'year');
-      if (parsed.month() === explicitDate.month && parsed.date() === explicitDate.day) {
+
+      let parsed = now
+        .month(explicitDate.month)
+        .date(explicitDate.day);
+
+      if (parsed.isBefore(now, 'day')) {
+        parsed = parsed.add(1, 'year');
+      }
+
+      if (
+        parsed.month() === explicitDate.month
+        && parsed.date() === explicitDate.day
+      ) {
         date = parsed.format('YYYY-MM-DD');
       }
     } else if (explicitDate) {
       const day = explicitDate.day;
       const now = nowInBusinessTimezone();
+
       let parsed = now.date(day);
+
       if (parsed.isValid() && parsed.isBefore(now, 'day')) {
         parsed = now.add(1, 'month').date(day);
       }
+
       if (parsed.isValid()) {
         date = parsed.format('YYYY-MM-DD');
       }
     }
 
     return {
-      name: nameMatch?.[1] || null,
+      name,
       service: serviceMatch?.[1] || null,
       date: date || null,
-      time: time || null
+      time: time || null,
     };
   }
 
-  private async aiExtract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
-    const now = nowInBusinessTimezone().format('dddd, MMMM D, YYYY h:mm A');
-    const { response } = await createChatCompletion({
-      model: CHAT_MODEL,
-      messages: [
-        {
-          role: 'system',
-          content: `Current Date/Time: ${now}\n\nExtract booking details from the user message.\n\nReturn ONLY valid JSON. No text.\n\nFormat:\n{\n  "name": string | null,\n  "service": string | null,\n  "date": string | null,\n  "time": string | null\n}\n\nRules:\n- Name must be full name if possible\n- Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names)\n- Prefer Edition names like "THE EMPRESS" over legacy names\n- Convert date into YYYY-MM-DD\n- Convert time into 24h format (HH:mm)\n- If missing, return null\n`
-        },
-        { role: 'user', content: message }
-      ],
-      temperature: 0,
-      max_completion_tokens: MAX_EXTRACTOR_COMPLETION_TOKENS,
-    });
-    let details: BookingDetails = {};
-    try {
-      details = JSON.parse(response.choices[0].message.content || '{}');
-    } catch {
-      details = {};
-    }
-    return { details, usage: usageFromCompletion(response) };
-  }
+ private hasBookingSignals(message: string): boolean {
+  const text = message.toLowerCase();
 
-  private hasBookingSignals(message: string): boolean {
-    const text = message.toLowerCase();
-    return /\b(\d{1,2})(st|nd|rd|th)?\b|\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b|\b(am|pm)\b|\bbook|\bschedule|\bappointment|\bsession|\bpackage|\bbloom|\bmuse|\bicon|\blegend|\bqueen|\bempress|\bgoddess|\bresched|\bcancel|\bdeposit|\bmpesa|\bpay/i.test(text);
-  }
+  return (
+    /\b(\d{1,2})(st|nd|rd|th)?\b/.test(text)
+    || /\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b/.test(text)
+    || /\b(am|pm)\b/.test(text)
+    || /\bbook\b/.test(text)
+    || /\bschedule\b/.test(text)
+    || /\bappointment\b/.test(text)
+    || /\bsession\b/.test(text)
+    || /\bpackage\b/.test(text)
+    || /\bbloom\b/.test(text)
+    || /\bmuse\b/.test(text)
+    || /\bicon\b/.test(text)
+    || /\blegend\b/.test(text)
+    || /\bqueen\b/.test(text)
+    || /\bempress\b/.test(text)
+    || /\bgoddess\b/.test(text)
+    || /\bresched/.test(text)
+    || /\bcancel\b/.test(text)
+    || /\bdeposit\b/.test(text)
+    || /\bmpesa\b/.test(text)
+    || /\bpay\b/.test(text)
+  );
+}
 
-  private needsAiExtraction(message: string): boolean {
-    const text = message.toLowerCase();
-    const rescheduleSignal = /\b(reschedule|change|move|postpone)\b/.test(text);
-    const hasDateSignal = /\b\d{1,2}(st|nd|rd|th)?\b|\b\d{4}-\d{2}-\d{2}\b|\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
-    const hasTimeSignal = /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
-    return rescheduleSignal && hasDateSignal && hasTimeSignal;
-  }
+private needsAiExtraction(message: string): boolean {
+  const text = message.toLowerCase();
 
-  async extract(message: string): Promise<{ details: BookingDetails; usage: TokenUsage }> {
+  const rescheduleSignal =
+    /\b(reschedule|change|move|postpone)\b/.test(text);
+
+  const hasDateSignal =
+    /\b\d{1,2}(st|nd|rd|th)?\b/.test(text)
+    || /\b\d{4}-\d{2}-\d{2}\b/.test(text)
+    || /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b/.test(text)
+    || /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
+
+  const hasTimeSignal =
+    /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/.test(text)
+    || /\b\d{2}:\d{2}\b/.test(text);
+
+  return rescheduleSignal && hasDateSignal && hasTimeSignal;
+}
+
+  async extract(
+    message: string
+  ): Promise<{ details: BookingDetails; usage: TokenUsage }> {
     const regex = BookingExtractor.regexExtract(message);
-    if (process.env.NODE_ENV !== 'production') console.log('Regex result:', regex);
-    if (regex.name && regex.service && regex.date && regex.time) {
-      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('Regex result:', regex);
     }
+
+    if (
+      regex.name
+      && regex.service
+      && regex.date
+      && regex.time
+    ) {
+      return {
+        details: regex,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          completionCalls: 0,
+        },
+      };
+    }
+
     if (!this.needsAiExtraction(message)) {
-      console.log('No reschedule date/time extraction needed - skipping AI extractor call.');
-      return { details: regex, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, completionCalls: 0 } };
+      console.log(
+        'No reschedule date/time extraction needed - skipping AI extractor call.'
+      );
+
+      return {
+        details: regex,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          completionCalls: 0,
+        },
+      };
     }
+
     const { details: ai, usage } = await this.aiExtract(message);
-    if (process.env.NODE_ENV !== 'production') console.log('AI result:', ai);
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('AI result:', ai);
+    }
+
     return {
       details: {
         name: regex.name || ai.name,
         service: regex.service || ai.service,
         date: regex.date || ai.date,
-        time: regex.time || ai.time
+        time: regex.time || ai.time,
       },
-      usage
+      usage,
+    };
+  }
+
+  private async aiExtract(
+    message: string
+  ): Promise<{ details: BookingDetails; usage: TokenUsage }> {
+    const now = nowInBusinessTimezone().format(
+      'dddd, MMMM D, YYYY h:mm A'
+    );
+
+    const { response } = await createChatCompletion({
+      model: CHAT_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: `Current Date/Time: ${now}
+
+Extract booking details from the user message.
+
+Return ONLY valid JSON. No text.
+
+Format:
+{
+  "name": string | null,
+  "service": string | null,
+  "date": string | null,
+  "time": string | null
+}
+
+Rules:
+- Name must be a person's name, not a descriptive word or sentence fragment.
+- Only extract a name when the customer clearly identifies it as their name.
+- Do not interpret words such as "still", "early", "pregnant", "looking", "interested", "thinking", "planning", "ready", or "married" as names.
+- Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names)
+- Prefer Edition names like "THE EMPRESS" over legacy names
+- Convert date into YYYY-MM-DD
+- Convert time into 24h format (HH:mm)
+- If missing, return null
+`,
+        },
+        {
+          role: 'user',
+          content: message,
+        },
+      ],
+      temperature: 0,
+      max_completion_tokens: MAX_EXTRACTOR_COMPLETION_TOKENS,
+    });
+
+    let details: BookingDetails = {};
+
+    try {
+      details = JSON.parse(
+        response.choices[0].message.content || '{}'
+      );
+    } catch {
+      details = {};
+    }
+
+    /*
+     * Final defensive validation.
+     *
+     * Even if the model returns:
+     * { "name": "still" }
+     *
+     * we reject it before it reaches the booking pipeline.
+     */
+    if (
+      details.name
+      && !BookingExtractor.isLikelyName(details.name)
+    ) {
+      details.name = null;
+    }
+
+    return {
+      details,
+      usage: usageFromCompletion(response),
     };
   }
 }
