@@ -1,3 +1,4 @@
+
 import dayjs from 'dayjs';
 import { PACKAGE_NAME_PATTERN, PACKAGE_NAMES_FOR_EXTRACTION } from '../../config/constants';
 import { businessDay, bookingDateFacts, nowInBusinessTimezone } from '../../utils/time';
@@ -39,22 +40,30 @@ const MONTH_NAME_PATTERN = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|
 const MONTH_ABBREVIATIONS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 const ISO_DATE_PATTERN = /\b(\d{4}-\d{2}-\d{2})\b/;
 
-/**
- * Day-of-month only when written as an ordinal ("3rd"), next to a month name
- * ("3 Oct", "October 3") or inside an ISO date. Bare numbers ("7 months") and
- * hours ("3pm", "15:00") never count. `month` is 0-based when a month name was given.
- */
 export function findExplicitDate(message: string): { day: number; month: number | null } | null {
   const text = message.toLowerCase();
   const iso = text.match(ISO_DATE_PATTERN);
-  if (iso) return { day: Number(iso[1].slice(8, 10)), month: Number(iso[1].slice(5, 7)) - 1 };
 
-  const dayThenMonth = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:of\\s+)?(${MONTH_NAME_PATTERN})\\b`));
-  const monthThenDay = text.match(new RegExp(`\\b(${MONTH_NAME_PATTERN})\\s*(\\d{1,2})(?:st|nd|rd|th)?\\b(?!\\s*(?:am|pm|:\\d|\\.\\d))`));
+  if (iso) {
+    return {
+      day: Number(iso[1].slice(8, 10)),
+      month: Number(iso[1].slice(5, 7)) - 1,
+    };
+  }
+
+  const dayThenMonth = text.match(
+    new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:of\\s+)?(${MONTH_NAME_PATTERN})\\b`)
+  );
+
+  const monthThenDay = text.match(
+    new RegExp(`\\b(${MONTH_NAME_PATTERN})\\s*(\\d{1,2})(?:st|nd|rd|th)?\\b(?!\\s*(?:am|pm|:\\d|\\.\\d))`)
+  );
+
   const ordinal = text.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
 
   let day: number;
   let monthName: string | null = null;
+
   if (dayThenMonth) {
     day = Number(dayThenMonth[1]);
     monthName = dayThenMonth[2];
@@ -66,19 +75,19 @@ export function findExplicitDate(message: string): { day: number; month: number 
   } else {
     return null;
   }
+
   if (day < 1 || day > 31) return null;
-  return { day, month: monthName ? MONTH_ABBREVIATIONS.indexOf(monthName.slice(0, 3)) : null };
+
+  return {
+    day,
+    month: monthName ? MONTH_ABBREVIATIONS.indexOf(monthName.slice(0, 3)) : null,
+  };
 }
 
 export function findExplicitDayOfMonth(message: string): number | null {
   return findExplicitDate(message)?.day ?? null;
 }
 
-/**
- * A customer-named date that cannot exist on the calendar ("30th of February").
- * Callers answer it with a clarification instead of treating it as a pipeline
- * failure, so a typo can never count toward the circuit breaker.
- */
 export class InvalidDateError extends Error {
   constructor(message = 'That calendar date is invalid. Please choose a valid date.') {
     super(message);
@@ -86,44 +95,83 @@ export class InvalidDateError extends Error {
   }
 }
 
-/** Customer-facing clarification for an {@link InvalidDateError}. */
-export const INVALID_DATE_REPLY = "That date doesn't exist on the calendar. Which date would you like for your session?";
+export const INVALID_DATE_REPLY =
+  "That date doesn't exist on the calendar. Which date would you like for your session?";
 
 export function resolveCalendarDate(message: string): string | null {
   const iso = message.match(ISO_DATE_PATTERN)?.[1];
+
   if (iso) {
     try {
       bookingDateFacts(iso);
     } catch {
       throw new InvalidDateError();
     }
+
     return iso;
   }
+
   const explicit = findExplicitDate(message);
   const now = nowInBusinessTimezone();
+
   if (explicit) {
     const year = message.match(/\b((?:19|20)\d{2})\b/)?.[1];
     const month = explicit.month ?? now.month();
-    let date = now.date(1).year(year ? Number(year) : now.year()).month(month).date(explicit.day);
+
+    let date = now
+      .date(1)
+      .year(year ? Number(year) : now.year())
+      .month(month)
+      .date(explicit.day);
+
     if (!year && date.isBefore(now, 'day')) {
       date = explicit.month === null
         ? now.add(1, 'month').date(1).date(explicit.day)
         : date.add(1, 'year');
     }
-    if (date.date() !== explicit.day || (explicit.month !== null && date.month() !== month)) {
+
+    if (
+      date.date() !== explicit.day
+      || (explicit.month !== null && date.month() !== month)
+    ) {
       throw new InvalidDateError();
     }
+
     const resolved = date.format('YYYY-MM-DD');
     bookingDateFacts(resolved);
+
     return resolved;
   }
-  if (/\btomorrow\b/i.test(message)) return now.add(1, 'day').format('YYYY-MM-DD');
-  if (/\btoday\b/i.test(message)) return now.format('YYYY-MM-DD');
-  const weekday = message.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i)?.[1]?.toLowerCase();
+
+  if (/\btomorrow\b/i.test(message)) {
+    return now.add(1, 'day').format('YYYY-MM-DD');
+  }
+
+  if (/\btoday\b/i.test(message)) {
+    return now.format('YYYY-MM-DD');
+  }
+
+  const weekday = message
+    .match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i)?.[1]
+    ?.toLowerCase();
+
   if (!weekday) return null;
-  const target = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'].indexOf(weekday);
+
+  const target = [
+    'sunday',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+  ].indexOf(weekday);
+
   const offset = (target - now.day() + 7) % 7;
-  return businessDay(now.add(offset || 7, 'day').format('YYYY-MM-DD')).format('YYYY-MM-DD');
+
+  return businessDay(
+    now.add(offset || 7, 'day').format('YYYY-MM-DD')
+  ).format('YYYY-MM-DD');
 }
 
 export class BookingExtractor {
@@ -136,18 +184,22 @@ export class BookingExtractor {
   }
 
   /**
-   * Words that commonly follow "I am" but are not names.
-   *
-   * This protects casual conversation such as:
-   * - "I am still early"
-   * - "I am pregnant"
-   * - "I am looking for..."
-   * - "I am interested..."
+   * Common conversational words that must not be accepted as names.
+   * Explicit name introductions are still checked against this list.
    */
   private static readonly NON_NAME_WORDS = new Set([
     'still',
     'early',
     'late',
+    'alright',
+    'okay',
+    'fine',
+    'good',
+    'great',
+    'well',
+    'back',
+    'here',
+    'there',
     'pregnant',
     'looking',
     'interested',
@@ -155,6 +207,11 @@ export class BookingExtractor {
     'thinking',
     'trying',
     'planning',
+    'considering',
+    'hoping',
+    'waiting',
+    'expecting',
+    'feeling',
     'ready',
     'not',
     'just',
@@ -163,6 +220,8 @@ export class BookingExtractor {
     'actually',
     'really',
     'very',
+    'quite',
+    'maybe',
     'happy',
     'excited',
     'curious',
@@ -179,16 +238,25 @@ export class BookingExtractor {
   private static isLikelyName(value: string | null | undefined): boolean {
     if (!value) return false;
 
-    const normalized = value.trim().toLowerCase();
+    const normalized = value.trim().replace(/\s+/g, ' ').toLowerCase();
 
-    if (!/^[a-z]{2,}$/i.test(normalized)) return false;
+    // Only accept a first name or a two-part name.
+    if (normalized.split(' ').length > 2) return false;
 
-    if (BookingExtractor.NON_NAME_WORDS.has(normalized)) return false;
+    // Support alphabetic names, hyphenated names, and apostrophes.
+    if (!/^[a-z]+(?:[-'][a-z]+)?(?:\s[a-z]+(?:[-'][a-z]+)?)?$/i.test(normalized)) {
+      return false;
+    }
 
-    return true;
+    const words = normalized.split(' ');
+
+    if (words.some(word => BookingExtractor.NON_NAME_WORDS.has(word))) {
+      return false;
+    }
+
+    return words.every(word => word.length >= 2);
   }
 
-  /** Public so callers can use BookingExtractor.regexExtract(text) without a cast. */
   public static regexExtract(text: string): BookingDetails {
     const cleanText = BookingExtractor.cleanText(text);
 
@@ -201,35 +269,17 @@ export class BookingExtractor {
       };
     }
 
+    // Strong name signals only. Do not automatically interpret "I am X" as a name.
     const explicitNameMatch =
-      cleanText.match(/\bmy name is ([a-z]{2,})\b/i)
-      || cleanText.match(/\bthis is ([a-z]{2,})\b/i)
-      || cleanText.match(/\bcall me ([a-z]{2,})\b/i);
+      cleanText.match(/\bmy name is ([a-z]{2,}(?:[-'][a-z]{2,})?)\b/i)
+      || cleanText.match(/\bthis is ([a-z]{2,}(?:[-'][a-z]{2,})?)\b/i)
+      || cleanText.match(/\bcall me ([a-z]{2,}(?:[-'][a-z]{2,})?)\b/i);
 
-    /*
-     * "I am X" is intentionally handled more carefully.
-     *
-     * We only accept it when X is not a common descriptive/conversational
-     * word. This prevents:
-     *
-     *   "I am still early..."
-     *
-     * from becoming:
-     *
-     *   name = "still"
-     */
-    const iAmMatch = cleanText.match(/\bi am ([a-z]{2,})\b/i);
+    const nameCandidate = explicitNameMatch?.[1] || null;
 
-    const nameCandidate =
-      explicitNameMatch?.[1]
-      || (iAmMatch?.[1] && BookingExtractor.isLikelyName(iAmMatch[1])
-        ? iAmMatch[1]
-        : null);
-
-    const name =
-      BookingExtractor.isLikelyName(nameCandidate)
-        ? nameCandidate
-        : null;
+    const name = BookingExtractor.isLikelyName(nameCandidate)
+      ? nameCandidate
+      : null;
 
     const serviceMatch = cleanText.match(
       new RegExp(
@@ -249,9 +299,7 @@ export class BookingExtractor {
     let time: string | null = null;
 
     if (timeMatch) {
-      time = timeMatch[0]
-        .toLowerCase()
-        .replace(/\s/g, '');
+      time = timeMatch[0].toLowerCase().replace(/\s/g, '');
     }
 
     if (isoDate && dayjs(isoDate).isValid()) {
@@ -296,51 +344,61 @@ export class BookingExtractor {
     };
   }
 
- private hasBookingSignals(message: string): boolean {
-  const text = message.toLowerCase();
+  private hasBookingSignals(message: string): boolean {
+    const text = message.toLowerCase();
 
-  return (
-    /\b(\d{1,2})(st|nd|rd|th)?\b/.test(text)
-    || /\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b/.test(text)
-    || /\b(am|pm)\b/.test(text)
-    || /\bbook\b/.test(text)
-    || /\bschedule\b/.test(text)
-    || /\bappointment\b/.test(text)
-    || /\bsession\b/.test(text)
-    || /\bpackage\b/.test(text)
-    || /\bbloom\b/.test(text)
-    || /\bmuse\b/.test(text)
-    || /\bicon\b/.test(text)
-    || /\blegend\b/.test(text)
-    || /\bqueen\b/.test(text)
-    || /\bempress\b/.test(text)
-    || /\bgoddess\b/.test(text)
-    || /\bresched/.test(text)
-    || /\bcancel\b/.test(text)
-    || /\bdeposit\b/.test(text)
-    || /\bmpesa\b/.test(text)
-    || /\bpay\b/.test(text)
-  );
-}
+    return (
+      /\b(\d{1,2})(st|nd|rd|th)?\b/.test(text)
+      || /\b(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|next week)\b/.test(text)
+      || /\b(am|pm)\b/.test(text)
+      || /\bbook\b/.test(text)
+      || /\bschedule\b/.test(text)
+      || /\bappointment\b/.test(text)
+      || /\bsession\b/.test(text)
+      || /\bpackage\b/.test(text)
+      || /\bbloom\b/.test(text)
+      || /\bmuse\b/.test(text)
+      || /\bicon\b/.test(text)
+      || /\blegend\b/.test(text)
+      || /\bqueen\b/.test(text)
+      || /\bempress\b/.test(text)
+      || /\bgoddess\b/.test(text)
+      || /\bresched/.test(text)
+      || /\bcancel\b/.test(text)
+      || /\bdeposit\b/.test(text)
+      || /\bmpesa\b/.test(text)
+      || /\bpay\b/.test(text)
+    );
+  }
 
-private needsAiExtraction(message: string): boolean {
-  const text = message.toLowerCase();
+  private needsAiExtraction(message: string): boolean {
+    const text = message.toLowerCase();
 
-  const rescheduleSignal =
-    /\b(reschedule|change|move|postpone)\b/.test(text);
+    const rescheduleSignal =
+      /\b(reschedule|change|move|postpone)\b/.test(text);
 
-  const hasDateSignal =
-    /\b\d{1,2}(st|nd|rd|th)?\b/.test(text)
-    || /\b\d{4}-\d{2}-\d{2}\b/.test(text)
-    || /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b/.test(text)
-    || /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
+    const hasDateSignal =
+      /\b\d{1,2}(st|nd|rd|th)?\b/.test(text)
+      || /\b\d{4}-\d{2}-\d{2}\b/.test(text)
+      || /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|next\s+week)\b/.test(text)
+      || /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
 
-  const hasTimeSignal =
-    /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/.test(text)
-    || /\b\d{2}:\d{2}\b/.test(text);
+    const hasTimeSignal =
+      /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/.test(text)
+      || /\b\d{2}:\d{2}\b/.test(text);
 
-  return rescheduleSignal && hasDateSignal && hasTimeSignal;
-}
+    // Preserve the existing AI extraction behaviour for rescheduling.
+    if (rescheduleSignal && hasDateSignal && hasTimeSignal) {
+      return true;
+    }
+
+    // Only use AI for ambiguous name introductions, not every casual message.
+    const ambiguousNameIntroduction =
+      /\bi am\s+[a-z]{2,}\b/i.test(text)
+      || /\bi'm\s+[a-z]{2,}\b/i.test(text);
+
+    return ambiguousNameIntroduction;
+  }
 
   async extract(
     message: string
@@ -370,7 +428,7 @@ private needsAiExtraction(message: string): boolean {
 
     if (!this.needsAiExtraction(message)) {
       console.log(
-        'No reschedule date/time extraction needed - skipping AI extractor call.'
+        'No name or reschedule date/time extraction needed - skipping AI extractor call.'
       );
 
       return {
@@ -390,9 +448,13 @@ private needsAiExtraction(message: string): boolean {
       console.log('AI result:', ai);
     }
 
+    const aiName = BookingExtractor.isLikelyName(ai.name)
+      ? ai.name
+      : null;
+
     return {
       details: {
-        name: regex.name || ai.name,
+        name: regex.name || aiName,
         service: regex.service || ai.service,
         date: regex.date || ai.date,
         time: regex.time || ai.time,
@@ -427,15 +489,22 @@ Format:
   "time": string | null
 }
 
-Rules:
+Name extraction rules:
+- Extract a name only when the customer clearly identifies the word as their personal name.
+- "My name is Maryanne" means name: "Maryanne".
+- "Call me Maryanne" means name: "Maryanne".
+- "This is Maryanne" means name: "Maryanne".
+- "I am Maryanne" or "I'm Maryanne" may be a name introduction if the context clearly indicates that Maryanne is a person's name.
+- "I am alright", "I am fine", "I am still early", "I am pregnant", and "I am interested" must return name: null.
+- Never assume the first word after "I am" or "I'm" is a name.
+- If uncertain, return name: null.
 - Name must be a person's name, not a descriptive word or sentence fragment.
-- Only extract a name when the customer clearly identifies it as their name.
-- Do not interpret words such as "still", "early", "pregnant", "looking", "interested", "thinking", "planning", "ready", or "married" as names.
-- Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names)
-- Prefer Edition names like "THE EMPRESS" over legacy names
-- Convert date into YYYY-MM-DD
-- Convert time into 24h format (HH:mm)
-- If missing, return null
+
+Service must be one of the 2026 Editions: ${PACKAGE_NAMES_FOR_EXTRACTION.join(', ')} (or legacy: standard, economy, executive, gold, platinum, vip, vvip if the customer still uses those names).
+- Prefer Edition names like "THE EMPRESS" over legacy names.
+- Convert date into YYYY-MM-DD.
+- Convert time into 24h format (HH:mm).
+- If a field is missing, return null.
 `,
         },
         {
@@ -457,14 +526,7 @@ Rules:
       details = {};
     }
 
-    /*
-     * Final defensive validation.
-     *
-     * Even if the model returns:
-     * { "name": "still" }
-     *
-     * we reject it before it reaches the booking pipeline.
-     */
+    // Final defensive validation before returning the AI result.
     if (
       details.name
       && !BookingExtractor.isLikelyName(details.name)

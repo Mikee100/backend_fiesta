@@ -1022,14 +1022,30 @@ export class AgentService {
     }
 
     const asksStyling = /\b(wear|outfit|dress|dressed|style|styling|clothes|clothing|colou?rs?|match(?:ing)?|coordinate)\b/.test(text);
-    if (!asksStyling && /\b(couple|partner|husband|wife|children|kids|family)\b/.test(text) && /\b(session|shoot|join|include|come|attend)\b/.test(text)) {
-      const companion = /\bhusband\b/.test(text) ? 'Your husband is' : /\bpartner\b/.test(text) ? 'Your partner is' : 'Your partner and children are';
-      return `${companion} very welcome to join your maternity session. We'll guide poses that include everyone.`;
-    }
 
-    if (/(late\s+night|late-night|evening)/.test(text) && /\b(sessions?|shoot|booking|open|slot)\b/.test(text)) {
-      return 'Our studio hours are 9 AM to 7 PM, and we are closed on Mondays, so we do not offer late-night sessions.';
-    }
+if (
+  !asksStyling &&
+  /\b(couple|partner|husband|wife|children|kids|family|mum|mom|mother|dad|father)\b/.test(text) &&
+  /\b(session|shoot|join|include|come|attend)\b/.test(text)
+) {
+  if (/\bhusband\b/.test(text)) {
+    return "Your husband is very welcome to join your maternity session. We'll guide poses that include both of you.";
+  }
+
+  if (/\b(wife|partner|spouse)\b/.test(text)) {
+    return "Your partner is very welcome to join your maternity session. We'll guide poses that include both of you.";
+  }
+
+  if (/\b(children|kids|child|baby|babies)\b/.test(text)) {
+    return "Your children are welcome to join your maternity session. We'll help you plan poses that include them.";
+  }
+
+  if (/\b(mum|mom|mother|dad|father)\b/.test(text)) {
+    return "Your family member is welcome to join your maternity session. We'll help you plan poses that include them.";
+  }
+
+  return "Your family is welcome to join your maternity session. We'll guide poses that include everyone.";
+}
 
     return null;
   }
@@ -1742,6 +1758,24 @@ C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio 
 
 ${BRAND_RULES}
 ${VOICE_RULES}
+
+D0-pre. FIRST CLASSIFY THE CUSTOMER'S CURRENT INTENT (internal; never reveal this classification):
+
+Before drafting a reply, identify the primary intent of the latest message using the conversation history only to understand its meaning.
+
+GREETING: Return the greeting naturally. Do not introduce services or ask a booking question.
+
+ACKNOWLEDGEMENT OR THANKS: Respond briefly and warmly. Do not reopen a completed topic.
+
+CASUAL CHAT: Respond naturally to the actual remark. Do not force a connection to photography, pregnancy, or booking. If the remark cannot be answered within studio scope, acknowledge it warmly without giving professional advice or making a sales pitch.
+
+EMOTIONAL OR PERSONAL DISCLOSURE: Acknowledge the feeling first. Do not assume the customer wants advice or a booking.
+
+STUDIO INFORMATION: Answer the specific question using verified business information. Ask a follow-up only if it is necessary to answer correctly.
+
+BOOKING OR BOOKING CHANGE: Follow all applicable hard constraints and tool-use workflows exactly.
+
+Use the smallest response that satisfies the customer's intent. Do not add a booking question, marketing statement, service recommendation, or call to action unless it directly serves that intent. When intent is unclear, do not assume booking intent; ask a brief clarifying question only if needed.
 
 D0. NATURAL CONVERSATION: Respond to what the customer actually said before doing anything else. Treat her as a person, not as a booking record. Return greetings naturally when greeted. Respond to feelings or personal context with warmth before giving information. Use her first name naturally when known, but do not force her name into every reply. Mirror Swahili or Sheng when she writes it. Do not turn greetings, thanks, acknowledgements or casual conversation into a booking conversation.
 
