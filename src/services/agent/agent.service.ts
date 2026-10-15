@@ -618,13 +618,63 @@ export class AgentService {
   }
 
   /** Deterministic reply for the detected intent when the verifier cannot use the model's reply. */
-  private async getVerifierTemplateReply(customerId: string, userMessage: string,
-    history: { role: 'user' | 'assistant'; content: string }[]): Promise<string | null> {
-    if (this.shouldResolvePackageSelectionImmediately(userMessage)) return this.getPackageSelectionReply(customerId, userMessage);
-    if (this.conversationFlows.isPackageCatalogRequest(userMessage, history)) return EDITION_LINK_REPLY;
-    if (isPlainGreeting(userMessage)) return buildBusinessIntroductionReply();
-    return null;
+
+/** Deterministic reply for the detected intent when the verifier cannot use the model's reply. */
+private async getVerifierTemplateReply(
+  customerId: string,
+  userMessage: string,
+  history: { role: 'user' | 'assistant'; content: string }[]
+): Promise<string | null> {
+  if (this.shouldResolvePackageSelectionImmediately(userMessage)) {
+    return this.getPackageSelectionReply(customerId, userMessage);
   }
+
+  if (this.isAddonAdviceRequest(userMessage, history)) {
+    return this.getAddonAdviceReply();
+  }
+
+  if (this.conversationFlows.isPackageCatalogRequest(userMessage, history)) {
+    return EDITION_LINK_REPLY;
+  }
+
+  if (isPlainGreeting(userMessage)) {
+    return buildBusinessIntroductionReply();
+  }
+
+  return null;
+}
+
+
+
+private isAddonAdviceRequest(
+  userMessage: string,
+  history: { role: 'user' | 'assistant'; content: string }[]
+): boolean {
+  const asksForAdvice =
+    /\b(recommend|recommendation|suggest|suggestion|which would you|which one|what would you|most clients like|popular|best option|specific ones?|any specific|what do you recommend)\b/i
+      .test(userMessage);
+
+  if (!asksForAdvice) return false;
+
+  const recentContext = [
+    ...history.slice(-8).map((message) => message.content),
+    userMessage,
+  ].join('\n');
+
+  return /\b(add-?ons?|optional extras?|extras?|power suit|extra outfit|extra edited photos?|digital art edits?|styled wig|wig hire|wig styling|sculpture set|suspending concept)\b/i
+    .test(recentContext);
+}
+
+private getAddonAdviceReply(): string {
+  return [
+    'A few lovely options to consider are:',
+    '• Extra outfit — KSh 4,000 if you’d like another look.',
+    '• Extra edited photos — KSh 1,000 each for more finished images.',
+    '• Power Suit — KSh 10,000 if it isn’t already included in your edition, for a bold, structured look.',
+    '• Styled wig hire — KSh 4,000; this needs to be booked in advance.',
+    `You can see the full list here: ${OFFICIAL_WEBSITE_URLS.packages}`,
+  ].join('\n');
+}
 
   private shouldUseBookingProcessReply(userMessage: string): boolean {
     return isBookingProcessRequest(userMessage);

@@ -49,6 +49,37 @@ export type MessageRoute = {
   beforeSlotCapture?: boolean;
 };
 
+function isAddonAdviceRequest(
+  userMessage: string,
+  history: { role: 'user' | 'assistant'; content: string }[]
+): boolean {
+  const asksForAdvice =
+    /\b(recommend|recommendation|suggest|suggestion|which would you|which one|what would you|most clients like|popular|best option|specific ones?|any specific|what do you recommend)\b/i
+      .test(userMessage);
+
+  if (!asksForAdvice) return false;
+
+  const recentContext = [
+    ...history.slice(-8).map((message) => message.content),
+    userMessage,
+  ].join('\n');
+
+  return /\b(add-?ons?|optional extras?|extras?|power suit|extra outfit|extra edited photos?|digital art edits?|styled wig|wig hire|wig styling|sculpture set|suspending concept)\b/i
+    .test(recentContext);
+}
+
+function buildAddonAdviceReply(): string {
+  return [
+    'A few options you could consider:',
+    '• Extra outfit — KSh 4,000 for another look.',
+    '• Extra edited photos — KSh 1,000 each if you would like more finished images.',
+    '• Power Suit — KSh 10,000 if it is not already included in your edition.',
+    '• Styled wig hire — KSh 4,000; this must be booked in advance.',
+    `You can find the full list here: ${OFFICIAL_WEBSITE_URLS.packages}`,
+  ].join('\n');
+}
+
+
 export function createMessageRoutes(
   this: any,
   customerId: string,
@@ -428,6 +459,13 @@ export function createMessageRoutes(
       when: () => this.shouldClarifyNewAddon(userMessage, history),
       handle: () => 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.',
     },
+    {
+      name: 'addonAdvice',
+      replyMode: 'deterministic',
+      when: () => isAddonAdviceRequest(userMessage, history),
+      handle: () => buildAddonAdviceReply(),
+    },
+
     {
       name: 'addonRequest',
       replyMode: 'deterministic',
