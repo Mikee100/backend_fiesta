@@ -85,6 +85,13 @@ export const EMOJI_WHITELIST: readonly string[] = [
     '\u{1F917}', // 🤗
     '\u{1FAF6}', // 🫶
 
+    // Greetings / conversation
+    '\u{1F44B}', // 👋
+    '\u{1F44F}', // 👏
+    '\u{1F44D}', // 👍
+    '\u{1F64C}', // 🙌
+    '\u{1F602}', // 😂
+
     // Celebration / excitement
     '\u{2728}',  // ✨
     '\u{1F389}', // 🎉
@@ -109,15 +116,8 @@ export const EMOJI_WHITELIST: readonly string[] = [
     '\u{1F4C5}', // 📅
     '\u{1F4CD}', // 📍
     '\u2705',    // ✅
-
-    // Friendly conversational reactions
-    '\u{1F44F}', // 👏
-    '\u{1F44D}', // 👍
-    '\u{1F64C}', // 🙌
-    '\u{1F602}', // 😂
   ]),
 ];
-
 export const EMOJI_PROMPT_RULE = `Emojis should make the conversation feel warm and natural, never automated or decorated. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings.
 
 ${EMOJI_POLICY.modelSuggestions
