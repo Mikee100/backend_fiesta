@@ -2,40 +2,63 @@ import prisma from '../../config/prisma';
 import { inBusinessTimezone } from '../../utils/time';
 
 export class BookingDraftService {
-  async saveBookingProposal(input: {
-    customerId: string;
-    service: string;
-    dateTime: string;
-    customerName: string;
-  }) {
-    const dateTime = inBusinessTimezone(input.dateTime);
-    const date = dateTime.format('YYYY-MM-DD');
-    const time = dateTime.format('HH:mm');
-    const existing = await prisma.bookingDraft.findUnique({ where: { customerId: input.customerId }, select: { service: true, date: true, time: true } });
-    // A different edition or slot is a new proposal, so the M-Pesa prompt count starts again.
-    const newProposal = !existing || existing.service !== input.service || existing.date !== date || existing.time !== time;
-    return prisma.bookingDraft.upsert({
-      where: { customerId: input.customerId },
-      update: {
-        service: input.service,
-        date,
-        time,
-        dateTimeIso: input.dateTime,
-        name: input.customerName,
-        step: 'awaiting_confirmation',
-        ...(newProposal ? { version: 1 } : {}),
-      },
-      create: {
-        customerId: input.customerId,
-        service: input.service,
-        date,
-        time,
-        dateTimeIso: input.dateTime,
-        name: input.customerName,
-        step: 'awaiting_confirmation',
-      },
-    });
+ async saveBookingProposal(input: {
+  customerId: string;
+  service: string;
+  dateTime: string;
+  customerName: string;
+}) {
+  const dateTime = inBusinessTimezone(input.dateTime);
+  const date = dateTime.format('YYYY-MM-DD');
+  const time = dateTime.format('HH:mm');
+
+  const existing = await prisma.bookingDraft.findUnique({
+    where: { customerId: input.customerId },
+    select: {
+      id: true,
+      service: true,
+      date: true,
+      time: true,
+      step: true,
+    },
+  });
+
+  if (existing?.step === 'payment_pending') {
+    throw Object.assign(
+      new Error('A payment request is already being processed for this booking.'),
+      { code: 'PAYMENT_ALREADY_PENDING' }
+    );
   }
+
+  // A different edition or slot is a new proposal.
+  const newProposal =
+    !existing ||
+    existing.service !== input.service ||
+    existing.date !== date ||
+    existing.time !== time;
+
+  return prisma.bookingDraft.upsert({
+    where: { customerId: input.customerId },
+    update: {
+      service: input.service,
+      date,
+      time,
+      dateTimeIso: input.dateTime,
+      name: input.customerName,
+      step: 'awaiting_confirmation',
+      ...(newProposal ? { version: 1 } : {}),
+    },
+    create: {
+      customerId: input.customerId,
+      service: input.service,
+      date,
+      time,
+      dateTimeIso: input.dateTime,
+      name: input.customerName,
+      step: 'awaiting_confirmation',
+    },
+  });
+}
 
   async get(customerId: string) {
     return prisma.bookingDraft.findUnique({ where: { customerId } });
