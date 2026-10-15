@@ -73,12 +73,38 @@ const providerCooldownUntil =
  *
  * Those fields must not be forwarded to the LLM provider.
  */
+
 function sanitizeMessages(messages: any[]): any[] {
-  return messages.map((message) => ({
-    role: message.role,
-    content: message.content,
-  }));
+  return messages.map((message) => {
+    const sanitized: Record<string, any> = {
+      role: message.role,
+      content: message.content ?? null,
+    };
+
+    // Preserve assistant tool calls.
+    if (message.tool_calls !== undefined) {
+      sanitized.tool_calls = message.tool_calls;
+    }
+
+    // Preserve the ID linking a tool result to its call.
+    if (message.tool_call_id !== undefined) {
+      sanitized.tool_call_id = message.tool_call_id;
+    }
+
+    // Preserve the tool name on tool-result messages.
+    if (message.name !== undefined) {
+      sanitized.name = message.name;
+    }
+
+    // Preserve legacy assistant function calls if present.
+    if (message.function_call !== undefined) {
+      sanitized.function_call = message.function_call;
+    }
+
+    return sanitized;
+  });
 }
+
 
 /** 
  * AI_PRIMARY_PROVIDER=gemini puts Gemini first and keeps Groq
