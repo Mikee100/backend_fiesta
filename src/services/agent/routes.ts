@@ -49,6 +49,9 @@ export type MessageRoute = {
   beforeSlotCapture?: boolean;
 };
 
+
+
+
 function isAddonAdviceRequest(
   userMessage: string,
   history: { role: 'user' | 'assistant'; content: string }[]
@@ -68,16 +71,27 @@ function isAddonAdviceRequest(
     .test(recentContext);
 }
 
+
 function buildAddonAdviceReply(): string {
   return [
-    'A few options you could consider:',
-    '• Extra outfit — KSh 4,000 for another look.',
-    '• Extra edited photos — KSh 1,000 each if you would like more finished images.',
-    '• Power Suit — KSh 10,000 if it is not already included in your edition.',
-    '• Styled wig hire — KSh 4,000; this must be booked in advance.',
-    `You can find the full list here: ${OFFICIAL_WEBSITE_URLS.packages}`,
+    'Add-ons are completely optional 😊 Your Bloom package already includes its own features, so there is no pressure to add anything extra.',
+    '',
+    'If you would like to personalise your photoshoot, here are a few options:',
+    '• Extra outfit — KSh 4,000 if you would like another look.',
+    '• Extra edited photo — KSh 1,000 each for more finished images beyond those included in your package.',
+    '• Styled wig hire — KSh 4,000 if you would like a different look; this must be booked in advance.',
+    '',
+    'These are just suggestions, not requirements. You can enjoy your session with your existing package exactly as it is.',
+    `You can explore all the optional extras here: ${OFFICIAL_WEBSITE_URLS.packages}`,
   ].join('\n');
 }
+
+
+
+
+
+
+
 
 
 export function createMessageRoutes(
@@ -454,6 +468,22 @@ export function createMessageRoutes(
         }
       },
     },
+    
+{
+  name: 'addonAdvice',
+  replyMode: 'deterministic',
+  when: () => isAddonAdviceRequest(userMessage, history),
+  handle: () => buildAddonAdviceReply(),
+},
+
+{
+  name: 'addonAdvice',
+  replyMode: 'deterministic',
+  when: () => isAddonAdviceRequest(userMessage, history),
+  handle: () => buildAddonAdviceReply(),
+},
+
+
     {
       name: 'clarifyNewAddon',
       when: () => this.shouldClarifyNewAddon(userMessage, history),
