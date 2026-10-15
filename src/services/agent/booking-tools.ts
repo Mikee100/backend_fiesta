@@ -129,12 +129,27 @@ export async function executeConfirmBookingTool(
   if (expectedDeposit === null || expectedDeposit !== depositAmount) {
     throw new Error('The package deposit no longer matches the amount in the customer-visible proposal. Do not start payment; prepare a new proposal and ask for confirmation again.');
   }
-  if (draftVersion(draft) - 1 >= MAX_PAYMENT_ATTEMPTS) {
+   // Attempts are counted as version - 1, but slot saves also bump version.
+  // Before the first prompt, reset to a clean baseline so those bumps never count.
+  let baseVersion = draft.version;
+  const priorPayment = await prisma.payment.findFirst({ where: { bookingDraftId: draft.id }, select: { id: true } });
+  if (!priorPayment && Number.isInteger(draft.version) && draft.version > 1) {
+    const reset = await prisma.bookingDraft.updateMany({
+      where: { id: draft.id, step: 'awaiting_confirmation', version: draft.version },
+      data: { version: 1 },
+    });
+    if (!reset.count) {
+      throw new Error('The booking changed while confirming. Ask the customer to confirm again.');
+    }
+    baseVersion = 1;
+  }
+  if (draftVersion({ version: baseVersion }) - 1 >= MAX_PAYMENT_ATTEMPTS) {
     throw Object.assign(new Error('The M-Pesa prompt limit for this booking has been reached. Do not send another prompt; the studio team will follow up.'), { code: PAYMENT_ATTEMPTS_EXHAUSTED });
   }
 
-  await bookingDraftService.markPaymentPending(customerId, draft.version);
+  await bookingDraftService.markPaymentPending(customerId, baseVersion);
 
+  
   let mpesaResponse: any;
   try {
     mpesaResponse = await mpesaService.initiateStkPush(customerId, depositAmount, draft.id);

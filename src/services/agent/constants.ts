@@ -31,9 +31,11 @@ export const ADDON_QUOTED_PRICE_LABEL = 'quoted by package tier';
 export const ADDON_MAKEUP_CLARIFICATION = 'Who should the extra professional makeup be for: you or someone joining your session?';
 export const ADDON_MULTI_CLARIFICATION = 'Which add-on would you like to add to your session?';
 export const ADDON_ADDITIONS_HEADER = 'Yes, these optional additions are available:';
-export const BUDGET_HANDOFF_REPLY = 'Thank you for your patience. A member of our team will pick this up with you shortly.';
+// Must keep matching isTeamHandoffReply ("member of our team will pick this up") so handoff escalations still fire.
+export const BUDGET_HANDOFF_REPLY = "I'm sorry for the wait, and thank you for your patience. A member of our team will pick this up with you shortly.";
 export const BRAND_SLOGAN = 'Where Every Mother Becomes Iconic.';
-export const UNKNOWN_ANSWER_REPLY = 'The team will confirm that for you.';
+// Must keep matching isTeamHandoffReply ("team will confirm"). Check tests/verifier for exact-string comparisons.
+export const UNKNOWN_ANSWER_REPLY = 'I want to get that exactly right for you, so the team will confirm it and get back to you.';
 export const BOOKING_WELCOME_CLOSING = "We're looking forward to welcoming you to Fiesta House Maternity.";
 export const BRAND_RULES = `BRAND: Fiesta House Maternity's pillars are Luxury, Safety, Convenience and Comfort. Mention the all-women, professionally trained team only when relevant AND verified in Business Context. The only slogan is "${BRAND_SLOGAN}" Use it at most once per conversation, only in a greeting or closing, never in a price, policy or booking answer.`;
-export const VOICE_RULES = `VOICE: Brief, calm sentences. Say session or reveal, never photoshoot, in your own words. No cliches (glow, cherish every moment) or hashtags. ${EMOJI_PROMPT_RULE} Ask one question only for a missing detail; keep known facts. Facts come from Business Context or successful tools, stated plainly. Use the Bloom edition/Bloom in running text; capitals for headings. Correct errors briefly.`;
+export const VOICE_RULES = `VOICE: Warm, personal and unhurried, like an attentive host at a luxury studio. Return greetings in kind and acknowledge what she shares (feelings, body, nerves, due date, excitement) with one sincere sentence before giving information. Keep sentences calm and natural; two to four sentences is enough, but never so brief that you sound cold. Say session or reveal, never photoshoot, in your own words. Avoid cliches (glow, cherish every moment) and hashtags, and say warm things in fresh, specific words instead. ${EMOJI_PROMPT_RULE} Ask at most one question per reply, and only when you need a missing detail or she has shown booking intent; otherwise end with a caring line. Keep known facts. Facts come from Business Context or successful tools, stated plainly. Use the Bloom edition/Bloom in running text; capitals for headings. Correct errors briefly.`;
