@@ -10,6 +10,12 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'socialresponder2025';
+const WHATSAPP_PRIVACY_NOTICE = `Welcome to Fiesta House Maternity! 🤍
+
+Before we get started, we'd like to let you know that we may save and process this chat to assist with enquiries, bookings and customer service, in accordance with our Privacy Policy.
+
+You can read our Privacy Policy here:
+https://www.fiestahousematernity.com/privacy-policy`;
 
 export class WhatsAppController {
   
@@ -226,8 +232,44 @@ export class WhatsAppController {
       // handleMessage never throws - on any internal failure (provider error,
       // circuit open, rate limited) it resolves to a safe fallback string,
       // logged distinctly in AiJobMetric.
-      console.log(`[WHATSAPP_TURN] Calling agentService.handleMessage for ${customerId}`);
-      const aiReply = await agentService.handleMessage(customerId, combinedMessage, history, 'whatsapp');
+      // Send the privacy notice once, before the customer's first AI response.
+// We check the outbound message history rather than the current AI history
+// so returning customers are not shown the notice again.
+const privacyNoticeSent = await retryOnPrismaDisconnect(prisma, () =>
+  prisma.message.findFirst({
+    where: {
+      customerId,
+      platform: 'whatsapp',
+      direction: 'outbound',
+      content: WHATSAPP_PRIVACY_NOTICE,
+    },
+    select: { id: true },
+  })
+);
+
+if (!privacyNoticeSent) {
+  console.log(`[WHATSAPP_TURN] Sending first-contact privacy notice to ${customerId}`);
+
+  await prisma.message.create({
+    data: {
+      content: WHATSAPP_PRIVACY_NOTICE,
+      platform: 'whatsapp',
+      direction: 'outbound',
+      customerId,
+      handledBy: 'system',
+    },
+  });
+
+  await whatsappService.sendMessage(customerId, WHATSAPP_PRIVACY_NOTICE);
+}
+
+console.log(`[WHATSAPP_TURN] Calling agentService.handleMessage for ${customerId}`);
+const aiReply = await agentService.handleMessage(
+  customerId,
+  combinedMessage,
+  history,
+  'whatsapp'
+);
       console.log(`[WHATSAPP_TURN] Agent response for ${customerId}:`, JSON.stringify({
         replyPreview: aiReply.slice(0, 200),
         isFallback: aiReply.includes("we're experiencing high demand") || aiReply.includes("we are experiencing high demand")
