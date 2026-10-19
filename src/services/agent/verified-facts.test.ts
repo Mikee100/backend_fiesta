@@ -33,11 +33,20 @@ test('verified-facts table answers hair and wig questions deterministically with
 });
 
 test('verified-facts table answers outfit and gown selection without inventing Instagram gallery browsing', () => {
-  const q = 'How can I chose the outfits?';
-  const reply = resolveVerifiedFact(q);
-  assert.ok(reply);
-  assert.match(reply, /select your gowns and outfits from our studio wardrobe/i);
-  assert.doesNotMatch(reply, /instagram|gallery posts|scroll/i);
+  const variations = [
+    'How can I chose the outfits?',
+    'Can i choose an outfit for myself',
+    'Can I pick my own outfits?',
+    'Do I get to choose the gowns?',
+    'Where do I choose the outfits?'
+  ];
+
+  for (const q of variations) {
+    const reply = resolveVerifiedFact(q);
+    assert.ok(reply, `Expected verified fact reply for: "${q}"`);
+    assert.match(reply, /select your gowns and outfits from our studio wardrobe/i);
+    assert.doesNotMatch(reply, /instagram|gallery posts|scroll/i);
+  }
 });
 
 test('verified-facts table safely handles customer offering to share gowns in chat', () => {

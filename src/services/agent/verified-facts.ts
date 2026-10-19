@@ -63,7 +63,7 @@ export function resolveVerifiedFact(
   }
 
   // 4. Outfits - How to choose gowns / outfits
-  const chooseTerms = /\b(?:how\s+(?:can|do)\s+i\s+(?:choose|chose|pick|select)|where\s+do\s+i\s+(?:choose|chose|pick|select)|how\s+are\s+(?:the\s+)?(?:outfits?|gowns?)\s+(?:chosen|selected|picked))\b/i;
+  const chooseTerms = /\b(?:(?:how|where)\s+(?:can|do)\s+i\s+(?:choose|chose|pick|select)|how\s+are\s+(?:the\s+)?(?:outfits?|gowns?)\s+(?:chosen|selected|picked)|(?:can|could|do|may)\s+i\s+(?:get\s+to\s+)?(?:choose|chose|pick|select))\b/i;
   const outfitTerms = /\b(?:outfits?|gowns?|dresses?|wardrobe)\b/i;
   if (chooseTerms.test(text) && outfitTerms.test(text)) {
     return 'You select your gowns and outfits from our studio wardrobe during your session, where our team assists with styling and fit. You may also bring personal sentimental outfits if you wish.';
