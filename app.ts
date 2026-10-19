@@ -41,12 +41,14 @@ if (process.env.DATABASE_URL) {
 } else {
   console.warn('⚠️ WARNING: DATABASE_URL is missing!');
 }
-
 const app = express();
+
+app.set('trust proxy', 1);
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: '*', 
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
@@ -88,6 +90,9 @@ app.use(cors());
 app.use(express.json({
   verify: (req: any, _res, buf) => { req.rawBody = buf; }
 }));
+
+
+
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
