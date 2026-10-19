@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { agentService } from '../services/agent/agent.service';
 import { instagramService } from '../services/messaging/instagram.service';
 import * as messageDebouncer from '../services/messaging/debounce.service';
+import { visionService } from '../services/vision/vision.service';
 import prisma from '../config/prisma';
 import dotenv from 'dotenv';
 
@@ -49,11 +50,15 @@ export class InstagramController {
                   // Non-text messages (images, audio, etc.) arrive as attachments,
                   // not `.text` - previously these were silently dropped with no
                   // reply, leaving the customer thinking the bot was broken.
-                  const attachmentType = event.message.attachments?.[0]?.type;
-                  const isNonText = !event.message.text;
-                  const msgBody = isNonText
-                    ? `[Customer sent ${attachmentType ? `a${['image','audio'].includes(attachmentType) ? 'n' : ''} ${attachmentType}` : 'a message'} - not yet supported by the AI]`
-                    : event.message.text;
+                  const attachment = event.message.attachments?.[0];
+                  const attachmentType = attachment?.type;
+                  const isImage = attachmentType === 'image';
+                  const isNonText = !event.message.text && Boolean(attachmentType);
+                  const msgBody = isImage
+                    ? (event.message.text ? `[Customer sent an outfit photo: "${event.message.text}"]` : '[Customer sent an outfit photo]')
+                    : isNonText
+                      ? `[Customer sent ${attachmentType ? `a${['image','audio'].includes(attachmentType) ? 'n' : ''} ${attachmentType}` : 'a message'} - not yet supported by the AI]`
+                      : event.message.text;
 
                   if (isNonText && !attachmentType) continue; // no text and no recognizable attachment - nothing to process
 
@@ -92,7 +97,8 @@ export class InstagramController {
                         platform: 'instagram',
                         direction: 'inbound',
                         customerId: customer.id,
-                        externalId: msgId
+                        externalId: msgId,
+                        handledBy: isImage ? 'ai' : (isNonText ? 'system' : 'pending')
                       }
                     });
                   } catch (e: any) {
@@ -105,8 +111,20 @@ export class InstagramController {
 
                   await instagramService.markAsRead(senderId);
 
-                  if (isNonText) {
-                    const reply = "Thanks for sending that! I can only read text messages right now, but I've saved it and one of our team members will take a look. Feel free to type out your question in the meantime and I'll answer right away.";
+                  if (isImage) {
+                    console.log(`[INSTAGRAM_WEBHOOK] Analyzing incoming outfit photo for ${customer.id}`);
+                    const reply = await visionService.handleIncomingImage({
+                      platform: 'instagram',
+                      customerId: customer.id,
+                      imageUrl: attachment?.payload?.url,
+                      caption: event.message.text
+                    });
+                    await prisma.message.create({
+                      data: { content: reply, platform: 'instagram', direction: 'outbound', customerId: customer.id, handledBy: 'ai' }
+                    });
+                    await instagramService.sendMessage(senderId, reply);
+                  } else if (isNonText) {
+                    const reply = "Thanks for sending that! We've received your media and one of our team members will take a look. Feel free to type out your question in the meantime and I'll answer right away.";
                     await prisma.message.create({
                       data: { content: reply, platform: 'instagram', direction: 'outbound', customerId: customer.id, handledBy: 'system' }
                     });

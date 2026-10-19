@@ -5,6 +5,7 @@ import { whatsappTemplatesService } from '../services/messaging/whatsapp-templat
 import * as messageDebouncer from '../services/messaging/debounce.service';
 import prisma from '../config/prisma';
 import { retryOnPrismaDisconnect } from '../utils/prisma-retry';
+import { visionService } from '../services/vision/vision.service';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -85,8 +86,10 @@ export class WhatsAppController {
           // documents, locations, etc.) don't have a `.text.body` - previously these
           // were silently dropped with no reply at all, leaving the customer thinking
           // the bot was broken. Now they get an acknowledgment instead of silence.
+          const isImage = msgType === 'image';
+          const imageCaption = message.image?.caption || '';
           const NON_TEXT_LABELS: Record<string, string> = {
-            image: 'an image',
+            image: 'an outfit photo',
             video: 'a video',
             audio: 'a voice note',
             document: 'a document',
@@ -95,9 +98,11 @@ export class WhatsAppController {
             contacts: 'a contact card',
           };
           const isNonText = msgType !== 'text';
-          const msgBody = isNonText
-            ? `[Customer sent ${NON_TEXT_LABELS[msgType] || 'a message'} - not yet supported by the AI]`
-            : (message.text?.body || '');
+          const msgBody = isImage
+            ? (imageCaption ? `[Customer sent an outfit photo: "${imageCaption}"]` : '[Customer sent an outfit photo]')
+            : isNonText
+              ? `[Customer sent ${NON_TEXT_LABELS[msgType] || 'a message'} - not yet supported by the AI]`
+              : (message.text?.body || '');
 
           if (!isNonText && !msgBody) {
             return res.sendStatus(200);
@@ -138,7 +143,7 @@ export class WhatsAppController {
                 direction: 'inbound',
                 customerId: from,
                 externalId: msgId,
-                handledBy: isNonText ? 'system' : 'pending'
+                handledBy: isImage ? 'ai' : (isNonText ? 'system' : 'pending')
               }
             });
           } catch (e: any) {
@@ -157,11 +162,21 @@ export class WhatsAppController {
           console.log(`[WHATSAPP_WEBHOOK] Marking message ${msgId} as read`);
           await whatsappService.markAsRead(msgId);
 
-          if (isNonText) {
-            // Non-text messages skip the AI/RAG pipeline entirely - there's nothing
-            // meaningful for it to reason about - and get a fixed acknowledgment
-            // right away instead of silence.
-            const reply = "Thanks for sending that! I can only read text messages right now, but I've saved it and one of our team members will take a look. Feel free to type out your question in the meantime and I'll answer right away.";
+          if (isImage) {
+            console.log(`[WHATSAPP_WEBHOOK] Analyzing incoming outfit photo for ${from}`);
+            const reply = await visionService.handleIncomingImage({
+              platform: 'whatsapp',
+              customerId: from,
+              imageId: message.image?.id,
+              caption: imageCaption
+            });
+            await prisma.message.create({
+              data: { content: reply, platform: 'whatsapp', direction: 'outbound', customerId: from, handledBy: 'ai' }
+            });
+            await whatsappService.sendMessage(from, reply);
+          } else if (isNonText) {
+            // Other non-text messages (voice notes, videos, etc.)
+            const reply = "Thanks for sending that! We've received your media and one of our team members will take a look. Feel free to type out your question in the meantime and I'll answer right away.";
             await prisma.message.create({
               data: { content: reply, platform: 'whatsapp', direction: 'outbound', customerId: from, handledBy: 'system' }
             });

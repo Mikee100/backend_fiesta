@@ -295,7 +295,7 @@ export async function runCase(
     result.reply = await handle.agent.handleMessage(customerId, kase.message, kase.history || [], platform);
   } catch (error: any) {
     result.error = error?.message || String(error);
-    result.failures.push({ check: 'threw', detail: result.error });
+    result.failures.push({ check: 'threw', detail: result.error || 'Unknown error' });
   } finally {
     result.latencyMs = Date.now() - startedAt;
     if (kase.setup === 'tripCircuitBreaker') await withBreaker('reset');

@@ -16,7 +16,10 @@ function harness(context: any, reply: string, newerInbound: boolean) {
   const marked: string[][] = [];
   const pending = [{ id: 'm1', content: 'lets do it on 14th', createdAt: new Date('2026-10-09T13:30:00Z') }];
   stub(prisma.message, 'findMany', async ({ where }: any) => (where.handledBy === 'pending' ? pending : []));
-  stub(prisma.message, 'findFirst', async () => (newerInbound ? { id: 'm2' } : null));
+  stub(prisma.message, 'findFirst', async ({ where }: any) => {
+    if (where?.content) return { id: 'privacy-notice' };
+    return newerInbound ? { id: 'm2' } : null;
+  });
   stub(prisma.message, 'create', async ({ data }: any) => { saved.push(data.content); return data; });
   stub(prisma.message, 'updateMany', async ({ where }: any) => { marked.push(where.id.in); return { count: 1 }; });
   stub(agentService, 'handleMessage', async () => reply);
