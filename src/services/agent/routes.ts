@@ -16,7 +16,7 @@ import { addonInquiryReply, addonRecipient, addonSelectionClarification, isAddon
 import { ADDON_NOTED_PREFIX, ADDON_BALANCE_REPLY, ADDON_UNCHANGED_REPLY } from './constants';
 import { isCustomerNameQuestion, needsUnchangedReassurance, editionInText } from './reply-voice';
 import { isMissingColumnError } from '../../config/schema-readiness';
-import { DEFERRAL_REPLY, buildBookingPolicyReply, buildHairWigClarificationReply, buildOpeningHoursReply, buildPersonalOutfitReply, buildWalkInReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply } from './replies';
+import { DEFERRAL_REPLY, buildBookingPolicyReply, buildHairWigClarificationReply, buildOpeningHoursReply, buildPersonalOutfitReply, buildWalkInReply, familyStylingReply, isHairWigClarificationRequest, isLashesQuestion, isPersonalOutfitQuestion, legacyPackageReply, buildAboutBusinessReply } from './replies';
 import { alternativeDates, extractStatedSlots, EARLY_SLOT_STEP } from './slot-memory';
 import { CARRY_OVER_PREFIX, STEP_QUESTIONS, alternativeDatesReply } from './booking-progress';
 
@@ -662,15 +662,23 @@ export function createMessageRoutes(
       handle: async () => this.getPackageAdviceReply(userMessage),
     },
     {
-      name: 'packageCatalog',
-      replyMode: 'deterministic',
-      when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history) || catalogLinkFollowUp(userMessage, history),
-      handle: async () => {
-        const previous = [...history].reverse().find(entry => entry.role === 'assistant')?.content || '';
-        const kind = catalogLinkFollowUp(userMessage, history) && /extras|add-ons/i.test(previous) ? 'addons' : 'editions';
-        return this.getCatalogDisplayReply(customerId, platform, kind, userMessage, history);
-      },
-    },
+  name: 'packageCatalog',
+  replyMode: 'deterministic',
+  when: () => this.conversationFlowHandler.isPackageCatalogRequest(userMessage, history) || catalogLinkFollowUp(userMessage, history),
+  handle: async () => {
+    const previous = [...history].reverse().find(entry => entry.role === 'assistant')?.content || '';
+    const kind = catalogLinkFollowUp(userMessage, history) && /extras|add-ons/i.test(previous) ? 'addons' : 'editions';
+    return this.getCatalogDisplayReply(customerId, platform, kind, userMessage, history);
+  },
+},
+{
+  name: 'aboutBusiness',
+  replyMode: 'deterministic',
+  when: () =>
+    /\b(?:about your services|what services do you offer|what does fiesta house do|tell me about fiesta house)\b/i
+      .test(userMessage),
+  handle: () => buildAboutBusinessReply(),
+},
     {
       name: 'immediateConfirmation',
       when: () => (platform === 'whatsapp' || platform === 'web')
