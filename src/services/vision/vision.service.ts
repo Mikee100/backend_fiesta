@@ -530,40 +530,49 @@ Do not invent pricing or availability.
 CUSTOMER REPLY
 --------------------------------------------------
 
-The customer reply should be:
+Write a natural, personalised reply to the customer.
 
-- Warm
-- Luxurious
-- Natural
-- Concise
-- Approximately 60-90 words
-- Appropriate for WhatsApp or Instagram DM
-- Not robotic
+Use the image analysis and the customer's actual caption
+to decide what is relevant to say. Do not follow a fixed
+response template.
 
-Use an emoji such as ✨ or 🤍.
+The reply should:
+- Sound like a warm, knowledgeable luxury maternity stylist.
+- Directly answer the customer's question when possible.
+- Mention visual details when they help answer the question.
+- Be concise, usually 1-4 sentences.
+- Feel appropriate for a WhatsApp or Instagram conversation.
+- Use an emoji naturally where appropriate.
 
-IMPORTANT:
+Avoid:
+- Repeating the customer's message back to them.
+- Starting every response with the same compliment.
+- Repeatedly mentioning that a styling note was saved.
+- Giving unnecessary explanations when a direct answer is enough.
+- Asking about booking or offering to check session dates.
+- Inventing prices, item availability, or package inclusions.
 
-If "isStudioPiece" is false, do NOT write:
+If "isStudioPiece" is false:
+- Never identify the exact pictured outfit as a confirmed
+  Fiesta House item.
+- You may explain that it resembles styles in our wardrobe
+  if "isInStudioWardrobeStyle" is true.
+- If the exact item cannot be confirmed, say so naturally
+  when it is relevant to the customer's question.
+- You may mention similar styles or bringing a personal
+  outfit when relevant.
 
-"Yes, that is our..."
-"That is our signature..."
-"It is part of our studio wardrobe..."
-"It will be ready for your session..."
+If "isStudioPiece" is true:
+- You may identify the verified item using its exact
+  catalogue name.
+- Do not imply that it is currently available, reserved,
+  or guaranteed to be ready unless explicitly confirmed.
 
-Instead, use language such as:
+If the customer asks about price, availability, fit,
+or another detail you cannot verify from the provided
+information, be transparent about that limitation.
+Do not invent an answer just to sound confident.
 
-"What a gorgeous look! ✨"
-
-"This is a beautiful styling reference."
-
-"This looks very similar to one of the styles in our studio wardrobe."
-
-"While I can't confirm that this exact piece is ours from the photo alone, our studio wardrobe features over 300 luxury maternity gowns and styling options with similar silhouettes, colors and details."
-
-"You are also warmly welcome to bring this piece if you own it."
-
-If "isStudioPiece" is true, you may identify the verified catalog item.
 
 --------------------------------------------------
 PHOTOGRAPHER NOTES
@@ -757,6 +766,8 @@ Return ONLY a valid JSON object matching this schema:
    *
    * This is intentionally conservative.
    */
+
+  
   private catalogContainsExactItem(
     catalogSummary: string,
     itemName: string
@@ -781,109 +792,89 @@ Return ONLY a valid JSON object matching this schema:
   /**
    * Customer-facing reply for a verified studio piece.
    */
-  private buildVerifiedStudioReply(
-    matchedStudioItemName: string,
-    caption?: string
-  ): string {
-    const safeName =
-      matchedStudioItemName.trim();
+private buildVerifiedStudioReply(
+  matchedStudioItemName: string,
+  caption?: string
+): string {
+  const safeName =
+    matchedStudioItemName.trim();
 
-    let captionContext = '';
-
-    if (
-      caption &&
-      this.isQuestionCaption(caption)
-    ) {
-      captionContext =
-        ` You asked: "${caption.trim()}"`;
-    }
-
-    return (
-      `Yes! ✨ This is our ${safeName}. ` +
-      `It's one of the signature looks in our studio wardrobe, ` +
-      `and our styling team can help you with the fit and finishing ` +
-      `details for your session.${captionContext} ` +
-      `I've saved this look to your session styling notes. ` +
-      `Would you like me to check available dates for your shoot? 🤍`
-    );
-  }
+  return (
+    `Yes! ✨ This is our ${safeName}. ` +
+    `It's one of the signature looks in our studio wardrobe, ` +
+    `and our styling team can help you with the fit and finishing ` +
+    `details for your session. ` +
+    `I've saved this look to your session styling notes.`
+  );
+}
 
   /**
    * Customer-facing reply for an external reference,
    * personal outfit, or uncertain catalog match.
    */
-  private buildExternalReferenceReply(
-    parsed: {
-      outfitDescription: string;
-      category: string;
-      primaryColor: string;
-      styleDetails: string;
-      customerIntent: string;
-      isInStudioWardrobeStyle: boolean;
-    },
-    caption?: string
-  ): string {
-    const color =
-      parsed.primaryColor &&
-      parsed.primaryColor.toLowerCase() !==
-        'unspecified'
-        ? parsed.primaryColor
-        : '';
+private buildExternalReferenceReply(
+  parsed: {
+    outfitDescription: string;
+    category: string;
+    primaryColor: string;
+    styleDetails: string;
+    customerIntent: string;
+    isInStudioWardrobeStyle: boolean;
+  },
+  caption?: string
+): string {
+  const color =
+    parsed.primaryColor &&
+    parsed.primaryColor.toLowerCase() !== 'unspecified'
+      ? parsed.primaryColor.trim()
+      : '';
 
-    const outfit =
-      parsed.outfitDescription ||
-      'beautiful look';
+  const outfit =
+    parsed.outfitDescription?.trim() ||
+    'beautiful look';
 
-    const opening = color
+  // Avoid awkward duplication such as:
+  // "Scarlet red A vibrant red, form-fitting gown..."
+  const outfitAlreadyContainsColor =
+    color &&
+    outfit.toLowerCase().includes(color.toLowerCase());
+
+  const opening = outfitAlreadyContainsColor
+    ? `What a gorgeous look! ✨`
+    : color
       ? `What a gorgeous ${color} ${outfit}! ✨`
       : `What a gorgeous ${outfit}! ✨`;
 
-    let middle =
-      `While I can't confirm that this exact piece is ours from the photo alone, ` +
-      `our studio wardrobe features over 300 luxury maternity gowns and styling ` +
-      `options with a wide range of colors, silhouettes and details for you to explore.`;
+  let middle =
+    `While I can't confirm that this exact piece is ours from the photo alone, ` +
+    `our studio wardrobe features over 300 luxury maternity gowns and styling ` +
+    `options with a wide range of colors, silhouettes and details for you to explore.`;
 
-    if (
-      parsed.customerIntent ===
-      'bringing_own'
-    ) {
-      middle =
-        `It's a beautiful choice. 🤍 You are warmly welcome to bring your own outfit ` +
-        `for the session, and our styling team can help you incorporate it beautifully. ` +
-        `We also have over 300 luxury maternity gowns and styling options in our studio wardrobe.`;
-    }
-
-    if (
-      parsed.isInStudioWardrobeStyle &&
-      parsed.customerIntent !==
-        'bringing_own'
-    ) {
-      middle =
-        `This look is very similar to styles we offer in our studio wardrobe. ` +
-        `While I can't confirm that this exact piece is ours from the photo alone, ` +
-        `we have over 300 luxury maternity gowns and styling options with similar ` +
-        `colors, silhouettes and details for you to explore.`;
-    }
-
-    let questionContext = '';
-
-    if (
-      caption &&
-      this.isQuestionCaption(caption)
-    ) {
-      questionContext =
-        ` I've also noted your question about the look.`;
-    }
-
-    return (
-      `${opening} ${middle}` +
-      `${questionContext} ` +
-      `I've saved this look as a styling reference for you. ` +
-      `You're also warmly welcome to bring this piece if you own it. ` +
-      `Would you like me to check available session dates for you? 🤍`
-    );
+  if (
+    parsed.customerIntent === 'bringing_own'
+  ) {
+    middle =
+      `It's a beautiful choice. 🤍 You are warmly welcome to bring your own outfit ` +
+      `for the session, and our styling team can help you incorporate it beautifully. ` +
+      `We also have over 300 luxury maternity gowns and styling options in our studio wardrobe.`;
   }
 
+  if (
+    parsed.isInStudioWardrobeStyle &&
+    parsed.customerIntent !== 'bringing_own'
+  ) {
+    middle =
+      `This look is very similar to styles we offer in our studio wardrobe. ` +
+      `While I can't confirm that this exact piece is ours from the photo alone, ` +
+      `we have over 300 luxury maternity gowns and styling options with similar ` +
+      `colors, silhouettes and details for you to explore.`;
+  }
+
+  return (
+    `${opening} ${middle} ` +
+    `I've saved this look as a styling reference for you.`
+  );
+}
   /**
    * Determines whether the caption appears to contain
    * a direct question.
