@@ -173,9 +173,37 @@ async function progressReply(this: any, customerId: string, message: string, his
     }
     return `${formatCustomerDate(draft.date)} is fully booked for ${editionInText(draft.service)}. Which other date would work for you?`;
   }
-  if (!draft.time) return openTimesReply(draft.date, draft.service, open);
-  if (!open.includes(draft.time)) return unavailableTimeReply(draft.date, draft.time, open);
-  const lead = dateTimeTurn ? `${formatCustomerTime(draft.time)} on ${formatCustomerDate(draft.date)} is available for ${editionInText(draft.service)}. ` : '';
+  const selectedTime = stated.time || draft.time;
+
+  if (!selectedTime) {
+    return openTimesReply(draft.date, draft.service, open);
+  }
+
+  if (!open.includes(selectedTime)) {
+    return unavailableTimeReply(draft.date, selectedTime, open);
+  }
+
+  // Save the selected time only after checking actual slot availability.
+  if (stated.time && stated.time !== draft.time) {
+    const updated = await prisma.bookingDraft.updateMany({
+      where: {
+        id: draft.id,
+        step: EARLY_SLOT_STEP,
+      },
+      data: {
+        time: selectedTime,
+        dateTimeIso: null,
+      },
+    });
+
+    if (updated.count === 0) {
+      return 'I could not save that time just now. Please choose your preferred time again.';
+    }
+  }
+
+  const lead = dateTimeTurn
+    ? `${formatCustomerTime(selectedTime)} on ${formatCustomerDate(draft.date)} is available for ${editionInText(draft.service)}. `
+    : '';
   if (!isUsableName(draft.name)) return `${lead}${STEP_QUESTIONS.need_name}`;
   if (declinedNow) await recordAddonDecision(customerId, draft.id);
   if (!decisionJustSaved && !declinedNow && !await addonsDecided.call(this, customerId, draft, history)) {
@@ -183,8 +211,19 @@ async function progressReply(this: any, customerId: string, message: string, his
     return `${lead}${discussed ? ADDON_OTHER_DECISION_QUESTION : ADDON_DECISION_QUESTION}`;
   }
   try {
-    const result = await this.executeProposeBookingTool(customerId, draft.name, draft.service, `${draft.date}T${draft.time}`);
-    return buildBookingProposalConfirmation(draft.service, draft.date, draft.time, result.depositAmount);
+    const result = await this.executeProposeBookingTool(
+  customerId,
+  draft.name,
+  draft.service,
+  `${draft.date}T${selectedTime}`
+);
+
+return buildBookingProposalConfirmation(
+  draft.service,
+  draft.date,
+  selectedTime,
+  result.depositAmount
+);
   } catch {
     return 'The team will help verify these booking details before any payment prompt is sent.';
   }

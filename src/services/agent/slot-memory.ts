@@ -389,27 +389,63 @@ function scanStatedSlots(
       invalidDate = true;
     }
 
-    const time = message.match(
-      /(?:@\s*|\bat\s+)?\b(\d{1,2})(?:\s*:\s*(\d{2}))?\s*(am|pm)\b|\b(\d{2}):(\d{2})\b/i
+        const clockTime = message.match(
+      /(?:@\s*|\bat\s+)?\b(\d{1,2})\s*[:.]\s*(\d{2})(?:\s*(am|pm))?\b/i
     );
 
-    if (time) {
-      const hour = time[4] ? Number(time[4]) : Number(time[1]);
-      const minute = Number(time[5] || time[2] || 0);
+    const hourTime = clockTime
+      ? null
+      : message.match(
+          /(?:@\s*|\bat\s+)?\b(\d{1,2})\s*(am|pm)\b/i
+        );
+
+    if (clockTime || hourTime) {
+      const hour = Number(clockTime?.[1] || hourTime?.[1]);
+      const minute = Number(clockTime?.[2] || 0);
+
+      let meridiem = (
+        clockTime?.[3] || hourTime?.[2] || ''
+      ).toLowerCase();
 
       if (
         minute < 60 &&
-        (time[4] ? hour < 24 : hour >= 1 && hour <= 12)
+        hour >= 0 &&
+        hour <= 23 &&
+        (
+          meridiem
+            ? hour >= 1 && hour <= 12
+            : true
+        )
       ) {
-        const normalizedHour =
-          time[4]
-            ? hour
-            : hour % 12 +
-              (time[3]?.toLowerCase() === 'pm' ? 12 : 0);
+        // Explicit 24-hour times such as 14:30 need no inference.
+        if (!meridiem && (hour === 0 || hour > 12)) {
+          slots.time =
+            `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+        } else {
+          // For shorthand such as "2.30", use the recent assistant
+          // message to establish whether the offered time was AM or PM.
+          if (!meridiem) {
+            const formattedMinute = String(minute).padStart(2, '0');
 
-        slots.time = `${String(normalizedHour).padStart(2, '0')}:${String(
-          minute
-        ).padStart(2, '0')}`;
+            const offeredTime = lastAssistant.match(
+              new RegExp(
+                `\\b${hour}\\s*[:.]\\s*${formattedMinute}\\s*(am|pm)\\b`,
+                'i'
+              )
+            );
+
+            meridiem = offeredTime?.[1]?.toLowerCase() || '';
+          }
+
+          // Don't guess AM/PM if the conversation doesn't establish it.
+          if (meridiem && hour >= 1 && hour <= 12) {
+            const normalizedHour =
+              hour % 12 + (meridiem === 'pm' ? 12 : 0);
+
+            slots.time =
+              `${String(normalizedHour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+          }
+        }
       }
     }
   }
