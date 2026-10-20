@@ -291,8 +291,9 @@ export class BookingExtractor {
     const isoDate = text.match(ISO_DATE_PATTERN)?.[1];
     const explicitDate = isoDate ? null : findExplicitDate(text);
 
+    // Also recognises period-separator times like "2.30" common on WhatsApp
     const timeMatch = cleanText.match(
-      /(\d{1,2})(:|\s*)(\d{2})?\s*(am|pm)/i
+      /(\d{1,2})([:.](\d{2}))\s*(am|pm)?|(\d{1,2})\s*(am|pm)/i
     );
 
     let date: string | undefined;
@@ -384,8 +385,8 @@ export class BookingExtractor {
       || /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(text);
 
     const hasTimeSignal =
-      /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/.test(text)
-      || /\b\d{2}:\d{2}\b/.test(text);
+      /\b\d{1,2}(?:[:.\u{FF0E}]\d{2})?\s*(?:am|pm)\b/iu.test(text)
+      || /\b\d{1,2}[:.\u{FF0E}]\d{2}\b/iu.test(text);
 
     // Preserve the existing AI extraction behaviour for rescheduling.
     if (rescheduleSignal && hasDateSignal && hasTimeSignal) {
