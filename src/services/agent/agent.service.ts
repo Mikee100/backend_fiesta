@@ -394,7 +394,8 @@ export class AgentService {
 
   private messageContainsExplicitTimeSignal(message: string): boolean {
     const text = message.toLowerCase();
-    return /\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{2}:\d{2}\b/.test(text);
+    // Matches: "2pm", "2:30pm", "2.30pm", "14:30", "14.30", "2:30", "2.30"
+    return /\b\d{1,2}(?:[:.\u{FF0E}]\d{2})?\s*(?:am|pm)\b|\b\d{1,2}[:.\u{FF0E}]\d{2}\b/iu.test(text);
   }
 
   private shouldResolvePackageSelectionImmediately(userMessage: string): boolean {
@@ -935,7 +936,8 @@ private getAddonAdviceReply(): string {
       return true;
     }
 
-    const givesExplicitTime = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{2}:\d{2}\b/i.test(text);
+    // Also match period-separated times like "2.30" or "14.30" (common shorthand on WhatsApp)
+    const givesExplicitTime = /\b\d{1,2}(?:[:.\u{FF0E}]\d{2})?\s*(?:am|pm)\b|\b\d{1,2}[:.\u{FF0E}]\d{2}\b/iu.test(text);
     const recentlyAskedForTime = history.slice(-2).some((message) =>
       message.role === 'assistant' && /\b(?:what time|which time|preferred time|time would work)\b/i.test(message.content)
     );
