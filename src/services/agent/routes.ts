@@ -664,7 +664,7 @@ export function createMessageRoutes(
     {
   name: 'packageCatalog',
   replyMode: 'deterministic',
-  when: () => this.conversationFlowHandler.isPackageCatalogRequest(userMessage, history) || catalogLinkFollowUp(userMessage, history),
+ when: () => this.conversationFlows.isPackageCatalogRequest(userMessage, history) || catalogLinkFollowUp(userMessage, history),
   handle: async () => {
     const previous = [...history].reverse().find(entry => entry.role === 'assistant')?.content || '';
     const kind = catalogLinkFollowUp(userMessage, history) && /extras|add-ons/i.test(previous) ? 'addons' : 'editions';
