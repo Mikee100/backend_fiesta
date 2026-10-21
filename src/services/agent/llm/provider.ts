@@ -51,11 +51,36 @@ const geminiBackup2 = process.env.GEMINI_BACKUP2
     })
   : null;
 
+/**
+ * OpenRouter aggregates many upstream providers behind a single
+ * OpenAI-compatible endpoint.  Free models are identified by the
+ * ":free" suffix (e.g. "meta-llama/llama-3.1-8b-instruct:free").
+ * This client is used as the last-resort fallback when all four
+ * primary/backup providers are exhausted or on cooldown.
+ */
+const openrouter = process.env.OPENROUTER_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+      maxRetries: 0,
+      timeout: PROVIDER_TIMEOUT_MS,
+      defaultHeaders: {
+        'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://fiesta-ai.app',
+        'X-Title': process.env.OPENROUTER_TITLE || 'Fiesta AI',
+      },
+    })
+  : null;
+
+const OPENROUTER_CHAT_MODEL =
+  process.env.OPENROUTER_CHAT_MODEL ||
+  'meta-llama/llama-3.1-8b-instruct:free';
+
 export type ChatProvider =
   | 'groq'
   | 'groq2'
   | 'gemini'
-  | 'gemini2';
+  | 'gemini2'
+  | 'openrouter';
 
 const providerCooldownUntil =
   new WeakMap<Pick<OpenAI, 'chat'>, number>();
@@ -128,8 +153,8 @@ function providerOrderFor(
   primary: ChatProvider
 ): ChatProvider[] {
   return primary === 'gemini'
-    ? ['gemini', 'gemini2', 'groq', 'groq2']
-    : ['groq', 'groq2', 'gemini', 'gemini2'];
+    ? ['gemini', 'gemini2', 'groq', 'groq2', 'openrouter']
+    : ['groq', 'groq2', 'gemini', 'gemini2', 'openrouter'];
 }
 
 export function getGroqCooldownUntil(
@@ -266,11 +291,13 @@ export async function createChatCompletion(
     groq2?: Pick<OpenAI, 'chat'> | null;
     gemini?: Pick<OpenAI, 'chat'> | null;
     gemini2?: Pick<OpenAI, 'chat'> | null;
+    openrouter?: Pick<OpenAI, 'chat'> | null;
   } = {
     groq: openai,
     groq2,
     gemini,
     gemini2: geminiBackup2,
+    openrouter,
   },
   primary: ChatProvider = primaryProvider()
 ): Promise<{
@@ -304,6 +331,7 @@ export async function createChatCompletion(
     gemini2:
       process.env.GEMINI_BACKUP2_CHAT_MODEL ||
       GEMINI_CHAT_MODEL,
+    openrouter: OPENROUTER_CHAT_MODEL,
   };
 
   let completionCalls = 0;

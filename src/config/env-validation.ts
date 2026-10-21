@@ -97,5 +97,6 @@ export function validateStartupEnv(): void {
   const groqBackupConfigured = Boolean(groqBackupKey);
   const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
   const geminiBackupConfigured = Boolean(process.env.GEMINI_BACKUP2);
-  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, GROQ_API_KEY=${groqConfigured}, GROQ_2=${groqBackupConfigured}, GEMINI_API_KEY=${geminiConfigured}, GEMINI_BACKUP2=${geminiBackupConfigured}, PINECONE_API_KEY=${pineconeConfigured})`);
+  const openrouterConfigured = Boolean(process.env.OPENROUTER_API_KEY);
+  console.log(`[ENV] Validation passed (DATABASE_URL=${dbConfigured}, GROQ_API_KEY=${groqConfigured}, GROQ_2=${groqBackupConfigured}, GEMINI_API_KEY=${geminiConfigured}, GEMINI_BACKUP2=${geminiBackupConfigured}, OPENROUTER=${openrouterConfigured}, PINECONE_API_KEY=${pineconeConfigured})`);
 }
