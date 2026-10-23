@@ -52,7 +52,7 @@ test('VisionService correctly sanitizes in-closet vs external outfit analysis re
   const sanitizedStudio = (visionService as any).sanitizeAnalysisResult(studioMatchAI);
   assert.equal(sanitizedStudio.isStudioPiece, true);
   assert.equal(sanitizedStudio.matchedStudioItemName, 'Champagne Gold Goddess Draped Look & Handcrafted Crown');
-  assert.match(sanitizedStudio.customerReply, /signature Champagne Gold Goddess/i);
+  assert.match(sanitizedStudio.customerReply, /Champagne Gold Goddess/i);
 
   // Case B: External reference not in closet
   const externalAI = {

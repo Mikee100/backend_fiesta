@@ -370,6 +370,9 @@ A client just sent an image in the chat${
 
 Platform: ${platform || 'unknown'}
 
+CHECK AGAINST OUR STUDIO CATALOG FIRST
+Compare the image against the catalog below before identifying a studio piece. Visual similarity alone does not prove inventory or current availability.
+
 FIESTA ATELIER STUDIO WARDROBE CATALOG:
 
 ${catalogSummary}
@@ -616,7 +619,7 @@ Return ONLY a valid JSON object matching this schema:
   private sanitizeAnalysisResult(
     parsed: any,
     caption?: string,
-    catalogSummary?: string
+    catalogSummary: string = getStudioCatalogPromptSummary()
   ): OutfitAnalysisResult {
     const allowedCategories = [
       'gown',
@@ -854,7 +857,7 @@ private buildExternalReferenceReply(
     parsed.customerIntent === 'bringing_own'
   ) {
     middle =
-      `It's a beautiful choice. 🤍 You are warmly welcome to bring your own outfit ` +
+      `It's a beautiful choice. 🤍 I can't confirm from the photo alone whether this exact piece is part of our studio wardrobe or an external design, but you are warmly welcome to bring your own outfit ` +
       `for the session, and our styling team can help you incorporate it beautifully. ` +
       `We also have over 300 luxury maternity gowns and styling options in our studio wardrobe.`;
   }

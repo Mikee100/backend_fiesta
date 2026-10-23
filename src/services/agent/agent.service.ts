@@ -33,7 +33,7 @@ import { BUDGET_HANDOFF_REPLY } from './constants';
 import { BRAND_RULES, VOICE_RULES, UNKNOWN_ANSWER_REPLY } from './constants';
 import { editionInText, isCustomerNameQuestion, repeatedCollectionQuestion, savedCustomerNameReply } from './reply-voice';
 import { enforceSlogan } from './slogan-guard';
-import { applyEmojiPolicy, emojiReplyType, emojisIn, enforceEmojiPolicy, stripAssistantEmojis, templateEmojiReply, type EmojiReplyType } from './emoji-policy';
+import { applyEmojiPolicy, emojiReplyType, emojisIn, enforceEmojiPolicy, stripAssistantEmojis, templateEmojiReply, EMOJI_PROMPT_RULE, type EmojiReplyType } from './emoji-policy';
 import { claimCatalogLink, explicitCatalogListRequest, type CatalogKind } from './catalog-policy';
 import { ADDON_LINK_REPLY, EDITION_LINK_REPLY } from './constants';
 import { bookingProgressReply, addonPickQuestion, carryOverQuestion, nextStep, openTimesReply, sampleSlots, STEP_QUESTIONS, welcomePrefix } from './booking-progress';
@@ -1067,16 +1067,28 @@ private getAddonAdviceReply(): string {
   private getStudioPolicyReply(userMessage: string): string | null {
     const text = userMessage.toLowerCase();
 
+    const asksEveningSession =
+      /\b(?:evening|late\s*night|nighttime|night-time)\s+(?:sessions?|shoots?)\b|\b(?:sessions?|shoots?)\b.{0,40}\b(?:evening|late\s*night|nighttime|night-time)\b/i.test(text);
+
+    if (asksEveningSession) {
+      return "We are open Tuesday to Sunday from 9 AM to 7 PM and closed on Mondays. Sessions are by appointment only. The team can confirm whether a particular evening time is available.";
+    }
+
     if (isFamilyPhotoCountQuestion(userMessage)) return null;
 
     if (/\b(nude|semi[-\s]?nude)\b/.test(text) && /\b(session|shoot|maternity|portrait|photo)\b/.test(text)) {
       return 'Yes, nude and semi-nude maternity portraits are available. We handle them with professionalism and privacy so you can feel comfortable throughout the session.';
     }
 
+    const asksPartnerFee =
+      /\b(?:extra\s+(?:charge|fee|cost)|additional\s+(?:charge|fee|cost)|pay\s+extra|costs?\s+extra|charged\s+extra|(?:charge|fee|cost)\s+to\s+include|is\s+it\s+free)\b/i.test(text);
+
+
     const asksStyling = /\b(wear|outfit|dress|dressed|style|styling|clothes|clothing|colou?rs?|match(?:ing)?|coordinate)\b/.test(text);
 
 if (
   !asksStyling &&
+  !asksPartnerFee &&
   /\b(couple|partner|husband|wife|children|kids|family|mum|mom|mother|dad|father)\b/.test(text) &&
   /\b(session|shoot|join|include|come|attend)\b/.test(text)
 ) {
@@ -1812,6 +1824,7 @@ C5. MISSED CALLS / UNREACHABLE STAFF: If a customer says they called the studio 
 
 ${BRAND_RULES}
 ${VOICE_RULES}
+${EMOJI_PROMPT_RULE}
 
 
 D0-pre. FIRST CLASSIFY THE CUSTOMER'S CURRENT INTENT (internal; never reveal this classification):
@@ -2567,13 +2580,13 @@ ${contextString}`;
    * always resolves to a string that's safe to send to the customer.
    */
 
-  
+
   async handleMessage(customerId: string, rawMessage: string, rawHistory: { role: 'user'|'assistant', content: string }[] = [], platform: string = 'whatsapp'): Promise<string> {
     const userMessage = normalizeQuotes(rawMessage);
     const history = stripAssistantEmojis(rawHistory).map((entry) => ({ ...entry, content: normalizeQuotes(entry.content) }));
     const startedAt = Date.now();
     const ctx: ReplyContext = { customerId, userMessage, platform, startedAt };
-    ctx.introduceAssistant = !history.some((entry) => entry.role === 'assistant');
+    ctx.introduceAssistant = false;
     this.activeTurnContext = ctx;
     if (String(process.env.AI_AUTOMATION_ENABLED || 'true').trim().toLowerCase() === 'false') {
       ctx.strategyUsed = 'automationDisabled';
@@ -2627,6 +2640,21 @@ ${contextString}`;
       ctx.strategyUsed = 'identityQuestion';
       return this.respond(ctx, "I'm the virtual assistant for Fiesta House Maternity, so you're chatting with an AI rather than a person. I can help with our editions, add-ons and bookings, and the studio team is always there when you'd like a person, on 0720 111928.");
     }
+    if (circuitBreaker.isOpen()) {
+      console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
+      ctx.strategyUsed = 'circuitBreaker';
+      if (shouldNotifyOutage()) {
+        await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
+      }
+      return this.respond(ctx, FALLBACK_MESSAGE, {
+        success: false,
+        isFallback: true,
+        failureReason: 'circuit_open',
+        circuitBreakerTrip: true,
+        circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
+      });
+    }
+
   if (this.isTimeOfDayGreeting(userMessage) || this.isCasualGreeting(userMessage)) {
   try {
     const greetingReply = await this.getGreetingReply(customerId, history);
@@ -2652,20 +2680,6 @@ ${contextString}`;
   }
 }
 
-    if (circuitBreaker.isOpen()) {
-      console.log('[AGENT_FLOW] Circuit breaker is open; returning fallback reply.');
-      ctx.strategyUsed = 'circuitBreaker';
-      if (shouldNotifyOutage()) {
-        await this.escalate(customerId, 'error', 'AI circuit breaker is open due to repeated failures - customers are getting the canned fallback message.');
-      }
-      return this.respond(ctx, FALLBACK_MESSAGE, {
-        success: false,
-        isFallback: true,
-        failureReason: 'circuit_open',
-        circuitBreakerTrip: true,
-        circuitBreakerReason: 'Reply pipeline failing repeatedly, cooling down',
-      });
-    }
 
     // Sentiment tracking runs after circuit-breaker check so
     // an angry burst during an outage doesn't flood escalations.
@@ -2700,6 +2714,7 @@ ${contextString}`;
     if ((platform === 'whatsapp' || platform === 'web') && !this.conversationFlows.isRescheduleQuestion(history)
       && !this.shouldUseInvoiceRequestReply(userMessage, history)
       && !isCustomerNameQuestion(userMessage)
+      && !this.shouldUseBookingProcessReply(userMessage)
       && !this.shouldUsePreviousAddonReply(userMessage, history)) {
       try {
         const slotReply = await this.rememberBookingSlots(customerId, userMessage, history);

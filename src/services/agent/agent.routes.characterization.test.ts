@@ -226,7 +226,7 @@ const CASES: Case[] = [
   { message: "What's your instagram?", expected: 'socialMedia' },
   { message: 'Can I get raw files?', expected: 'rawFiles' },
   { message: 'How much do I have to pay for photos within 3 working days?', expected: 'expressDeliveryFee' },
-  { message: 'Can I bring one extra outfit of my own?', expected: 'verifiedFacts' },
+  { message: 'Can I bring one extra outfit of my own?', expected: 'personalOutfit' },
   { message: 'What does professional hair mean, is it wig styling?', expected: 'hairWigClarification' },
 
   // Add-ons
@@ -372,6 +372,7 @@ test('message route order remains unchanged', () => {
     'rawFiles',
     'expressDeliveryFee',
     'previousAddon',
+    'addonAdvice',
     'clarifyNewAddon',
     'addonRequest',
     'addonListFollowUp',
@@ -394,6 +395,7 @@ test('message route order remains unchanged', () => {
     'packageSelection',
     'packageAdvice',
     'packageCatalog',
+    'aboutBusiness',
     'immediateConfirmation',
     'runAgent',
   ]);

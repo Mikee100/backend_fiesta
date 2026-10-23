@@ -10,6 +10,7 @@ import { AgentService } from './agent.service';
 import { SEED_EDITION_INCLUSIONS } from '../../config/edition-inclusions';
 import { VERIFIER_CORRECTION_PREFIX } from './output-verifier';
 import workflowBaseline from './workflow-baseline.fixtures.json';
+import { BUDGET_HANDOFF_REPLY } from './constants';
 
 test('workflow baseline preserves reported turns and labels synthetic state honestly', () => {
   assert.equal(workflowBaseline.historyLimit, 6);
@@ -321,7 +322,7 @@ test('Wairimu conversation replay with six-message history and a next-day return
   });
   await context.test('[FIXED IN 8.7] [SIMULATED QUOTA] exhausted-budget walk-in turn hands off rather than announcing a limit', () => {
     assert.doesNotMatch(frames[9].reply, /conversation limit|quota|today.*limit/i);
-    assert.equal(frames[9].reply, 'Thank you for your patience. A member of our team will pick this up with you shortly.');
+    assert.equal(frames[9].reply, BUDGET_HANDOFF_REPLY);
     assert.ok(frames[9].escalations > frames[8].escalations);
   });
   await context.test('[FIXED IN 8.6] [FAULT INJECTION] stale lashes price and retired package wording are blocked', () => {
