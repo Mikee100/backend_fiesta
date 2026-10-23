@@ -800,6 +800,7 @@ test('confirmed Muse transcript preserves the session and refreshes its invoice 
 });
 
 test('confirmed session model context supplies known slots and blocks an actual collection restart', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
   const restores: (() => void)[] = [];
   const stub = (target: any, method: string, implementation: (...args: any[]) => any) => {
     const original = target[method]; target[method] = implementation; restores.push(() => { target[method] = original; });
@@ -1000,7 +1001,7 @@ test('Joan correction retains Icon and closed Monday is answered without model c
   assert.equal(customer.name, 'Joan');
   assert.equal(draft.service, 'THE ICON');
   assert.equal(draft.time, '15:00');
-  assert.equal(draft.date, '2026-10-05');
+  assert.equal(draft.date, null, 'closed Monday dates must not be persisted');
   assert.equal(extractStatedSlots('The icon package').service, 'THE ICON');
   const mixed = await instance.handleMessage('synthetic-joan', 'Your husband / 5th at 3pm', [], 'whatsapp');
   assert.match(mixed, /closed on Mondays, so Monday, 5 October is not available/);
@@ -1108,12 +1109,12 @@ test('Icon sandbox deposit ten would be proposed as ten while production rejects
   let saved = 0;
   (bookingDraftService.saveBookingProposal as any) = async () => { saved++; };
   process.env.MPESA_ENVIRONMENT = 'sandbox';
-  const result = await agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-10-06T15:00');
+  const result = await agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-11-06T15:00');
   assert.equal(result.depositAmount, 10);
-  assert.match(buildBookingProposalConfirmation('THE ICON', '2026-10-06', '15:00', result.depositAmount), /deposit is Ksh 10\./);
+  assert.match(buildBookingProposalConfirmation('THE ICON', '2026-11-06', '15:00', result.depositAmount), /deposit is Ksh 10\./);
   assert.equal(saved, 1);
   process.env.MPESA_ENVIRONMENT = 'production';
-  await assert.rejects(agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-10-06T15:00'), /below the KSh 2,000 minimum/);
+  await assert.rejects(agent.executeProposeBookingTool('synthetic-icon-ten', 'Joan', 'THE ICON', '2026-11-06T15:00'), /below the KSh 2,000 minimum/);
   assert.equal(saved, 1, 'production must not save a low-deposit proposal');
 });
 
@@ -1128,7 +1129,7 @@ test('budget cutoff requests a human handoff without exposing limits or invoking
   const reply = await instance.handleMessage('budget-customer', 'Do you have parking at the studio?', [], 'whatsapp');
   assert.equal(reply, BUDGET_HANDOFF_REPLY);
   assert.doesNotMatch(reply, /quota|token|limit|50,?000|tomorrow/i);
-  assert.equal(reply, 'Thank you for your patience. A member of our team will pick this up with you shortly.');
+  assert.match(reply, /^I'm sorry for the wait, and thank you for your patience\./);
   assert.equal(escalations.length, 1);
   assert.equal(escalations[0].customerId, 'budget-customer');
   assert.equal(escalations[0].type, 'quota');
@@ -2276,7 +2277,7 @@ test('proposals require a usable name and preserve a fuller customer name', asyn
     bookingDraftService.saveBookingProposal = originals.proposal;
   });
   const instance = withQuietAgent({ getPackageForDeposit: async () => ({ name: 'THE BLOOM', deposit: 2000 }) });
-  await instance.executeProposeBookingTool('name-customer', 'Wairimu', 'THE BLOOM', '2026-10-06T10:00');
+  await instance.executeProposeBookingTool('name-customer', 'Wairimu', 'THE BLOOM', '2026-11-06T10:00');
   assert.equal(proposedName, 'Wairimu Kamau');
 });
 
@@ -2552,7 +2553,7 @@ test('all package deposit displays and booking charges use one helper result', a
     const ambiguousDeposit = await instance.getAmbiguousDepositReply();
     const additions = await instance.getAdditionsReply();
     const proposal = await instance.executeProposeBookingTool(
-      'customer-1', 'Jane Doe', 'THE ICON', '2026-10-10T15:00'
+      'customer-1', 'Jane Doe', 'THE ICON', '2026-11-10T15:00'
     );
     const confirmation = await instance.executeConfirmBookingTool('customer-1', 'awaiting_confirmation', sharedDeposit);
 
@@ -2691,7 +2692,7 @@ test('zero or null package deposits never appear in replies or initiate payment'
       }
 
       await assert.rejects(
-        instance.executeProposeBookingTool('customer-1', 'Jane Doe', 'THE ICON', '2026-10-10T15:00'),
+        instance.executeProposeBookingTool('customer-1', 'Jane Doe', 'THE ICON', '2026-11-10T15:00'),
         /missing or invalid/
       );
       await assert.rejects(

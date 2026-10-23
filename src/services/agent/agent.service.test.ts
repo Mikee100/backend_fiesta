@@ -261,10 +261,10 @@ test('keeps hard policy identifiers while replacing redundant voice rules and om
     const compactPrompt = agent.getSystemPrompt('', 'whatsapp', false, false);
     const fallbackPricingPrompt = agent.getSystemPrompt('', 'whatsapp', true, false);
 
-    assert.equal((fullPrompt.match(/(?:^|\n)[A-C]\d+[a-z]?\./g) || []).length, 20);
-    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 25);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-C]\d+[a-z]?\./g) || []).length, 24);
+    assert.equal((fullPrompt.match(/(?:^|\n)[A-D]\d+[a-z]?\./g) || []).length, 33);
     assert.match(fullPrompt, /BRAND:.*Luxury, Safety, Convenience and Comfort/);
-    assert.match(fullPrompt, /VOICE:.*never photoshoot/);
+    assert.ok(fullPrompt.includes('VOICE: Warm, personable') && fullPrompt.includes('Say session or reveal, never photoshoot'));
     assert.match(fullPrompt, /THE BLOOM: Ksh 15,555/);
     assert.doesNotMatch(fullPrompt, /THE BLOOM: Ksh 15,000/);
     assert.equal(fullPrompt.includes(agent.getAddonPricingLine()), true);
@@ -479,8 +479,8 @@ test('rejects a booking proposal when the requested slot is occupied', async () 
 
   try {
     await assert.rejects(
-      agent.executeProposeBookingTool('customer-123', 'Joan', 'THE ICON', '2026-10-06T16:00'),
-      /unavailable on 2026-10-06/i
+      agent.executeProposeBookingTool('customer-123', 'Joan', 'THE ICON', '2026-11-06T16:00'),
+      /unavailable on 2026-11-06/i
     );
     assert.equal(draftSaved, false);
   } finally {
@@ -491,7 +491,8 @@ test('rejects a booking proposal when the requested slot is occupied', async () 
   }
 });
 
-test('uses the customer-stated day over a conflicting model-proposed date', () => {
+test('uses the customer-stated day over a conflicting model-proposed date', (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
   assert.equal(
     agent.getAuthoritativeRequestedDate(
       'she would want on 6th at 4pm',
@@ -541,7 +542,8 @@ test('rejects an unsupported all-set claim while collecting a new booking time',
   assert.equal(agent.isUnverifiedBookingConfirmation('Wonderful choice!', 'Lets go with the Icon', history), false);
 });
 
-test('handles a session mix-up correction without changing the existing booking', async () => {
+test('handles a session mix-up correction without changing the existing booking', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-04T09:00:00Z').getTime() });
   const originals = {
     getDraft: bookingDraftService.get,
     getAvailableSlots: bookingService.getAvailableSlots,

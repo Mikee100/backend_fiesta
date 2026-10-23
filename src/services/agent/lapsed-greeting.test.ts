@@ -25,7 +25,8 @@ test('emoji repeat rule applies within 2 hours but does not span a full day (22 
   assert.equal(yesterdayResult, `Welcome back. ${heart}`);
 });
 
-test('lapsed draft greeting: varies on 2nd turn and offers clean reset on 3rd turn', async () => {
+test('lapsed draft greeting: varies on 2nd turn and offers clean reset on 3rd turn', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-13T09:00:00Z').getTime() });
   const originals = {
     draftFindUnique: prisma.bookingDraft.findUnique,
     draftDeleteMany: prisma.bookingDraft.deleteMany,

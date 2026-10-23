@@ -67,7 +67,12 @@ test('schema mismatch in draft pre-guard or slot capture uses the same maintenan
       escalate: async (_customer: string, _type: string, description: string) => { alerts.push(JSON.parse(description)); },
     });
     const confirming = boundary === 'tryImmediateConfirmation';
-    const reply = await agent.handleMessage('schema-boundary', confirming ? 'yes' : 'Hello', confirming ? [PAYMENT_PROPOSAL] : [], 'whatsapp');
+    const message = confirming
+    ? 'yes'
+    : boundary === 'rememberBookingSlots'
+      ? 'I would like to book a maternity session'
+      : 'Hello';
+  const reply = await agent.handleMessage('schema-boundary', message, confirming ? [PAYMENT_PROPOSAL] : [], 'whatsapp');
     await settle();
     assert.equal(reply, SCHEMA_MAINTENANCE_REPLY);
     assert.equal(alerts.length, 1);

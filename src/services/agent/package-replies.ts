@@ -352,7 +352,7 @@ export function isPackageChangeRequest(message: string, history: Array<{ role: '
   if (/\b(?:i\s+(?:want|would like)\s+to\s+)?(?:change|switch)\s+(?:my\s+)?(?:package|edition)\s+to\b/i.test(text)) return true;
 
   const lastAssistant = [...history].reverse().find(m => m.role === 'assistant')?.content || '';
-  if (lastAssistant.includes(CARRY_OVER_PREFIX) || /\b(?:which|what)\s+package\b/i.test(lastAssistant)) {
+  if (lastAssistant.includes(CARRY_OVER_PREFIX)) {
     if (/\b\d{2,3}\s*k\b|\b\d{5,6}\b|\b\d{1,3},\d{3}\b|\b(?:the\s+)?(?:bloom|muse|icon|legend|queen|empress|goddess)\b/i.test(text)) {
       return true;
     }

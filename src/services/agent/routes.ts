@@ -152,7 +152,49 @@ export function createMessageRoutes(
       replyMode: 'deterministic',
       beforeSlotCapture: true,
       when: () => isWalkInQuestion(userMessage),
-      handle: () => buildWalkInReply(),
+      handle: async () => {
+        let withinBudget: boolean;
+
+        try {
+          withinBudget = await this.checkTokenBudget(customerId);
+        } catch (error) {
+          if (isMissingColumnError(error)) throw error;
+
+          console.error('[AGENT_FLOW] Walk-in budget check failed; handing off to the studio team.');
+          try {
+            await this.escalate(customerId, 'quota', JSON.stringify({
+              event: 'quota_handoff_requested',
+              platform,
+              customerMessage: userMessage.slice(0, 2000),
+              requiresHumanReply: true,
+              assignedOwner: null,
+              note: 'The automated conversation limit could not be verified. A studio team member must review this message.',
+            }));
+          } catch {
+            console.error('[AGENT_FLOW] Failed to create the walk-in budget handoff.');
+          }
+
+          return {
+            reply: BUDGET_HANDOFF_REPLY,
+            outcome: { success: false, isFallback: true, failureReason: 'token_budget_check_failed' },
+          };
+        }
+
+        if (!withinBudget) {
+          try {
+            await this.escalateQuotaHandoff(customerId, userMessage, platform);
+          } catch {
+            console.error('[AGENT_FLOW] Failed to create the walk-in quota handoff.');
+          }
+
+          return {
+            reply: BUDGET_HANDOFF_REPLY,
+            outcome: { success: false, isFallback: true, failureReason: 'daily_token_limit_exceeded' },
+          };
+        }
+
+        return buildWalkInReply();
+      },
     },
     {
       name: 'openingHours',
@@ -476,24 +518,12 @@ export function createMessageRoutes(
   handle: () => buildAddonAdviceReply(),
 },
 
-{
-  name: 'addonAdvice',
-  replyMode: 'deterministic',
-  when: () => isAddonAdviceRequest(userMessage, history),
-  handle: () => buildAddonAdviceReply(),
-},
 
 
     {
       name: 'clarifyNewAddon',
       when: () => this.shouldClarifyNewAddon(userMessage, history),
       handle: () => 'Which add-on would you like to add to your session? I can show you the available extras if you are not sure yet.',
-    },
-    {
-      name: 'addonAdvice',
-      replyMode: 'deterministic',
-      when: () => isAddonAdviceRequest(userMessage, history),
-      handle: () => buildAddonAdviceReply(),
     },
 
     {
@@ -513,6 +543,7 @@ export function createMessageRoutes(
       replyMode: 'deterministic',
       when: () => !this.getSelectedAddon(userMessage, history) && !addonSelectionClarification(userMessage, history) && Boolean(resolveVerifiedFact(userMessage, history)),
       handle: async () => {
+        if (isPersonalOutfitQuestion(userMessage)) return buildPersonalOutfitReply();
         const draft = await prisma.bookingDraft.findUnique({ where: { customerId } }).catch(() => null);
         return resolveVerifiedFact(userMessage, history, { draftService: draft?.service });
       },

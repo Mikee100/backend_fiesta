@@ -64,7 +64,12 @@ export function shouldUseUpcomingAppointmentDetailsReply(userMessage: string): b
   if (shouldUseLastAppointmentDetailsReply(userMessage)) return false;
   if (/\b(show|tell|remind|list)\b.*\b(in|on|for|about|included in|part of)?\s*(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
   if (/\bwhat(?:'s| is| are)?\b.*\b(included|in|on|booked for)\b.*\b(my|the|this)\s+(session|shoot|appointment|booking)\b/.test(text)) return true;
-  return /\b(any|what|more|tell me about)\b.*\b(details?|information|shoot|session|appointment|booking)\b|\b(details?|information)\b.*\b(session|shoot|appointment|booking)\b/.test(text);
+  return (
+    /\b(?:any|more)\b.*\b(?:details?|information)\b.*\b(?:session|shoot|appointment|booking)\b/i.test(text) ||
+    /\btell me more about\b.*\b(?:session|shoot|appointment|booking)\b/i.test(text) ||
+    /\b(?:details?|information)\b.*\b(?:session|shoot|appointment|booking)\b/i.test(text) ||
+    /\btell me about (?:my|the|this|upcoming|next)\b.*\b(?:session|shoot|appointment|booking)\b/i.test(text)
+  );
 }
 
 export function formatBookingDuration(durationMinutes?: number | null): string {

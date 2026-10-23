@@ -74,48 +74,48 @@ export const EMOJI_WHITELIST: readonly string[] = [
     ...Object.values(REPLY_EMOJI),
 
     // Warmth / appreciation
-    '\u{1F90D}', // 🤍
-    '\u{1F49B}', // 💛
-    '\u{1F49C}', // 💜
-    '\u{1F499}', // 💙
-    '\u{1F9E1}', // 🧡
-    '\u{1F60A}', // 😊
-    '\u{1F970}', // 🥰
-    '\u{1F642}', // 🙂
-    '\u{1F917}', // 🤗
-    '\u{1FAF6}', // 🫶
+    '\u{1F90D}', // \u{1F90D}
+    '\u{1F49B}', // \u{1F49B}
+    '\u{1F49C}', // \u{1F49C}
+    '\u{1F499}', // \u{1F499}
+    '\u{1F9E1}', // \u{1F9E1}
+    '\u{1F60A}', // \u{1F60A}
+    '\u{1F970}', // \u{1F970}
+    '\u{1F642}', // \u{1F642}
+    '\u{1F917}', // \u{1F917}
+    '\u{1FAF6}', // \u{1FAF6}
 
     // Greetings / conversation
-    '\u{1F44B}', // 👋
-    '\u{1F44F}', // 👏
-    '\u{1F44D}', // 👍
-    '\u{1F64C}', // 🙌
-    '\u{1F602}', // 😂
+    '\u{1F44B}', // \u{1F44B}
+    '\u{1F44F}', // \u{1F44F}
+    '\u{1F44D}', // \u{1F44D}
+    '\u{1F64C}', // \u{1F64C}
+    '\u{1F602}', // \u{1F602}
 
     // Celebration / excitement
-    '\u{2728}',  // ✨
-    '\u{1F389}', // 🎉
-    '\u{1F38A}', // 🎊
-    '\u{1F31F}', // 🌟
+    '\u{2728}',  // \u{2728}
+    '\u{1F389}', // \u{1F389}
+    '\u{1F38A}', // \u{1F38A}
+    '\u{1F31F}', // \u{1F31F}
 
     // Maternity / beauty / styling
-    '\u{1F337}', // 🌷
-    '\u{1F338}', // 🌸
-    '\u{1F33A}', // 🌺
-    '\u{1F490}', // 💐
-    '\u{1F457}', // 👗
-    '\u{1F484}', // 💄
-    '\u{1F476}', // 👶
-    '\u{1F380}', // 🎀
+    '\u{1F337}', // \u{1F337}
+    '\u{1F338}', // \u{1F338}
+    '\u{1F33A}', // \u{1F33A}
+    '\u{1F490}', // \u{1F490}
+    '\u{1F457}', // \u{1F457}
+    '\u{1F484}', // \u{1F484}
+    '\u{1F476}', // \u{1F476}
+    '\u{1F380}', // \u{1F380}
 
     // Photography / studio
-    '\u{1F4F8}', // 📸
-    '\u{1F4F7}', // 📷
+    '\u{1F4F8}', // \u{1F4F8}
+    '\u{1F4F7}', // \u{1F4F7}
 
     // Calendar / location / confirmation
-    '\u{1F4C5}', // 📅
-    '\u{1F4CD}', // 📍
-    '\u2705',    // ✅
+    '\u{1F4C5}', // \u{1F4C5}
+    '\u{1F4CD}', // \u{1F4CD}
+    '\u2705',    // \u{2705}
   ]),
 ];
 export const EMOJI_PROMPT_RULE = `Emojis should make the conversation feel warm and natural, never automated or decorated. Density: ${EMOJI_LEVEL}; at most ${EMOJI_POLICY.maximum} per message, ${EMOJI_POLICY.greetingClosingMaximum} in greetings or closings.
@@ -124,7 +124,7 @@ ${EMOJI_POLICY.modelSuggestions
   ? `You may use emojis, but only choose from this approved whitelist:
 ${EMOJI_WHITELIST.join(' ')}
 
-Use an emoji only when it genuinely adds warmth, emotion or context. Good examples include 🤍 for warmth or reassurance, ✨ for excitement, 🌷 or 🌸 for a warm maternity/beauty context, 👗 for outfits, 📸 for photography, 🫶 for appreciation, 😊 for a friendly response, and 🎉 for genuine celebration.
+Use an emoji only when it genuinely adds warmth, emotion or context. Good examples include \u{1F90D} for warmth or reassurance, \u{2728} for excitement, \u{1F337} or \u{1F338} for a warm maternity/beauty context, \u{1F457} for outfits, \u{1F4F8} for photography, \u{1FAF6} for appreciation, \u{1F60A} for a friendly response, and \u{1F389} for genuine celebration.
 
 Do not force an emoji into every reply. Most replies can contain no emoji. Never invent or use an emoji outside the approved whitelist.`
   : 'Prefer plain text and mirror customer tone.'}
@@ -240,6 +240,10 @@ export function applyEmojiPolicy(
   if (!found.length) return reply;
 
   const reasons = new Set<string>();
+  const hasUnwhitelistedEmoji = found.some(
+    value => !EMOJI_WHITELIST.includes(value.segment),
+  );
+  const templateEmojiSet = new Set<string>(Object.values(REPLY_EMOJI));
   const forbidden = emojiForbiddenReason(reply, context);
 
   const maximum = ['welcome', 'closing'].includes(
@@ -269,6 +273,24 @@ export function applyEmojiPolicy(
       }
 
       let reason = forbidden;
+
+      if (
+        !reason &&
+        hasUnwhitelistedEmoji &&
+        EMOJI_WHITELIST.includes(value.segment)
+      ) {
+        reason = 'mixed_unwhitelisted_emoji';
+      }
+
+      if (
+        !reason &&
+        context.replyType &&
+        context.replyType !== 'other' &&
+        context.mode !== 'model' &&
+        !templateEmojiSet.has(value.segment)
+      ) {
+        reason = 'template_emoji_mismatch';
+      }
 
       if (!reason && !EMOJI_WHITELIST.includes(value.segment)) {
         reason = 'not_whitelisted';
