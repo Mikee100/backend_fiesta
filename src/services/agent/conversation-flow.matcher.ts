@@ -41,7 +41,11 @@ export function isOpeningHoursQuestion(message: string): boolean {
 }
 
 export function isWalkInQuestion(message: string): boolean {
-  return /\bwalk[\s-]?ins?\b|\b(?:drop|pop|stop)\s+(?:by|in)\b|\bwithout\s+(?:an?\s+)?(?:appointment|booking)\b|\bdo\s+i\s+need\s+(?:an?\s+)?(?:appointment|booking)\b/i.test(message);
+  return (
+    /\bwalk[\s-]?ins?\b|\b(?:drop|pop|stop)\s+(?:by|in)\b|\bwithout\s+(?:an?\s+)?(?:appointment|booking)\b|\bdo\s+i\s+need\s+(?:an?\s+)?(?:appointment|booking)\b/i.test(message) ||
+    /\b(?:can|could|may)\s+(?:i|we)\s+(?:come|visit)\b.{0,30}\b(?:now|today)\b/i.test(message) ||
+    /\b(?:is it okay|is it alright|would it be okay)\s+if\s+(?:i|we)\s+(?:come|visit)\b.{0,30}\b(?:now|today)\b/i.test(message)
+  );
 }
 
 /** "I'll call later", "let me ask my partner": the customer is pausing, so the reply must not ask a booking question. */
